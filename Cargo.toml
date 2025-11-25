@@ -5,16 +5,21 @@ edition = "2024"
 
 [features]
 default = ["dep:mimalloc"]
+mimalloc = ["dep:mimalloc"]
+use_nightly = []
 
 [dependencies]
 regex = "1"
 memmap2 = "0.9"
-rayon = "1.8"
 smallvec = "1.15.1"
 mimalloc = { version = "=0.1.47", optional = true }
 ctrlc = "3.5.1"
 memchr = "2.7.6"
 nohash-hasher = "0.2.0"
+aho-corasick = "1.1.4"
+memmem = "0.1.1"
+libc = "0.2.177"
+ignore = "0.4.25"
 
 [profile.release-fast]
 inherits = "release"
@@ -25,4 +30,3 @@ lto = "fat"
 debug = false
 strip = true
 overflow-checks = false
-
