@@ -24,14 +24,6 @@ use memchr::memmem::Finder;
 use regex::bytes::Regex;
 use smallvec::{SmallVec, smallvec};
 
-static SKIP_DIRS_SET: phf::Set<&'static [u8]> = phf::phf_set! {
-    b"node_modules", b"target", b".git", b".hg", b".svn"
-};
-
-static BINARY_EXT_SET: phf::Set<&'static str> = phf::phf_set! {
-    "png","jpg","jpeg","gif","class","so","o","a","pdf","zip","tar","gz","7z","exe","dll","bin"
-};
-
 const BINARY_PROBE_BYTE_SIZE: usize = 0x1000;
 
 const MAX_DIR_BYTE_SIZE: usize = 16 * 1024 * 1024;
@@ -190,10 +182,34 @@ fn is_binary_chunk_nosimd(data: &[u8]) -> bool {
     false
 }
 
+// Skip dirs: tiny set, just match strings directly
 #[inline(always)]
-fn display_path(path_bytes: &[u8]) -> String {
-    // convert path_bytes to UTF-8 safely, replacing invalid bytes
-    String::from_utf8_lossy(path_bytes).into_owned()
+fn is_skip_dir(dir: &[u8]) -> bool {
+    match dir {
+        b"node_modules" | b"target" | b".git" | b".hg" | b".svn" => true,
+        _ => false,
+    }
+}
+
+#[inline(always)]
+fn is_binary_ext(ext: &[u8]) -> bool {
+    // Binary extensions: tiny set, use slice search (fast for <20 items)
+    const BINARY_EXTS: &[&[u8]] = &[
+        b"png",b"jpg",b"jpeg",b"gif",b"class",b"so",b"o",b"a",
+        b"pdf",b"zip",b"tar",b"gz",b"7z",b"exe",b"dll",b"bin",
+    ];
+
+    BINARY_EXTS.contains(&ext)
+}
+
+#[inline(always)]
+fn is_gitignored(frames: &[GitignoreFrame], path: &Path, is_dir: bool) -> bool {
+    for frame in frames.iter().rev() {
+        if frame.matcher.matched(path, is_dir).is_ignore() {
+            return true;
+        }
+    }
+    false
 }
 
 #[inline(always)]
@@ -204,6 +220,7 @@ fn build_gitignore(root: &Path) -> Gitignore {
 }
 
 /// Build a Gitignore matcher from raw file content (bytes), for a given parent directory
+#[inline(always)]
 fn build_gitignore_from_bytes(parent_path: &Path, bytes: &[u8]) -> Arc<Gitignore> {
     let mut builder = GitignoreBuilder::new(parent_path);
     for line in bytes.split(|&b| b == b'\n') {
@@ -358,6 +375,7 @@ pub struct BatchWriter {
 }
 
 impl BatchWriter {
+    #[inline(always)]
     pub fn new() -> Self {
         Self {
             // 256KB buffer - reduces syscalls dramatically
@@ -366,11 +384,12 @@ impl BatchWriter {
         }
     }
 
-    #[inline]
+    #[inline(always)]
     pub fn write(&mut self, data: &[u8]) -> io::Result<()> {
         self.writer.write_all(data)
     }
 
+    #[inline(always)]
     pub fn flush(&mut self) -> io::Result<()> {
         self.writer.flush()
     }
@@ -476,7 +495,7 @@ impl Stats {
     }
 }
 
-struct Ext4Reader {
+struct RawGrepper {
     device_mmap: Mmap,
     superblock: Ext4SuperBlock,
 
@@ -488,7 +507,7 @@ struct Ext4Reader {
     content_buf: Vec<u8>,
 }
 
-impl Ext4Reader {
+impl RawGrepper {
     fn new(device_path: &str) -> io::Result<Self> {
         fn device_size(fd: &File) -> io::Result<u64> {
             const BLKGETSIZE64: libc::c_ulong = 0x80081272;
@@ -545,7 +564,7 @@ impl Ext4Reader {
 
         let superblock = Self::parse_superblock(sb_bytes)?;
 
-        Ok(Ext4Reader {
+        Ok(RawGrepper {
             device_mmap: mmap,
             superblock,
             stats: Stats::default(),
@@ -553,28 +572,6 @@ impl Ext4Reader {
             output_buf: Vec::with_capacity(64 * 1024),
             content_buf: Vec::with_capacity(1024 * 1024),
         })
-    }
-
-    /// Quick extension check using bytes (no UTF-8 allocations)
-    fn has_binary_ext(&self, name: &[u8]) -> bool {
-        // find last '.' and test extension ASCII lower
-        if let Some(pos) = name.iter().rposition(|&c| c == b'.') {
-            // safe ASCII lower conversion into small stack string
-            let ext = std::str::from_utf8(&name[pos+1..]).ok();
-            if let Some(e) = ext {
-                return BINARY_EXT_SET.contains(&e.to_ascii_lowercase().as_str());
-            }
-        }
-        false
-    }
-
-    fn is_ignored(frames: &[GitignoreFrame], path: &Path, is_dir: bool) -> bool {
-        for frame in frames.iter().rev() {
-            if frame.matcher.matched(path, is_dir).is_ignore() {
-                return true;
-            }
-        }
-        false
     }
 
     fn quick_is_binary(&mut self, inode: &Ext4Inode) -> bool {
@@ -688,22 +685,26 @@ impl Ext4Reader {
         })
     }
 
-    #[inline]
+    // @Hot
+    #[inline(always)]
     fn get_block(&self, block_num: u32) -> &[u8] {
-        let offset = block_num as usize * self.superblock.block_size as usize;
-        let end = offset + self.superblock.block_size as usize;
-        &self.device_mmap[offset..end.min(self.device_mmap.len())]
+        let offset = (block_num as usize).wrapping_mul(self.superblock.block_size as usize);
+        debug_assert!(self.device_mmap.get(offset..offset + self.superblock.block_size as usize).is_some());
+        unsafe {
+            let ptr = self.device_mmap.as_ptr().add(offset);
+            std::slice::from_raw_parts(ptr, self.superblock.block_size as usize)
+        }
     }
 
-    // Optional: prefetch helper for mmap
     #[cfg(unix)]
+    #[inline(always)]
     fn prefetch_blocks(&self, blocks: &[u32]) {
         if blocks.is_empty() {
             return;
         }
 
         // Sort blocks to find contiguous ranges
-        let mut sorted = blocks.to_vec();
+        let mut sorted = SmallVec::<[u32; 16]>::from(blocks);
         sorted.sort_unstable();
         sorted.dedup();
 
@@ -1034,8 +1035,16 @@ impl Ext4Reader {
         running: &Arc<AtomicBool>,
         root_gitignore: Arc<Gitignore>,
     ) -> io::Result<()> {
+        #[inline(always)]
+        fn display_bytes_into_display_buf<'a>(buf: &'a mut String, path_bytes: &[u8]) -> &'a str {
+            buf.clear();
+            buf.push_str(&String::from_utf8_lossy(path_bytes));
+            buf
+        }
+
         let mut dir_stack = Vec::with_capacity(1024);
         let mut gi_stack = Vec::with_capacity(64);
+        let mut path_display_buf = String::with_capacity(512);
 
         // start with root
         dir_stack.push(DirFrame { inode_num: root_inode });
@@ -1061,13 +1070,17 @@ impl Ext4Reader {
                 Some(pos) => &path[pos+1..],
                 None => &path[..],
             };
-            if SKIP_DIRS_SET.contains(last_segment) {
+
+            if is_skip_dir(last_segment) {
                 self.stats.dirs_skipped_common += 1;
                 continue;
             }
 
-            let path_string = display_path(path);
-            if Self::is_ignored(&gi_stack, path_string.as_ref(), true) {
+            let path_str = display_bytes_into_display_buf(
+                &mut path_display_buf,
+                path
+            );
+            if is_gitignored(&gi_stack, path_str.as_ref(), true) {
                 self.stats.dirs_skipped_gitignore += 1;
                 continue;
             }
@@ -1086,7 +1099,7 @@ impl Ext4Reader {
                     if let Ok(gi_inode) = self.read_inode(*entry_inode) {
                         if let Ok(()) = self.read_file_content(&gi_inode, MAX_FILE_BYTE_SIZE) {
                             let buf = &self.content_buf;
-                            let matcher = build_gitignore_from_bytes(path_string.as_ref(), buf);
+                            let matcher = build_gitignore_from_bytes(path_str.as_ref(), buf);
                             gi_stack.push(GitignoreFrame { matcher });
                             pushed_gi = true;
                         }
@@ -1100,7 +1113,7 @@ impl Ext4Reader {
                 if name.as_slice() == b"." || name.as_slice() == b".." { continue; }
 
                 // cheap name-only SKIP_DIRS check (avoid changing path first)
-                if SKIP_DIRS_SET.contains(name.as_slice()) {
+                if is_skip_dir(&name) {
                     self.stats.dirs_skipped_common += 1;
                     continue;
                 }
@@ -1130,16 +1143,19 @@ impl Ext4Reader {
                         continue;
                     }
 
-                    let path_string = display_path(path);
-
-                    if Self::is_ignored(&gi_stack, path_string.as_ref(), false) {
-                        self.stats.files_skipped_gitignore += 1;
+                    if is_binary_ext(&name) {
+                        self.stats.files_skipped_as_binary_due_to_ext += 1;
                         path.truncate(old_path_len);
                         continue;
                     }
 
-                    if self.has_binary_ext(&name) {
-                        self.stats.files_skipped_as_binary_due_to_ext += 1;
+                    let path_str = display_bytes_into_display_buf(
+                        &mut path_display_buf,
+                        path
+                    );
+
+                    if is_gitignored(&gi_stack, path_str.as_ref(), false) {
+                        self.stats.files_skipped_gitignore += 1;
                         path.truncate(old_path_len);
                         continue;
                     }
@@ -1156,7 +1172,7 @@ impl Ext4Reader {
                             self.stats.files_read += 1;
                             _ = self.find_and_print_matches(
                                 matcher,
-                                &path_string,
+                                path_str,
                                 writer
                             );
                         }
@@ -1358,7 +1374,7 @@ fn main() -> io::Result<()> {
     let dir_path = dir_path.as_ref();
 
     // TODO: Detect the partition automatically
-    let mut reader = match Ext4Reader::new(device) {
+    let mut reader = match RawGrepper::new(device) {
         Ok(ok) => ok,
         Err(e) => {
             match e.kind() {
