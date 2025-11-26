@@ -174,14 +174,14 @@ struct Stats {
 
     dirs_skipped_common: usize,
     dirs_skipped_gitignore: usize,
-    dirs_parsed: usize,
+    dirs_encountered: usize,
 }
 
 impl Display for Stats {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let total_files = self.files_encountered;
 
-        let total_dirs = self.dirs_parsed
+        let total_dirs = self.dirs_encountered
             + self.dirs_skipped_common
             + self.dirs_skipped_gitignore;
 
@@ -236,7 +236,7 @@ impl Display for Stats {
             };
         }
 
-        dir_row!("Dirs parsed", self.dirs_parsed);
+        dir_row!("Dirs encountered", self.dirs_encountered);
         dir_row!("Skipped (common)", self.dirs_skipped_common);
         dir_row!("Skipped (gitignore)", self.dirs_skipped_gitignore);
 
@@ -865,7 +865,7 @@ impl RawGrepper {
     ) -> io::Result<()> {
         let dir_size = (inode.size as usize).min(MAX_DIR_BYTE_SIZE);
         self.read_file_into_buf(inode, dir_size, BufKind::Dir)?;
-        self.stats.dirs_parsed += 1;
+        self.stats.dirs_encountered += 1;
 
         // ------------- Quick scan for .gitignore
         let gitignore_inode = self.find_gitignore_inode_in_buf(BufKind::Dir);
