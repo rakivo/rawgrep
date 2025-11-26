@@ -9,25 +9,33 @@ mod util;
 mod binary;
 mod matcher;
 mod path_buf;
-use util::{likely, unlikely};
 
-use std::os::fd::AsRawFd;
+use crate::binary::{is_binary_chunk, is_binary_ext};
+use crate::matcher::Matcher as Matcher;
+use crate::path_buf::FixedPathBuf;
+use crate::util::{
+    likely,
+    unlikely,
+    build_gitignore,
+    build_gitignore_from_bytes,
+    is_common_skip_dir,
+    is_dot_entry,
+    is_gitignored,
+    truncate_utf8,
+};
+
 use std::sync::Arc;
 use std::fmt::Display;
+use std::os::fd::AsRawFd;
 use std::fs::{File, OpenOptions};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::io::{self, BufWriter, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use smallvec::{SmallVec, smallvec};
 use ignore::gitignore::Gitignore;
 use memmap2::{Mmap, MmapOptions};
 
-use crate::binary::{is_binary_chunk, is_binary_ext};
-use crate::matcher::Matcher as Matcher;
-use crate::path_buf::FixedPathBuf;
-use crate::util::{build_gitignore, build_gitignore_from_bytes, display_bytes_into_display_buf, is_common_skip_dir, is_dot_entry, is_gitignored, truncate_utf8, write_int};
-
-const BINARY_CONTROL_COUNT: usize = 51;
+const BINARY_CONTROL_COUNT: usize = 51; // tunned
 const BINARY_PROBE_BYTE_SIZE: usize = 0x1000;
 
 const MAX_DIR_BYTE_SIZE: usize = 16 * 1024 * 1024;
@@ -44,28 +52,30 @@ const EXT4_BLOCK_SIZE_OFFSET: usize = 24;
 const EXT4_INODE_TABLE_OFFSET: usize = 8;
 const EXT4_ROOT_INODE: INodeNum = 2;
 const EXT4_DESC_SIZE_OFFSET: usize = 254;
-
 const EXT4_INODE_MODE_OFFSET: usize = 0;
 const EXT4_INODE_SIZE_OFFSET_LOW: usize = 4;
 const EXT4_INODE_BLOCK_OFFSET: usize = 40;
 const EXT4_INODE_FLAGS_OFFSET: usize = 32;
+
+const EXT4_BLOCK_POINTERS_COUNT: usize = 12;
+
 const EXT4_S_IFMT: u16 = 0xF000;
 const EXT4_S_IFREG: u16 = 0x8000;
 const EXT4_S_IFDIR: u16 = 0x4000;
 const EXT4_EXTENTS_FL: u32 = 0x80000;
 
-const COLOR_RED: &[u8] = b"\x1b[1;31m";
-const COLOR_GREEN: &[u8] = b"\x1b[1;32m";
-const COLOR_CYAN: &[u8] = b"\x1b[1;36m";
-const COLOR_RESET: &[u8] = b"\x1b[0m";
+const COLOR_RED: &str = "\x1b[1;31m";
+const COLOR_GREEN: &str = "\x1b[1;32m";
+const COLOR_CYAN: &str = "\x1b[1;36m";
+const COLOR_RESET: &str = "\x1b[0m";
 
-const CURSOR_HIDE: &[u8] = b"\x1b[?25l";
-const CURSOR_UNHIDE: &[u8] = b"\x1b[?25h";
+const CURSOR_HIDE: &str = "\x1b[?25l";
+const CURSOR_UNHIDE: &str = "\x1b[?25h";
 
 type INodeNum = u32;
 type BlockNum = u32;
 
-/// Function used to indicate that we copy some amount of copiable data (bytes) into a newly allocated memory
+/// Helper used to indicate that we copy some amount of copiable data (bytes) into a newly allocated memory
 #[inline(always)]
 fn copy_data<A, T>(bytes: &[T]) -> SmallVec<A>
 where
@@ -87,27 +97,55 @@ struct DirFrame {
 
 struct GitignoreFrame { matcher: Gitignore }
 
-pub struct BatchWriter {
+pub struct BatchWriter<const BATCH_SIZE: usize = 0x8000> {
     writer: BufWriter<io::Stdout>,
+    size_since_last_flush: usize,
 }
 
-impl BatchWriter {
+impl<const BATCH_SIZE: usize> BatchWriter<BATCH_SIZE> {
     #[inline(always)]
     pub fn new() -> Self {
         Self {
-            // 256KB buffer - reduces syscalls dramatically
-            writer: BufWriter::with_capacity(256 * 1024, io::stdout()),
+            writer: BufWriter::with_capacity(BATCH_SIZE, io::stdout()),
+            size_since_last_flush: 0,
         }
     }
 
     #[inline(always)]
-    pub fn write(&mut self, data: &[u8]) -> io::Result<()> {
-        self.writer.write_all(data)
+    pub fn write_int(&mut self, mut n: usize) -> io::Result<usize> {
+        let mut buf = [0u8; 20]; // max digits for u64
+        let mut i = buf.len();
+
+        if n == 0 {
+            return self.writer.write(b"0");
+        }
+
+        while n > 0 {
+            i -= 1;
+            buf[i] = b'0' + (n % 10) as u8;
+            n /= 10;
+        }
+
+        self.writer.write(&buf[i..])
+    }
+
+    #[inline(always)]
+    pub fn write_all(&mut self, data: &[u8]) -> io::Result<()> {
+        self.writer.write_all(data)?;
+        self.size_since_last_flush += data.len();
+
+        if self.size_since_last_flush >= BATCH_SIZE {
+            self.flush()?;
+        }
+
+        Ok(())
     }
 
     #[inline(always)]
     pub fn flush(&mut self) -> io::Result<()> {
-        self.writer.flush()
+        self.writer.flush()?;
+        self.size_since_last_flush = 0;
+        Ok(())
     }
 }
 
@@ -131,7 +169,7 @@ impl Display for Ext4SuperBlock {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct Ext4Inode {
     mode: u16,
     size: u64,
@@ -147,6 +185,7 @@ struct Ext4Extent {
 
 #[derive(Default)]
 struct Stats {
+    files_encountered: usize,
     files_searched: usize,
     files_contained_matches: usize,
     files_skipped_large: usize,
@@ -160,24 +199,25 @@ struct Stats {
     dirs_parsed: usize,
 }
 
-impl Stats {
-    pub fn print(&self) {
-        let total_files = self.files_searched;
+impl Display for Stats {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let total_files = self.files_encountered;
 
         let total_dirs = self.dirs_parsed
             + self.dirs_skipped_common
             + self.dirs_skipped_gitignore;
 
-        eprintln!("\n\x1b[1;32mSearch complete\x1b[0m");
+        writeln!(f, "\n\x1b[1;32mSearch complete\x1b[0m")?;
 
-        eprintln!("\x1b[1;34mFiles Summary:\x1b[0m");
+        writeln!(f, "\x1b[1;34mFiles Summary:\x1b[0m")?;
         macro_rules! file_row {
             ($label:expr, $count:expr) => {
                 let pct = if total_files == 0 { 0.0 } else { ($count as f64 / total_files as f64) * 100.0 };
-                eprintln!("  {:<25} {:>8} ({:>5.1}%)", $label, $count, pct);
+                writeln!(f, "  {:<25} {:>8} ({:>5.1}%)", $label, $count, pct)?;
             };
         }
 
+        file_row!("Files encountered", self.files_encountered);
         file_row!("Files searched", self.files_searched);
         file_row!("Files contained matches", self.files_contained_matches);
         file_row!("Skipped (large)", self.files_skipped_large);
@@ -186,36 +226,44 @@ impl Stats {
         file_row!("Skipped (unreadable)", self.files_skipped_unreadable);
         file_row!("Skipped (gitignore)", self.files_skipped_gitignore);
 
-        eprintln!("\n\x1b[1;34mDirectories Summary:\x1b[0m");
+        writeln!(f, "\n\x1b[1;34mDirectories Summary:\x1b[0m")?;
         macro_rules! dir_row {
             ($label:expr, $count:expr) => {
                 let pct = if total_dirs == 0 { 0.0 } else { ($count as f64 / total_dirs as f64) * 100.0 };
-                eprintln!("  {:<25} {:>8} ({:>5.1}%)", $label, $count, pct);
+                writeln!(f, "  {:<25} {:>8} ({:>5.1}%)", $label, $count, pct)?;
             };
         }
 
         dir_row!("Dirs parsed", self.dirs_parsed);
         dir_row!("Skipped (common)", self.dirs_skipped_common);
         dir_row!("Skipped (gitignore)", self.dirs_skipped_gitignore);
+
+        Ok(())
     }
 }
 
 struct RawGrepper {
     device_mmap: Mmap,
-    superblock: Ext4SuperBlock,
+    sb: Ext4SuperBlock,
 
     stats: Stats,
 
-    // ----- reused buffers
+    writer: BatchWriter,
+
+    // ------------- reused buffers
+    //    --- 3 main buffers
+      content_buf: Vec<u8>, // `DirKind::Content`
+          dir_buf: Vec<u8>, // `DirKind::Dir`
+    gitignore_buf: Vec<u8>, // `DirKind::Gitignore`
+
        extent_buf: Vec<Ext4Extent>,
-       output_buf: Vec<u8>,
-      content_buf: Vec<u8>,
-          dir_buf: Vec<u8>,
-    gitignore_buf: Vec<u8>,
+         path_buf: FixedPathBuf,
+     dir_name_buf: Vec<u8>,
 }
 
 impl RawGrepper {
-    fn new(device_path: &str) -> io::Result<Self> {
+    pub fn new(device_path: &str, search_root_path: &str) -> io::Result<Self> {
+        #[inline]
         fn device_size(fd: &File) -> io::Result<u64> {
             const BLKGETSIZE64: libc::c_ulong = 0x80081272;
 
@@ -274,14 +322,106 @@ impl RawGrepper {
 
         Ok(RawGrepper {
             device_mmap: mmap,
-            superblock,
+            sb: superblock,
+            path_buf: FixedPathBuf::from_bytes(search_root_path.as_bytes()),
+            writer: BatchWriter::new(),
             stats: Stats::default(),
-            dir_buf: Vec::with_capacity(256 * 1024),      // 256 KB for directories
-            content_buf: Vec::with_capacity(1024 * 1024), // 1 MB for file content
-            gitignore_buf: Vec::with_capacity(64 * 1024), // 64 KB for .gitignore
-            extent_buf: Vec::with_capacity(256),
-            output_buf: Vec::with_capacity(64 * 1024),
+            dir_name_buf: Vec::default(),
+            dir_buf: Vec::default(),
+            content_buf: Vec::default(),
+            gitignore_buf: Vec::default(),
+            extent_buf: Vec::default(),
         })
+    }
+
+    #[inline(always)]
+    fn init(&mut self) {
+        self.dir_name_buf.reserve(0x2000);   // 8 KB for directory names
+        self.dir_buf.reserve(256 * 1024);    // 256 KB for parsing directories
+        self.content_buf.reserve(0x100000);  // 1 MB for file content
+        self.gitignore_buf.reserve(0x4000);  // 16 KB for .gitignore
+        self.extent_buf.reserve(0x100);      // 256 extents, very cheap, covers ~all files
+    }
+
+    pub fn search(
+        mut self,
+        root_inode: INodeNum,
+        path_display_buf: &mut String,
+        matcher: &Matcher,
+        running: &Arc<AtomicBool>,
+        root_gitignore: Gitignore,
+    ) -> io::Result<Stats> {
+        let mut dir_stack = Vec::with_capacity(1024);
+        let mut gi_stack = Vec::with_capacity(64);
+
+        dir_stack.push(DirFrame {
+            inode_num: root_inode,
+            parent_len: self.path_buf.len(),
+            name_offset: 0,
+            name_len: 0, // Root has no name to add
+        });
+        gi_stack.push(GitignoreFrame { matcher: root_gitignore });
+
+        self.init();
+
+        while let Some(frame) = dir_stack.pop() {
+            if unlikely(!running.load(Ordering::Relaxed)) {
+                break;
+            }
+
+            self.path_buf.truncate(frame.parent_len);
+            if frame.name_len > 0 {
+                if likely(frame.parent_len > 0)
+                    && self.path_buf.as_bytes().get(frame.parent_len - 1) != Some(&b'/')
+                {
+                    self.path_buf.push(b'/');
+                }
+                let name = &self.dir_name_buf[
+                    frame.name_offset..
+                    frame.name_offset + frame.name_len
+                ];
+                self.path_buf.extend_from_slice(name);
+            }
+
+            let Ok(inode) = self.read_inode(frame.inode_num) else {
+                continue;
+            };
+
+            if unlikely((inode.mode & EXT4_S_IFMT) != EXT4_S_IFDIR) {
+                continue;
+            }
+
+            let last_segment = match self.path_buf.as_bytes().iter().rposition(|&b| b == b'/') {
+                Some(pos) => &self.path_buf.as_bytes()[pos + 1..],
+                None => self.path_buf.as_bytes(),
+            };
+            if is_common_skip_dir(last_segment) {
+                self.stats.dirs_skipped_common += 1;
+                continue;
+            }
+
+            self.display_path_into_buf(path_display_buf);
+            if is_gitignored(&gi_stack, path_display_buf.as_ref(), true) {
+                self.stats.dirs_skipped_gitignore += 1;
+                continue;
+            }
+
+            if self.process_directory(
+                &inode,
+                path_display_buf,
+                matcher,
+                &mut dir_stack,
+                &mut gi_stack,
+                self.path_buf.len(),
+            ).is_err() {
+                continue;
+            }
+        }
+
+        // Just in case ..
+        self.writer.flush()?;
+
+        Ok(self.stats)
     }
 
     #[inline(always)]
@@ -300,6 +440,14 @@ impl RawGrepper {
             BufKind::Dir       => &mut self.dir_buf,
             BufKind::Gitignore => &mut self.gitignore_buf,
         }
+    }
+
+    /// Called when either checking if a path is gitignored or printing the matches
+    #[inline(always)]
+    fn display_path_into_buf<'a>(&self, buf: &'a mut String) -> &'a str {
+        buf.clear();
+        buf.push_str(&String::from_utf8_lossy(self.path_buf.as_bytes()));
+        buf.as_str()
     }
 
     #[inline]
@@ -451,15 +599,15 @@ impl RawGrepper {
     // @Hot
     #[inline(always)]
     fn get_block(&self, block_num: BlockNum) -> &[u8] {
-        let offset = (block_num as usize).wrapping_mul(self.superblock.block_size as usize);
+        let offset = (block_num as usize).wrapping_mul(self.sb.block_size as usize);
         debug_assert!(
             self.device_mmap
-                .get(offset..offset + self.superblock.block_size as usize)
+                .get(offset..offset + self.sb.block_size as usize)
                 .is_some()
         );
         unsafe {
             let ptr = self.device_mmap.as_ptr().add(offset);
-            std::slice::from_raw_parts(ptr, self.superblock.block_size as usize)
+            std::slice::from_raw_parts(ptr, self.sb.block_size as usize)
         }
     }
 
@@ -470,7 +618,7 @@ impl RawGrepper {
             return;
         }
 
-        let mut sorted: SmallVec<[BlockNum; 16]> = copy_data(blocks);
+        let mut sorted: SmallVec<[_; 16]> = copy_data(blocks);
         sorted.sort_unstable();
         sorted.dedup();
 
@@ -490,10 +638,10 @@ impl RawGrepper {
     }
 
     #[cfg(unix)]
-    #[inline]
+    #[inline(always)]
     fn advise_range(&self, start_block: BlockNum, end_block: BlockNum) {
-        let offset = start_block as usize * self.superblock.block_size as usize;
-        let length = (end_block - start_block + 1) as usize * self.superblock.block_size as usize;
+        let offset = start_block as usize * self.sb.block_size as usize;
+        let length = (end_block - start_block + 1) as usize * self.sb.block_size as usize;
 
         if offset + length <= self.device_mmap.len() {
             unsafe {
@@ -512,18 +660,18 @@ impl RawGrepper {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "Invalid inode number 0"));
         }
 
-        let group = (inode_num - 1) / self.superblock.inodes_per_group;
-        let index = (inode_num - 1) % self.superblock.inodes_per_group;
+        let group = (inode_num - 1) / self.sb.inodes_per_group;
+        let index = (inode_num - 1) % self.sb.inodes_per_group;
 
-        let bg_desc_offset = if self.superblock.block_size == 1024 {
+        let bg_desc_offset = if self.sb.block_size == 1024 {
             2048
         } else {
-            self.superblock.block_size as usize
-        } + (group as usize * self.superblock.desc_size as usize);
+            self.sb.block_size as usize
+        } + (group as usize * self.sb.desc_size as usize);
 
         let bg_desc = &self.device_mmap[
             bg_desc_offset..
-            bg_desc_offset + self.superblock.desc_size as usize
+            bg_desc_offset + self.sb.desc_size as usize
         ];
 
         let inode_table_block = BlockNum::from_le_bytes([
@@ -534,13 +682,13 @@ impl RawGrepper {
         ]);
 
         let inode_offset = inode_table_block as usize *
-            self.superblock.block_size as usize +
+            self.sb.block_size as usize +
             index as usize *
-            self.superblock.inode_size as usize;
+            self.sb.inode_size as usize;
 
         let inode_bytes = &self.device_mmap[
             inode_offset..
-            inode_offset + self.superblock.inode_size as usize
+            inode_offset + self.sb.inode_size as usize
         ];
 
         let mode = u16::from_le_bytes([
@@ -580,7 +728,7 @@ impl RawGrepper {
     fn parse_extents(&mut self, inode: &Ext4Inode) -> io::Result<()> {
         self.extent_buf.clear();
 
-        let mut block_bytes: SmallVec<[u8; 64]> = smallvec![0; 60];
+        let mut block_bytes: SmallVec<[_; 64]> = smallvec![0; 64];
         for (i, bytes) in inode.blocks.into_iter().map(BlockNum::to_le_bytes).enumerate() {
             block_bytes[i * 4 + 0] = bytes[0];
             block_bytes[i * 4 + 1] = bytes[1];
@@ -657,91 +805,8 @@ impl RawGrepper {
 
             for child_block in child_blocks {
                 let block_data = self.get_block(child_block);
-                let block_copy: SmallVec<[u8; 4096]> = copy_data(block_data);
+                let block_copy: SmallVec<[_; 4096]> = copy_data(block_data);
                 self.parse_extent_node(&block_copy, level + 1)?;
-            }
-        }
-
-        Ok(())
-    }
-
-    pub fn search(
-        &mut self,
-        root_inode: INodeNum,
-        path: &mut FixedPathBuf,
-        path_display_buf: &mut String,
-        matcher: &Matcher,
-        writer: &mut BatchWriter,
-        running: &Arc<AtomicBool>,
-        root_gitignore: Gitignore,
-    ) -> io::Result<()> {
-        let mut dir_stack = Vec::with_capacity(1024);
-        let mut gi_stack = Vec::with_capacity(64);
-        // TODO: Move dir_name_buf and path_display_buf into `RawGrepper`
-        let mut dir_name_buf = Vec::with_capacity(4096); // Shared buffer for all directory names
-
-        dir_stack.push(DirFrame {
-            inode_num: root_inode,
-            parent_len: path.len(),
-            name_offset: 0,
-            name_len: 0, // Root has no name to add
-        });
-        gi_stack.push(GitignoreFrame { matcher: root_gitignore });
-
-        while let Some(frame) = dir_stack.pop() {
-            if unlikely(!running.load(Ordering::Relaxed)) {
-                break;
-            }
-
-            path.truncate(frame.parent_len);
-            if frame.name_len > 0 {
-                if likely(frame.parent_len > 0)
-                    && path.as_bytes().get(frame.parent_len - 1) != Some(&b'/')
-                {
-                    path.push(b'/');
-                }
-                let name = &dir_name_buf[
-                    frame.name_offset..
-                    frame.name_offset + frame.name_len
-                ];
-                path.extend_from_slice(name);
-            }
-
-            let Ok(inode) = self.read_inode(frame.inode_num) else {
-                continue;
-            };
-
-            if unlikely((inode.mode & EXT4_S_IFMT) != EXT4_S_IFDIR) {
-                continue;
-            }
-
-            let last_segment = match path.as_bytes().iter().rposition(|&b| b == b'/') {
-                Some(pos) => &path.as_bytes()[pos + 1..],
-                None => path.as_bytes(),
-            };
-            if is_common_skip_dir(last_segment) {
-                self.stats.dirs_skipped_common += 1;
-                continue;
-            }
-
-            display_bytes_into_display_buf(path_display_buf, path.as_bytes());
-            if is_gitignored(&gi_stack, path_display_buf.as_ref(), true) {
-                self.stats.dirs_skipped_gitignore += 1;
-                continue;
-            }
-
-            if self.process_directory(
-                &inode,
-                path,
-                path_display_buf,
-                matcher,
-                writer,
-                &mut dir_stack,
-                &mut gi_stack,
-                path.len(),
-                &mut dir_name_buf
-            ).is_err() {
-                continue;
             }
         }
 
@@ -752,14 +817,11 @@ impl RawGrepper {
     fn process_directory(
         &mut self,
         inode: &Ext4Inode,
-        path: &mut FixedPathBuf,
         path_display_buf: &mut String,
         matcher: &Matcher,
-        writer: &mut BatchWriter,
         dir_stack: &mut Vec<DirFrame>,
         gi_stack: &mut Vec<GitignoreFrame>,
         current_dir_path_len: usize,
-        dir_name_buf: &mut Vec<u8>,
     ) -> io::Result<()> {
         let dir_size = (inode.size as usize).min(MAX_DIR_BYTE_SIZE);
         self.read_file_into_buf(inode, dir_size, BufKind::Dir)?;
@@ -811,14 +873,11 @@ impl RawGrepper {
                     self.process_entry(
                         entry_inode,
                         &name_bytes_copy,
-                        path,
                         path_display_buf,
                         matcher,
-                        writer,
                         dir_stack,
                         gi_stack,
                         current_dir_path_len,
-                        dir_name_buf,
                     )?;
                 }
             }
@@ -838,14 +897,11 @@ impl RawGrepper {
         &mut self,
         entry_inode: INodeNum,
         name: &[u8],
-        path: &mut FixedPathBuf,
         path_display_buf: &mut String,
         matcher: &Matcher,
-        writer: &mut BatchWriter,
         dir_stack: &mut Vec<DirFrame>,
         gi_stack: &[GitignoreFrame],
         current_dir_path_len: usize,
-        dir_name_buf: &mut Vec<u8>,
     ) -> io::Result<()> {
         if is_common_skip_dir(name) {
             self.stats.dirs_skipped_common += 1;
@@ -853,18 +909,18 @@ impl RawGrepper {
         }
 
         // ------ Ensure we start from the current directory path
-        path.truncate(current_dir_path_len);
+        self.path_buf.truncate(current_dir_path_len);
 
         // ------ Build the full path: current_dir + '/' + name
         if likely(current_dir_path_len > 0)
-            && path.as_bytes().get(current_dir_path_len - 1) != Some(&b'/')
+            && self.path_buf.as_bytes().get(current_dir_path_len - 1) != Some(&b'/')
         {
-            path.push(b'/');
+            self.path_buf.push(b'/');
         }
-        path.extend_from_slice(name);
+        self.path_buf.extend_from_slice(name);
 
         let Ok(child_inode) = self.read_inode(entry_inode) else {
-            path.truncate(current_dir_path_len);
+            self.path_buf.truncate(current_dir_path_len);
             return Ok(());
         };
 
@@ -872,8 +928,8 @@ impl RawGrepper {
 
         if ft == EXT4_S_IFDIR {
             // ------ Store directory name in shared buffer
-            let name_offset = dir_name_buf.len();
-            dir_name_buf.extend_from_slice(name);
+            let name_offset = self.dir_name_buf.len();
+            self.dir_name_buf.extend_from_slice(name);
             let name_len = name.len();
 
             // ----- For directories: push with name stored in buffer
@@ -888,15 +944,13 @@ impl RawGrepper {
             self.process_file(
                 &child_inode,
                 name,
-                path.as_bytes(),
                 path_display_buf,
                 matcher,
-                writer,
                 gi_stack,
             )?;
         }
 
-        path.truncate(current_dir_path_len);
+        self.path_buf.truncate(current_dir_path_len);
 
         Ok(())
     }
@@ -906,12 +960,12 @@ impl RawGrepper {
         &mut self,
         child_inode: &Ext4Inode,
         name: &[u8],
-        path_bytes: &[u8],
         path_display_buf: &mut String,
         matcher: &Matcher,
-        writer: &mut BatchWriter,
         gi_stack: &[GitignoreFrame],
     ) -> io::Result<()> {
+        self.stats.files_encountered += 1;
+
         // -------------------- Rejection by size
         if unlikely(child_inode.size > MAX_FILE_BYTE_SIZE as u64) {
             self.stats.files_skipped_large += 1;
@@ -926,7 +980,7 @@ impl RawGrepper {
 
         // -------------------- Build display path
         // path_bytes contains the full path including filename
-        display_bytes_into_display_buf(path_display_buf, path_bytes);
+        self.display_path_into_buf(path_display_buf);
 
         // -------------------- Rejection by .gitignore
         if is_gitignored(gi_stack, path_display_buf.as_ref(), false) {
@@ -943,7 +997,7 @@ impl RawGrepper {
         let size = (child_inode.size as usize).min(MAX_FILE_BYTE_SIZE);
         if likely(self.read_file_into_buf(child_inode, size, BufKind::Content).is_ok()) {
             self.stats.files_searched += 1;
-            self.find_and_print_matches(matcher, path_display_buf, writer)?;
+            self.find_and_print_matches(matcher, path_display_buf)?;
         } else {
             self.stats.files_skipped_unreadable += 1;
         }
@@ -972,90 +1026,102 @@ impl RawGrepper {
         false
     }
 
-    fn read_file_into_buf(
-        &mut self,
-        inode: &Ext4Inode,
-        max_size: usize,
-        kind: BufKind
-    ) -> io::Result<()> {
-        self.get_buf_mut(kind).clear();
+    fn read_file_into_buf(&mut self, inode: &Ext4Inode, max_size: usize, kind: BufKind) -> io::Result<()> {
+        let buf = self.get_buf_mut(kind);
+        buf.clear();
         let size_to_read = (inode.size as usize).min(max_size);
-        self.get_buf_mut(kind).reserve(size_to_read);
+        buf.reserve(size_to_read);
 
-        let mut temp_buf: SmallVec<[u8; 4096]> = SmallVec::new();
+        let copy_block_to_buf = |this: &mut RawGrepper, block_num: BlockNum| {
+            let offset = this.get_buf(kind).len();
+            let remaining = size_to_read - offset;
+
+            let (src_ptr, to_copy) = {
+                let block_data = this.get_block(block_num);
+                let to_copy = block_data.len().min(remaining);
+                (block_data.as_ptr(), to_copy)
+            };
+
+            let buf = this.get_buf_mut(kind);
+            let old_len = buf.len();
+            buf.resize(old_len + to_copy, 0);
+
+            // SAFETY: We obtain the source pointer from block_data while it's borrowed,
+            // then drop that borrow before getting a mutable borrow to the destination buffer.
+            // The source pointer remains valid because get_block() returns data from a cache
+            // that won't be invalidated during this operation. We ensure no overlap between
+            // source and destination, and both pointers are valid for the copy length.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    src_ptr,
+                    buf.as_mut_ptr().add(old_len),
+                    to_copy
+                );
+            }
+        };
 
         if inode.flags & EXT4_EXTENTS_FL != 0 {
-            self.parse_extents(inode)?;
-            let extents = self.extent_buf.clone();
+            const MAX_EXTENTS_UNTIL_SPILL: usize = 64;
 
-            #[cfg(unix)]
+            self.parse_extents(inode)?;
+
+            let extent_count = self.extent_buf.len();
+            let extents_copy: SmallVec::<[_; MAX_EXTENTS_UNTIL_SPILL]> = copy_data(
+                &self.extent_buf[..extent_count]
+            );
+
+            // ------- Prefetch the blooooooocks
             {
-                let mut blocks_to_prefetch = SmallVec::<[_; 16]>::with_capacity(extents.len() * 4);
-                for extent in &extents {
-                    for i in 0..extent.len {
+                let mut blocks_to_prefetch = SmallVec::<[_; MAX_EXTENTS_UNTIL_SPILL]>::with_capacity(
+                    MAX_EXTENTS_UNTIL_SPILL
+                );
+                for extent in &extents_copy {
+                    for i in 0..extent.len.min((MAX_EXTENTS_UNTIL_SPILL / extents_copy.len().max(1)) as _) {
                         blocks_to_prefetch.push(extent.start_lo + i as BlockNum);
+                        if blocks_to_prefetch.len() >= MAX_EXTENTS_UNTIL_SPILL {
+                            break;
+                        }
+                    }
+                    if blocks_to_prefetch.len() >= MAX_EXTENTS_UNTIL_SPILL {
+                        break;
                     }
                 }
                 self.prefetch_blocks(&blocks_to_prefetch);
             }
 
-            for extent in &extents {
+            for extent in &extents_copy {
                 if self.get_buf(kind).len() >= size_to_read {
                     break;
                 }
-
-                for i in 0..extent.len {
+                for j in 0..extent.len {
                     if self.get_buf(kind).len() >= size_to_read {
                         break;
                     }
 
-                    let phys_block = extent.start_lo + i as BlockNum;
-
-                    {
-                        let block_data = self.get_block(phys_block);
-                        let remaining = size_to_read - self.get_buf(kind).len();
-                        let to_read = block_data.len().min(remaining);
-
-                        temp_buf.clear();
-                        temp_buf.extend_from_slice(&block_data[..to_read]);
-                    }
-
-                    self.get_buf_mut(kind).extend_from_slice(&temp_buf);
+                    let phys_block = extent.start_lo + j as BlockNum;
+                    copy_block_to_buf(self, phys_block);
                 }
             }
         } else {
-            // Direct blocks
-            #[cfg(unix)]
+            // ------- Prefetch the blooooooocks
             {
-                let mut blocks_to_prefetch = SmallVec::<[_; 12]>::with_capacity(12);
-                for i in 0..12 {
-                    if inode.blocks[i] != 0 {
-                        blocks_to_prefetch.push(inode.blocks[i]);
+                let mut blocks_to_prefetch = SmallVec::<[_; EXT4_BLOCK_POINTERS_COUNT]>::with_capacity(
+                    EXT4_BLOCK_POINTERS_COUNT
+                );
+                for &block in inode.blocks.iter().take(EXT4_BLOCK_POINTERS_COUNT) {
+                    if block != 0 {
+                        blocks_to_prefetch.push(block);
                     }
                 }
                 self.prefetch_blocks(&blocks_to_prefetch);
             }
 
-            for i in 0..12 {
-                if self.get_buf(kind).len() >= size_to_read {
+            for &block in inode.blocks.iter().take(EXT4_BLOCK_POINTERS_COUNT) {
+                if block == 0 || self.get_buf(kind).len() >= size_to_read {
                     break;
                 }
 
-                let block = inode.blocks[i];
-                if block == 0 {
-                    continue;
-                }
-
-                {
-                    let block_data = self.get_block(block);
-                    let remaining = size_to_read - self.get_buf(kind).len();
-                    let to_read = block_data.len().min(remaining);
-
-                    temp_buf.clear();
-                    temp_buf.extend_from_slice(&block_data[..to_read]);
-                }
-
-                self.get_buf_mut(kind).extend_from_slice(&temp_buf);
+                copy_block_to_buf(self, block);
             }
         }
 
@@ -1104,72 +1170,70 @@ impl RawGrepper {
     }
 
     #[inline]
-    pub fn find_and_print_matches(
+    fn find_and_print_matches(
         &mut self,
         matcher: &Matcher,
         path: &str,
-        writer: &mut BatchWriter,
     ) -> io::Result<()> {
         let buf = &self.content_buf;
-
         if unlikely(!matcher.is_match(buf)) {
             return Ok(());
         }
 
-        self.output_buf.clear();
         let mut found_any = false;
-
         let mut line_start = 0;
         let mut line_num = 1;
-
         let buf_len = buf.len();
 
         for nl in memchr::memchr_iter(b'\n', buf).chain(std::iter::once(buf_len)) {
-            let line = if nl == buf_len && line_start < buf_len {
-                &buf[line_start..]
-            } else if nl == buf_len {
-                break; // No last line to process
-            } else {
+            let line = if nl < buf_len {
                 &buf[line_start..nl]
+            } else {
+                debug_assert!(nl == buf_len);
+                if line_start < buf_len {
+                    &buf[line_start..]
+                } else {
+                    break;
+                }
             };
 
             if likely(matcher.is_match(line)) {
                 if unlikely(!found_any) {
-                    self.output_buf.extend_from_slice(COLOR_GREEN);
-                    self.output_buf.extend_from_slice(path.as_bytes());
-                    self.output_buf.extend_from_slice(COLOR_RESET);
-                    self.output_buf.extend_from_slice(b":\n");
+                    // green `path:`
+                    self.writer.write_all(COLOR_GREEN.as_bytes())?;
+                    self.writer.write_all(path.as_bytes())?;
+                    self.writer.write_all(COLOR_RESET.as_bytes())?;
+                    self.writer.write_all(b":\n")?;
                     found_any = true;
                 }
 
-                self.output_buf.extend_from_slice(COLOR_CYAN);
-                write_int(&mut self.output_buf, line_num);
-                self.output_buf.extend_from_slice(COLOR_RESET);
-                self.output_buf.extend_from_slice(b": ");
+                // cyan `line_num:`
+                self.writer.write_all(COLOR_CYAN.as_bytes())?;
+                self.writer.write_int(line_num)?;
+                self.writer.write_all(COLOR_RESET.as_bytes())?;
+                self.writer.write_all(b": ")?;
 
                 let display = truncate_utf8(line, 500);
-
                 let mut last = 0;
+
                 for (s, e) in matcher.find_matches(line) {
                     if unlikely(s >= display.len()) {
                         break;
                     }
                     let e = e.min(display.len());
 
-                    self.output_buf.extend_from_slice(&display[last..s]);
-                    self.output_buf.extend_from_slice(COLOR_RED);
-                    self.output_buf.extend_from_slice(&display[s..e]);
-                    self.output_buf.extend_from_slice(COLOR_RESET);
+                    // text before match
+                    self.writer.write_all(&display[last..s])?;
+                    // red `match`
+                    self.writer.write_all(COLOR_RED.as_bytes())?;
+                    self.writer.write_all(&display[s..e])?;
+                    self.writer.write_all(COLOR_RESET.as_bytes())?;
                     last = e;
                 }
 
-                self.output_buf.extend_from_slice(&display[last..]);
-                self.output_buf.push(b'\n');
-
-                if unlikely(self.output_buf.len() > 64 * 1024) {
-                    writer.write(&self.output_buf)?;
-                    self.output_buf.clear();
-                }
+                // stuff after the match
+                self.writer.write_all(&display[last..])?;
+                self.writer.write_all(b"\n")?;
             }
 
             line_start = nl + 1;
@@ -1177,9 +1241,6 @@ impl RawGrepper {
         }
 
         if likely(found_any) {
-            writer.write(&self.output_buf)?;
-            writer.flush()?;
-
             self.stats.files_contained_matches += 1;
         }
 
@@ -1187,6 +1248,7 @@ impl RawGrepper {
     }
 }
 
+#[inline]
 fn setup_signal_handler() -> Arc<AtomicBool> {
     let running = Arc::new(AtomicBool::new(true));
     let r = running.clone();
@@ -1195,7 +1257,7 @@ fn setup_signal_handler() -> Arc<AtomicBool> {
         r.store(false, Ordering::Relaxed);
         {
             let mut handle = io::stdout().lock();
-            _ = handle.write_all(CURSOR_UNHIDE);
+            _ = handle.write_all(CURSOR_UNHIDE.as_bytes());
         }
         _ = io::stdout().flush();
         std::process::exit(0);
@@ -1208,7 +1270,7 @@ struct CursorHide;
 
 impl CursorHide {
     fn new() -> io::Result<Self> {
-        io::stdout().lock().write_all(CURSOR_HIDE)?;
+        io::stdout().lock().write_all(CURSOR_HIDE.as_bytes())?;
         io::stdout().flush()?;
         Ok(CursorHide)
     }
@@ -1216,7 +1278,7 @@ impl CursorHide {
 
 impl Drop for CursorHide {
     fn drop(&mut self) {
-        _ = io::stdout().lock().write_all(CURSOR_UNHIDE);
+        _ = io::stdout().lock().write_all(CURSOR_UNHIDE.as_bytes());
         _ = io::stdout().flush();
     }
 }
@@ -1246,17 +1308,18 @@ fn main() -> io::Result<()> {
     let dir_path = dir_path.as_ref();
 
     // TODO: Detect the partition automatically
-    let mut reader = match RawGrepper::new(device) {
+    let mut reader = match RawGrepper::new(device, dir_path) {
         Ok(ok) => ok,
         Err(e) => {
+            eprint!("{COLOR_RED}");
             match e.kind() {
-                std::io::ErrorKind::NotFound => {
+                io::ErrorKind::NotFound => {
                     eprintln!("error: device or partition not found: '{device}'");
                 }
-                std::io::ErrorKind::PermissionDenied => {
+                io::ErrorKind::PermissionDenied => {
                     eprintln!("error: permission denied. Try running with sudo/root to read raw devices.");
                 }
-                std::io::ErrorKind::InvalidData => {
+                io::ErrorKind::InvalidData => {
                     eprintln!("error: invalid ext4 filesystem on this path: {e}");
                     eprintln!("help: make sure the path points to a partition (e.g., /dev/sda1) and not a whole disk (e.g., /dev/sda)");
                     eprintln!("tip: try running `df -Th /` to find your root partition");
@@ -1265,39 +1328,57 @@ fn main() -> io::Result<()> {
                     eprintln!("error: failed to initialize ext4 reader: {e}");
                 }
             }
+            eprint!("{COLOR_RESET}");
 
             std::process::exit(1);
         }
     };
 
-    eprintln!("\x1b[1;36mSearching\x1b[0m '{device}' for pattern: \x1b[1;31m'{pattern}'\x1b[0m\n");
+    let matcher = match Matcher::new(&pattern) {
+        Ok(m) => m,
+        Err(e) => {
+            eprint!("{COLOR_RED}");
+            match e.kind() {
+                io::ErrorKind::InvalidInput => {
+                    eprintln!("error: invalid pattern '{pattern}'");
+                    eprintln!("help: patterns must be valid regex or a literal/alternation extractable form");
+                    eprintln!("tip: test your regex with `grep -E` or a regex tester before running");
+                }
+                io::ErrorKind::NotFound => {
+                    // unlikely for this constructor, but here for completeness
+                    eprintln!("error: referenced something that wasn't found: {e}");
+                }
+                _ => {
+                    eprintln!("error: failed to build matcher: {e}");
+                }
+            }
+            eprint!("{COLOR_RESET}");
+
+            std::process::exit(1);
+        }
+    };
+
+    eprintln!("{COLOR_CYAN}Searching{COLOR_RESET} '{device}' for pattern: {COLOR_RED}'{pattern}'{COLOR_RESET}\n");
 
     let _cur = CursorHide::new();
 
     let start_inode = match reader.try_resolve_path_to_inode(&dir_path) {
         Ok(ok) => ok,
         Err(e) => {
-            eprintln!("error: couldn't find {dir_path} in {device}: {e}");
+            eprintln!("{COLOR_RED}error: couldn't find {dir_path} in {device}: {e}{COLOR_RESET}");
             std::process::exit(1);
         }
     };
 
-    let mut path = FixedPathBuf::from_bytes(dir_path.as_bytes());
-    let matcher = Matcher::new(&pattern)?;
-    let mut writer = BatchWriter::new();
-    let running = setup_signal_handler();
-    let gitignore = build_gitignore(dir_path.as_ref());
-    reader.search(
+    let stats = reader.search(
         start_inode,
-        &mut path,
         &mut dir_path.to_string(),
         &matcher,
-        &mut writer,
-        &running,
-        gitignore
+        &setup_signal_handler(),
+        build_gitignore(dir_path.as_ref())
     )?;
 
-    reader.stats.print();
+    eprintln!("{stats}");
 
     Ok(())
 }

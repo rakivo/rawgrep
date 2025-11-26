@@ -38,36 +38,6 @@ pub fn build_gitignore_from_bytes(parent_path: &Path, bytes: &[u8]) -> Gitignore
 }
 
 #[inline(always)]
-pub fn write_int(buf: &mut Vec<u8>, mut n: usize) {
-    if unlikely(n == 0) {
-        buf.push(b'0');
-        return;
-    }
-
-    if n < 10 {
-        buf.push(b'0' + n as u8);
-        return;
-    }
-
-    if n < 100 {
-        buf.push(b'0' + (n / 10) as u8);
-        buf.push(b'0' + (n % 10) as u8);
-        return;
-    }
-
-    let mut temp = [0u8; 20];
-    let mut i = temp.len();
-
-    while n > 0 {
-        i -= 1;
-        temp[i] = b'0' + (n % 10) as u8;
-        n /= 10;
-    }
-
-    buf.extend_from_slice(&temp[i..]);
-}
-
-#[inline(always)]
 pub fn truncate_utf8(s: &[u8], max: usize) -> &[u8] {
     if s.len() <= max {
         return s;
@@ -77,13 +47,6 @@ pub fn truncate_utf8(s: &[u8], max: usize) -> &[u8] {
         end -= 1;
     }
     &s[..end]
-}
-
-#[inline(always)]
-pub fn display_bytes_into_display_buf<'a>(buf: &'a mut String, bytes: &[u8]) -> &'a str {
-    buf.clear();
-    buf.push_str(&String::from_utf8_lossy(bytes));
-    buf.as_str()
 }
 
 // ---------------

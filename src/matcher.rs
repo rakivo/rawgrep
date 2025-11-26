@@ -74,24 +74,32 @@ impl Matcher {
     pub fn new(pattern: &str) -> io::Result<Self> {
         // Try literal extraction first
         if let Some(literal) = extract_literal(pattern) {
-            let finder = Finder::new(&literal).into_owned();
-            return Ok(Matcher::Literal(finder));
+            return Ok(Matcher::Literal(Finder::new(&literal).into_owned()));
         }
 
         // Try alternation extraction: "foo|bar|baz"
         if let Some(literals) = extract_alternation_literals(pattern) {
-            let ac = AhoCorasick::builder()
+            return AhoCorasick::builder()
                 .match_kind(aho_corasick::MatchKind::LeftmostFirst)
                 .build(&literals)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-            return Ok(Matcher::MultiLiteral(ac));
+                .map(Matcher::MultiLiteral)
+                .map_err(|e| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("invalid alternation pattern '{pattern}': {e}")
+                    )
+                });
         }
 
         // Fallback to regex
-        let re = Regex::new(pattern)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-
-        Ok(Matcher::Regex(re))
+        Regex::new(pattern)
+            .map(Matcher::Regex)
+            .map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("invalid regex '{pattern}': {e}")
+                )
+            })
     }
 
     #[inline(always)]
