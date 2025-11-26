@@ -1,0 +1,124 @@
+use std::io;
+
+use aho_corasick::AhoCorasick;
+use memchr::memmem::Finder;
+use regex::bytes::Regex;
+
+#[inline]
+fn extract_literal(pattern: &str) -> Option<Vec<u8>> {
+    let trimmed = pattern.trim_start_matches('^').trim_end_matches('$');
+
+    // Check for regex metacharacters
+    if trimmed.chars().any(|c| ".*+?[]{}()|\\^$".contains(c)) {
+        return None;
+    }
+
+    Some(trimmed.as_bytes().to_vec())
+}
+
+#[inline]
+fn extract_alternation_literals(pattern: &str) -> Option<Vec<Vec<u8>>> {
+    if !pattern.contains('|') {
+        return None;
+    }
+
+    let parts = pattern.split('|').collect::<Vec<_>>();
+    let mut literals = Vec::new();
+
+    for part in parts {
+        let trimmed = part.trim_start_matches('^').trim_end_matches('$');
+        if trimmed.chars().any(|c| ".*+?[]{}()\\^$".contains(c)) {
+            return None; // Contains regex metacharacters
+        }
+        literals.push(trimmed.as_bytes().to_vec());
+    }
+
+    Some(literals)
+}
+
+pub enum MatchIterator<'a> {
+    Literal {
+        iter: memchr::memmem::FindIter<'a, 'a>,
+        needle_len: usize,
+    },
+    MultiLiteral(aho_corasick::FindIter<'a, 'a>),
+    Regex(regex::bytes::Matches<'a, 'a>),
+}
+
+impl<'a> Iterator for MatchIterator<'a> {
+    type Item = (usize, usize);
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            MatchIterator::Literal { iter, needle_len } => {
+                iter.next().map(|pos| (pos, pos + *needle_len))
+            }
+            MatchIterator::MultiLiteral(iter) => {
+                iter.next().map(|m| (m.start(), m.end()))
+            }
+            MatchIterator::Regex(iter) => {
+                iter.next().map(|m| (m.start(), m.end()))
+            }
+        }
+    }
+}
+
+pub enum Matcher {
+    Literal(Finder<'static>),  // Single literal: "error"
+    MultiLiteral(AhoCorasick), // Multiple: "error|warning|fatal"
+    Regex(Regex),              // Complex patterns
+}
+
+impl Matcher {
+    pub fn new(pattern: &str) -> io::Result<Self> {
+        // Try literal extraction first
+        if let Some(literal) = extract_literal(pattern) {
+            let finder = Finder::new(&literal).into_owned();
+            return Ok(Matcher::Literal(finder));
+        }
+
+        // Try alternation extraction: "foo|bar|baz"
+        if let Some(literals) = extract_alternation_literals(pattern) {
+            let ac = AhoCorasick::builder()
+                .match_kind(aho_corasick::MatchKind::LeftmostFirst)
+                .build(&literals)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+            return Ok(Matcher::MultiLiteral(ac));
+        }
+
+        // Fallback to regex
+        let re = Regex::new(pattern)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+
+        Ok(Matcher::Regex(re))
+    }
+
+    #[inline(always)]
+    pub fn is_match(&self, haystack: &[u8]) -> bool {
+        match self {
+            Matcher::Literal(finder) => finder.find(haystack).is_some(),
+            Matcher::MultiLiteral(ac) => ac.is_match(haystack),
+            Matcher::Regex(re) => re.is_match(haystack),
+        }
+    }
+
+    #[inline(always)]
+    pub fn find_matches<'a>(&'a self, haystack: &'a [u8]) -> MatchIterator<'a> {
+        match self {
+            Matcher::Literal(finder) => {
+                MatchIterator::Literal {
+                    iter: finder.find_iter(haystack),
+                    needle_len: finder.needle().len(),
+                }
+            }
+            Matcher::MultiLiteral(ac) => {
+                MatchIterator::MultiLiteral(ac.find_iter(haystack))
+            }
+            Matcher::Regex(re) => {
+                MatchIterator::Regex(re.find_iter(haystack))
+            }
+        }
+    }
+}
+

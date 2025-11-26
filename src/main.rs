@@ -6,25 +6,28 @@
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 mod util;
-use ignore::gitignore::{Gitignore, GitignoreBuilder};
-use memmap2::{Mmap, MmapOptions};
+mod binary;
+mod matcher;
+mod path_buf;
 use util::{likely, unlikely};
 
 use std::os::fd::AsRawFd;
-use std::path::Path;
 use std::sync::Arc;
 use std::fmt::Display;
 use std::fs::{File, OpenOptions};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::io::{self, BufWriter, Write};
-#[cfg(target_arch = "x86_64")]
-use std::arch::x86_64::*;
 
-use aho_corasick::AhoCorasick;
-use memchr::memmem::Finder;
-use regex::bytes::Regex;
 use smallvec::{SmallVec, smallvec};
+use ignore::gitignore::Gitignore;
+use memmap2::{Mmap, MmapOptions};
 
+use crate::binary::{is_binary_chunk, is_binary_ext};
+use crate::matcher::Matcher as Matcher;
+use crate::path_buf::FixedPathBuf;
+use crate::util::{build_gitignore, build_gitignore_from_bytes, display_bytes_into_display_buf, is_common_skip_dir, is_dot_entry, is_gitignored, truncate_utf8, write_int};
+
+const BINARY_CONTROL_COUNT: usize = 51;
 const BINARY_PROBE_BYTE_SIZE: usize = 0x1000;
 
 const MAX_DIR_BYTE_SIZE: usize = 16 * 1024 * 1024;
@@ -62,376 +65,27 @@ const CURSOR_UNHIDE: &[u8] = b"\x1b[?25h";
 type INodeNum = u32;
 type BlockNum = u32;
 
+/// Function used to indicate that we copy some amount of copiable data (bytes) into a newly allocated memory
+#[inline(always)]
+fn copy_data<A, T>(bytes: &[T]) -> SmallVec<A>
+where
+    A: smallvec::Array<Item = T>,
+    T: Copy
+{
+    SmallVec::from_slice(bytes)
+}
+
 #[derive(Copy, Clone)]
 enum BufKind { Content, Dir, Gitignore }
 
 struct DirFrame {
     inode_num: INodeNum,
-    parent_len: usize,      // Length of parent path (before this directory)
-    name_offset: usize,     // Offset into dir_name_buf
-    name_len: usize,        // Length of directory name
+    parent_len: usize,   // Length of parent path (before this directory)
+    name_offset: usize,  // Offset into `dir_name_buf`
+    name_len: usize,     // Length of directory name
 }
 
-struct GitignoreFrame {
-    matcher: Gitignore,
-}
-
-static BYTE_CLASS: [bool; 256] = {
-    let mut table = [false; 256];
-    let mut i = 0;
-    while i < 256 {
-        table[i] = match i as u8 {
-            0x09 | 0x0A | 0x0D | 0x20..=0x7E | 0x80..=0xFF => true,
-            _ => false,
-        };
-        i += 1;
-    }
-    table
-};
-
-#[inline(always)]
-const fn is_dot_entry(name: &[u8]) -> bool {
-    name.len() == 1 && name[0] == b'.' ||
-    name.len() == 2 && name[0] == b'.' && name[1] == b'.'
-}
-
-#[inline]
-fn is_binary_chunk(data: &[u8]) -> bool {
-    if data.is_empty() {
-        return false;
-    }
-
-    if memchr::memchr(0, data).is_some() {
-        return true;
-    }
-
-    if cfg!(target_arch = "x86_64") && is_x86_feature_detected!("sse2") {
-        unsafe { is_binary_chunk_simd_sse2(data) }
-    } else {
-        is_binary_chunk_(data)
-    }
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "sse2")]
-unsafe fn is_binary_chunk_simd_sse2(data: &[u8]) -> bool {
-    let check_len = data.len().min(512);
-    let mut control_count = 0;
-
-    let chunks = check_len / 16;
-    let ptr = data.as_ptr();
-
-    // Create masks for allowed control chars: \t (0x09), \n (0x0A), \r (0x0D)
-    let tab = _mm_set1_epi8(0x09);
-    let lf = _mm_set1_epi8(0x0A);
-    let cr = _mm_set1_epi8(0x0D);
-    let space = _mm_set1_epi8(0x20);
-
-    for i in 0..chunks {
-        let chunk = unsafe { _mm_loadu_si128(ptr.add(i * 16) as *const __m128i) };
-
-        // Find bytes < 0x20 (potential control characters)
-        let below_space = _mm_cmplt_epi8(chunk, space);
-
-        // Exclude allowed control chars: tab, LF, CR
-        let is_tab = _mm_cmpeq_epi8(chunk, tab);
-        let is_lf = _mm_cmpeq_epi8(chunk, lf);
-        let is_cr = _mm_cmpeq_epi8(chunk, cr);
-
-        // Combine: allowed = tab | lf | cr
-        let allowed = _mm_or_si128(_mm_or_si128(is_tab, is_lf), is_cr);
-
-        // Bad control chars = below_space AND NOT allowed
-        let bad_controls = _mm_andnot_si128(allowed, below_space);
-
-        let mask = _mm_movemask_epi8(bad_controls) as u32;
-        control_count += mask.count_ones() as usize;
-
-        if control_count > 51 {
-            return true;
-        }
-    }
-
-    // Handle remaining bytes
-    for &byte in &data[chunks * 16..check_len] {
-        if !BYTE_CLASS[byte as usize] {
-            control_count += 1;
-            if control_count > 51 {
-                return true;
-            }
-        }
-    }
-
-    false
-}
-
-#[inline]
-fn is_binary_chunk_(data: &[u8]) -> bool {
-    let check_len = data.len().min(512);
-    let mut control_count = 0;
-
-    let mut i = 0;
-    while i + 4 <= check_len {
-        control_count += !BYTE_CLASS[data[i+0] as usize] as usize;
-        control_count += !BYTE_CLASS[data[i+1] as usize] as usize;
-        control_count += !BYTE_CLASS[data[i+2] as usize] as usize;
-        control_count += !BYTE_CLASS[data[i+3] as usize] as usize;
-
-        if control_count > 51 {
-            return true;
-        }
-        i += 4;
-    }
-
-    // Handle remaining bytes
-    while i < check_len {
-        control_count += !BYTE_CLASS[data[i] as usize] as usize;
-        if control_count > 51 {
-            return true;
-        }
-        i += 1;
-    }
-
-    false
-}
-
-#[inline(always)]
-const fn is_common_skip_dir(dir: &[u8]) -> bool {
-    matches!(dir, b"node_modules" | b"target" | b".git" | b".hg" | b".svn")
-}
-
-#[inline(always)]
-fn is_binary_ext(ext: &[u8]) -> bool {
-    const BINARY_EXTS: &[&[u8]] = &[
-        b"png",b"jpg",b"jpeg",b"gif",b"class",b"so",b"o",b"a",
-        b"pdf",b"zip",b"tar",b"gz",b"7z",b"exe",b"dll",b"bin",
-    ];
-
-    BINARY_EXTS.contains(&ext)
-}
-
-#[inline(always)]
-fn is_gitignored(frames: &[GitignoreFrame], path: &Path, is_dir: bool) -> bool {
-    for frame in frames.iter().rev() {
-        if frame.matcher.matched(path, is_dir).is_ignore() {
-            return true;
-        }
-    }
-    false
-}
-
-#[inline(always)]
-fn build_gitignore(root: &Path) -> Gitignore {
-    let mut builder = GitignoreBuilder::new(root);
-    builder.add(root.join(".gitignore"));
-    builder.build().unwrap()
-}
-
-#[inline(always)]
-fn build_gitignore_from_bytes(parent_path: &Path, bytes: &[u8]) -> Gitignore {
-    let mut builder = GitignoreBuilder::new(parent_path);
-    for line in bytes.split(|&b| b == b'\n') {
-        if let Ok(s) = std::str::from_utf8(line) {
-            builder.add_line(None, s).ok();
-        }
-    }
-    builder.build().unwrap_or_else(|_| Gitignore::empty())
-}
-
-#[inline(always)]
-fn write_int(buf: &mut Vec<u8>, mut n: usize) {
-    if unlikely(n == 0) {
-        buf.push(b'0');
-        return;
-    }
-
-    if n < 10 {
-        buf.push(b'0' + n as u8);
-        return;
-    }
-
-    if n < 100 {
-        buf.push(b'0' + (n / 10) as u8);
-        buf.push(b'0' + (n % 10) as u8);
-        return;
-    }
-
-    let mut temp = [0u8; 20];
-    let mut i = temp.len();
-
-    while n > 0 {
-        i -= 1;
-        temp[i] = b'0' + (n % 10) as u8;
-        n /= 10;
-    }
-
-    buf.extend_from_slice(&temp[i..]);
-}
-
-#[inline(always)]
-fn truncate_utf8(s: &[u8], max: usize) -> &[u8] {
-    if s.len() <= max {
-        return s;
-    }
-    let mut end = max;
-    while end > 0 && (s[end] & 0b1100_0000) == 0b1000_0000 {
-        end -= 1;
-    }
-    &s[..end]
-}
-
-#[inline(always)]
-fn display_bytes_into_display_buf<'a>(buf: &'a mut String, bytes: &[u8]) -> &'a str {
-    buf.clear();
-    buf.push_str(&String::from_utf8_lossy(bytes));
-    buf.as_str()
-}
-
-const MAX_PATH: usize = 4096;
-
-struct FixedPathBuf {
-    buf: [u8; MAX_PATH],
-    len: usize,
-}
-
-impl FixedPathBuf {
-    #[inline]
-    fn new() -> Self {
-        Self {
-            buf: [0; MAX_PATH],
-            len: 0,
-        }
-    }
-
-    #[inline]
-    fn with_initial(s: &[u8]) -> Self {
-        let mut pb = Self::new();
-        pb.extend_from_slice(s);
-        pb
-    }
-
-    #[inline(always)]
-    fn push(&mut self, byte: u8) {
-        if likely(self.len < MAX_PATH) {
-            self.buf[self.len] = byte;
-            self.len += 1;
-        }
-    }
-
-    #[inline(always)]
-    fn extend_from_slice(&mut self, slice: &[u8]) {
-        let copy_len = slice.len().min(MAX_PATH - self.len);
-        self.buf[self.len..self.len + copy_len].copy_from_slice(&slice[..copy_len]);
-        self.len += copy_len;
-    }
-
-    #[inline(always)]
-    fn truncate(&mut self, len: usize) {
-        self.len = len;
-    }
-
-    #[inline(always)]
-    fn len(&self) -> usize {
-        self.len
-    }
-
-    #[inline(always)]
-    fn as_bytes(&self) -> &[u8] {
-        &self.buf[..self.len]
-    }
-}
-
-pub enum FastMatcher {
-    Literal(Finder<'static>),  // Single literal: "error"
-    MultiLiteral(AhoCorasick), // Multiple: "error|warning|fatal"
-    Regex(Regex),              // Complex patterns
-}
-
-impl FastMatcher {
-    pub fn new(pattern: &str) -> io::Result<Self> {
-        // Try literal extraction first
-        if let Some(literal) = extract_literal(pattern) {
-            let finder = Finder::new(&literal).into_owned();
-            return Ok(FastMatcher::Literal(finder));
-        }
-
-        // Try alternation extraction: "foo|bar|baz"
-        if let Some(literals) = extract_alternation_literals(pattern) {
-            let ac = AhoCorasick::builder()
-                .match_kind(aho_corasick::MatchKind::LeftmostFirst)
-                .build(&literals)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-            return Ok(FastMatcher::MultiLiteral(ac));
-        }
-
-        // Fallback to regex
-        let re = Regex::new(pattern)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-        Ok(FastMatcher::Regex(re))
-    }
-
-    #[inline(always)]
-    fn is_match(&self, haystack: &[u8]) -> bool {
-        match self {
-            FastMatcher::Literal(finder) => finder.find(haystack).is_some(),
-            FastMatcher::MultiLiteral(ac) => ac.is_match(haystack),
-            FastMatcher::Regex(re) => re.is_match(haystack),
-        }
-    }
-
-    #[inline]
-    fn find_matches<'a>(&'a self, haystack: &'a [u8], matches: &mut SmallVec<[(usize, usize); 4]>) {
-        matches.clear();
-        match self {
-            FastMatcher::Literal(finder) => {
-                let needle_len = finder.needle().len();
-                for pos in finder.find_iter(haystack) {
-                    matches.push((pos, pos + needle_len));
-                }
-            }
-            FastMatcher::MultiLiteral(ac) => {
-                for m in ac.find_iter(haystack) {
-                    matches.push((m.start(), m.end()));
-                }
-            }
-            FastMatcher::Regex(re) => {
-                for m in re.find_iter(haystack) {
-                    matches.push((m.start(), m.end()));
-                }
-            }
-        }
-    }
-}
-
-fn extract_literal(pattern: &str) -> Option<Vec<u8>> {
-    let trimmed = pattern.trim_start_matches('^').trim_end_matches('$');
-
-    // Check for regex metacharacters
-    if trimmed.chars().any(|c| ".*+?[]{}()|\\^$".contains(c)) {
-        return None;
-    }
-
-    Some(trimmed.as_bytes().to_vec())
-}
-
-fn extract_alternation_literals(pattern: &str) -> Option<Vec<Vec<u8>>> {
-    if !pattern.contains('|') {
-        return None;
-    }
-
-    let parts: Vec<_> = pattern.split('|').collect();
-    let mut literals = Vec::new();
-
-    for part in parts {
-        let trimmed = part.trim_start_matches('^').trim_end_matches('$');
-        if trimmed.chars().any(|c| ".*+?[]{}()\\^$".contains(c)) {
-            return None; // Contains regex metacharacters
-        }
-        literals.push(trimmed.as_bytes().to_vec());
-    }
-
-    Some(literals)
-}
+struct GitignoreFrame { matcher: Gitignore }
 
 pub struct BatchWriter {
     writer: BufWriter<io::Stdout>,
@@ -816,7 +470,7 @@ impl RawGrepper {
             return;
         }
 
-        let mut sorted = SmallVec::<[BlockNum; 16]>::from(blocks);
+        let mut sorted: SmallVec<[BlockNum; 16]> = copy_data(blocks);
         sorted.sort_unstable();
         sorted.dedup();
 
@@ -1003,7 +657,7 @@ impl RawGrepper {
 
             for child_block in child_blocks {
                 let block_data = self.get_block(child_block);
-                let block_copy: SmallVec<[u8; 4096]> = SmallVec::from_slice(block_data);
+                let block_copy: SmallVec<[u8; 4096]> = copy_data(block_data);
                 self.parse_extent_node(&block_copy, level + 1)?;
             }
         }
@@ -1016,7 +670,7 @@ impl RawGrepper {
         root_inode: INodeNum,
         path: &mut FixedPathBuf,
         path_display_buf: &mut String,
-        matcher: &FastMatcher,
+        matcher: &Matcher,
         writer: &mut BatchWriter,
         running: &Arc<AtomicBool>,
         root_gitignore: Gitignore,
@@ -1030,7 +684,7 @@ impl RawGrepper {
             inode_num: root_inode,
             parent_len: path.len(),
             name_offset: 0,
-            name_len: 0,  // Root has no name to add
+            name_len: 0, // Root has no name to add
         });
         gi_stack.push(GitignoreFrame { matcher: root_gitignore });
 
@@ -1041,10 +695,15 @@ impl RawGrepper {
 
             path.truncate(frame.parent_len);
             if frame.name_len > 0 {
-                if frame.parent_len > 0 && path.as_bytes().get(frame.parent_len - 1) != Some(&b'/') {
+                if likely(frame.parent_len > 0)
+                    && path.as_bytes().get(frame.parent_len - 1) != Some(&b'/')
+                {
                     path.push(b'/');
                 }
-                let name = &dir_name_buf[frame.name_offset..frame.name_offset + frame.name_len];
+                let name = &dir_name_buf[
+                    frame.name_offset..
+                    frame.name_offset + frame.name_len
+                ];
                 path.extend_from_slice(name);
             }
 
@@ -1095,12 +754,12 @@ impl RawGrepper {
         inode: &Ext4Inode,
         path: &mut FixedPathBuf,
         path_display_buf: &mut String,
-        matcher: &FastMatcher,
+        matcher: &Matcher,
         writer: &mut BatchWriter,
         dir_stack: &mut Vec<DirFrame>,
         gi_stack: &mut Vec<GitignoreFrame>,
         current_dir_path_len: usize,
-        dir_name_buf: &mut Vec<u8>,  // Shared buffer for directory names
+        dir_name_buf: &mut Vec<u8>,
     ) -> io::Result<()> {
         let dir_size = (inode.size as usize).min(MAX_DIR_BYTE_SIZE);
         self.read_file_into_buf(inode, dir_size, BufKind::Dir)?;
@@ -1145,7 +804,7 @@ impl RawGrepper {
                         continue;
                     }
 
-                    let name_bytes_copy = SmallVec::<[_; 256]>::from(
+                    let name_bytes_copy: SmallVec::<[_; 256]> = copy_data(
                         &self.dir_buf[offset + 8..name_end]
                     );
 
@@ -1181,7 +840,7 @@ impl RawGrepper {
         name: &[u8],
         path: &mut FixedPathBuf,
         path_display_buf: &mut String,
-        matcher: &FastMatcher,
+        matcher: &Matcher,
         writer: &mut BatchWriter,
         dir_stack: &mut Vec<DirFrame>,
         gi_stack: &[GitignoreFrame],
@@ -1197,7 +856,9 @@ impl RawGrepper {
         path.truncate(current_dir_path_len);
 
         // ------ Build the full path: current_dir + '/' + name
-        if likely(current_dir_path_len > 0 && path.as_bytes().get(current_dir_path_len - 1) != Some(&b'/')) {
+        if likely(current_dir_path_len > 0)
+            && path.as_bytes().get(current_dir_path_len - 1) != Some(&b'/')
+        {
             path.push(b'/');
         }
         path.extend_from_slice(name);
@@ -1247,7 +908,7 @@ impl RawGrepper {
         name: &[u8],
         path_bytes: &[u8],
         path_display_buf: &mut String,
-        matcher: &FastMatcher,
+        matcher: &Matcher,
         writer: &mut BatchWriter,
         gi_stack: &[GitignoreFrame],
     ) -> io::Result<()> {
@@ -1445,7 +1106,7 @@ impl RawGrepper {
     #[inline]
     pub fn find_and_print_matches(
         &mut self,
-        matcher: &FastMatcher,
+        matcher: &Matcher,
         path: &str,
         writer: &mut BatchWriter,
     ) -> io::Result<()> {
@@ -1457,16 +1118,20 @@ impl RawGrepper {
 
         self.output_buf.clear();
         let mut found_any = false;
-        let mut matches = SmallVec::<[(usize, usize); 4]>::new();
 
         let mut line_start = 0;
         let mut line_num = 1;
 
-        let mut newlines: SmallVec<[usize; 256]> = SmallVec::new();
-        newlines.extend(memchr::memchr_iter(b'\n', buf));
+        let buf_len = buf.len();
 
-        for &nl in &newlines {
-            let line = &buf[line_start..nl];
+        for nl in memchr::memchr_iter(b'\n', buf).chain(std::iter::once(buf_len)) {
+            let line = if nl == buf_len && line_start < buf_len {
+                &buf[line_start..]
+            } else if nl == buf_len {
+                break; // No last line to process
+            } else {
+                &buf[line_start..nl]
+            };
 
             if likely(matcher.is_match(line)) {
                 if unlikely(!found_any) {
@@ -1483,10 +1148,9 @@ impl RawGrepper {
                 self.output_buf.extend_from_slice(b": ");
 
                 let display = truncate_utf8(line, 500);
-                matcher.find_matches(line, &mut matches);
 
                 let mut last = 0;
-                for &(s, e) in &matches {
+                for (s, e) in matcher.find_matches(line) {
                     if unlikely(s >= display.len()) {
                         break;
                     }
@@ -1510,45 +1174,6 @@ impl RawGrepper {
 
             line_start = nl + 1;
             line_num += 1;
-        }
-
-        // Last line
-        if line_start < buf.len() {
-            let line = &buf[line_start..];
-            if matcher.is_match(line) {
-                if !found_any {
-                    self.output_buf.extend_from_slice(COLOR_GREEN);
-                    self.output_buf.extend_from_slice(path.as_bytes());
-                    self.output_buf.extend_from_slice(COLOR_RESET);
-                    self.output_buf.extend_from_slice(b":\n");
-                    found_any = true;
-                }
-
-                self.output_buf.extend_from_slice(COLOR_CYAN);
-                write_int(&mut self.output_buf, line_num);
-                self.output_buf.extend_from_slice(COLOR_RESET);
-                self.output_buf.extend_from_slice(b": ");
-
-                let display = truncate_utf8(line, 500);
-                matcher.find_matches(line, &mut matches);
-
-                let mut last = 0;
-                for &(s, e) in &matches {
-                    if s >= display.len() {
-                        break;
-                    }
-                    let e = e.min(display.len());
-
-                    self.output_buf.extend_from_slice(&display[last..s]);
-                    self.output_buf.extend_from_slice(COLOR_RED);
-                    self.output_buf.extend_from_slice(&display[s..e]);
-                    self.output_buf.extend_from_slice(COLOR_RESET);
-                    last = e;
-                }
-
-                self.output_buf.extend_from_slice(&display[last..]);
-                self.output_buf.push(b'\n');
-            }
         }
 
         if likely(found_any) {
@@ -1657,8 +1282,8 @@ fn main() -> io::Result<()> {
         }
     };
 
-    let mut path = FixedPathBuf::with_initial(dir_path.as_bytes());
-    let matcher = FastMatcher::new(&pattern)?;
+    let mut path = FixedPathBuf::from_bytes(dir_path.as_bytes());
+    let matcher = Matcher::new(&pattern)?;
     let mut writer = BatchWriter::new();
     let running = setup_signal_handler();
     let gitignore = build_gitignore(dir_path.as_ref());
