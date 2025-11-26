@@ -14,10 +14,10 @@ const BYTE_CLASS: [bool; 256] = {
     let mut table = [false; 256];
     let mut i = 0;
     while i < 256 {
-        table[i] = match i as u8 {
-            0x09 | 0x0A | 0x0D | 0x20..=0x7E | 0x80..=0xFF => true,
-            _ => false,
-        };
+        table[i] = matches!(
+            i as u8,
+            0x09 | 0x0A | 0x0D | 0x20..=0x7E | 0x80..=0xFF
+        );
         i += 1;
     }
     table
@@ -104,7 +104,7 @@ fn is_binary_chunk_(data: &[u8]) -> bool {
 
     let mut i = 0;
     while i + 4 <= check_len {
-        control_count += !BYTE_CLASS[data[i+0] as usize] as usize;
+        control_count += !BYTE_CLASS[data[i] as usize] as usize;
         control_count += !BYTE_CLASS[data[i+1] as usize] as usize;
         control_count += !BYTE_CLASS[data[i+2] as usize] as usize;
         control_count += !BYTE_CLASS[data[i+3] as usize] as usize;

@@ -1,6 +1,11 @@
 #![cfg_attr(feature = "use_nightly", allow(internal_features))]
 #![cfg_attr(feature = "use_nightly", feature(core_intrinsics))]
 
+#![allow(
+    clippy::identity_op,
+    clippy::only_used_in_recursion
+)]
+
 #[cfg(feature = "mimalloc")]
 #[global_allocator]
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -10,9 +15,9 @@ mod binary;
 mod matcher;
 mod path_buf;
 
-use crate::binary::{is_binary_chunk, is_binary_ext};
-use crate::matcher::Matcher as Matcher;
+use crate::matcher::Matcher;
 use crate::path_buf::FixedPathBuf;
+use crate::binary::{is_binary_chunk, is_binary_ext};
 use crate::util::{
     likely,
     unlikely,
@@ -104,6 +109,12 @@ pub struct BatchWriter<const BATCH_SIZE: usize = 0x8000> {
     size_since_last_flush: usize,
 }
 
+impl<const BATCH_SIZE: usize> Default for BatchWriter<BATCH_SIZE> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<const BATCH_SIZE: usize> BatchWriter<BATCH_SIZE> {
     #[inline(always)]
     pub fn new() -> Self {
@@ -166,7 +177,7 @@ impl Display for Ext4SuperBlock {
         writeln!(f, "Blocks per group: {}", self.blocks_per_group)?;
         writeln!(f, "Inodes per group: {}", self.inodes_per_group)?;
         writeln!(f, "Inode size: {} bytes", self.inode_size)?;
-        write!  (f, "Descriptor size: {} bytes\n", self.desc_size)?;
+        writeln!(f, "Descriptor size: {} bytes", self.desc_size)?;
         Ok(())
     }
 }
@@ -262,6 +273,7 @@ struct RawGrepper {
     stats: Stats,
 
     writer: BatchWriter,
+    matcher: Matcher,
 
     // ------------- reused buffers
     //    --- 3 main buffers
@@ -275,7 +287,11 @@ struct RawGrepper {
 }
 
 impl RawGrepper {
-    pub fn new(device_path: &str, search_root_path: &str) -> io::Result<Self> {
+    pub fn new(
+        device_path: &str,
+        search_root_path: &str,
+        pattern: &str
+    ) -> io::Result<Self> {
         #[inline]
         fn device_size(fd: &File) -> io::Result<u64> {
             const BLKGETSIZE64: libc::c_ulong = 0x80081272;
@@ -291,6 +307,30 @@ impl RawGrepper {
 
             Ok(size)
         }
+
+        let matcher = match Matcher::new(pattern) {
+            Ok(m) => m,
+            Err(e) => {
+                eprint!("{COLOR_RED}");
+                match e.kind() {
+                    io::ErrorKind::InvalidInput => {
+                        eprintln!("error: invalid pattern '{pattern}'");
+                        eprintln!("help: patterns must be valid regex or a literal/alternation extractable form");
+                        eprintln!("tip: test your regex with `grep -E` or a regex tester before running");
+                    }
+                    io::ErrorKind::NotFound => {
+                        // unlikely for this constructor, but here for completeness
+                        eprintln!("error: referenced something that wasn't found: {e}");
+                    }
+                    _ => {
+                        eprintln!("error: failed to build matcher: {e}");
+                    }
+                }
+                eprint!("{COLOR_RESET}");
+
+                std::process::exit(1);
+            }
+        };
 
         let file = OpenOptions::new()
             .read(true)
@@ -327,7 +367,7 @@ impl RawGrepper {
         if magic != EXT4_SUPER_MAGIC {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("Not an ext4 filesystem")
+                "Not an ext4 filesystem".to_string()
             ));
         }
 
@@ -336,6 +376,7 @@ impl RawGrepper {
         Ok(RawGrepper {
             device_mmap: mmap,
             sb: superblock,
+            matcher,
             path_buf: FixedPathBuf::from_bytes(search_root_path.as_bytes()),
             writer: BatchWriter::new(),
             stats: Stats::default(),
@@ -356,148 +397,9 @@ impl RawGrepper {
         self.extent_buf.reserve(0x100);      // 256 extents, very cheap, covers ~all files
     }
 
-    pub fn search(
-        mut self,
-        root_inode: INodeNum,
-        path_display_buf: &mut String,
-        matcher: &Matcher,
-        running: &Arc<AtomicBool>,
-        root_gitignore: Gitignore,
-    ) -> io::Result<Stats> {
-        let mut dir_stack = Vec::with_capacity(1024);
-        let mut gi_stack = Vec::with_capacity(64);
-
-        dir_stack.push(DirFrame {
-            inode_num: root_inode,
-            parent_len: self.path_buf.len(),
-            name_offset: 0,
-            name_len: 0, // Root has no name to add
-        });
-        gi_stack.push(GitignoreFrame { matcher: root_gitignore });
-
-        self.init();
-
-        while let Some(frame) = dir_stack.pop() {
-            if unlikely(!running.load(Ordering::Relaxed)) {
-                break;
-            }
-
-            self.path_buf.truncate(frame.parent_len);
-            if frame.name_len > 0 {
-                if likely(frame.parent_len > 0)
-                    && self.path_buf.as_bytes().get(frame.parent_len - 1) != Some(&b'/')
-                {
-                    self.path_buf.push(b'/');
-                }
-                let name = &self.dir_name_buf[
-                    frame.name_offset..
-                    frame.name_offset + frame.name_len
-                ];
-                self.path_buf.extend_from_slice(name);
-            }
-
-            let Ok(inode) = self.read_inode(frame.inode_num) else {
-                continue;
-            };
-
-            if unlikely((inode.mode & EXT4_S_IFMT) != EXT4_S_IFDIR) {
-                continue;
-            }
-
-            let last_segment = match self.path_buf.as_bytes().iter().rposition(|&b| b == b'/') {
-                Some(pos) => &self.path_buf.as_bytes()[pos + 1..],
-                None => self.path_buf.as_bytes(),
-            };
-            if is_common_skip_dir(last_segment) {
-                self.stats.dirs_skipped_common += 1;
-                continue;
-            }
-
-            self.display_path_into_buf(path_display_buf);
-            if is_gitignored(&gi_stack, path_display_buf.as_ref(), true) {
-                self.stats.dirs_skipped_gitignore += 1;
-                continue;
-            }
-
-            if self.process_directory(
-                &inode,
-                path_display_buf,
-                matcher,
-                &mut dir_stack,
-                &mut gi_stack,
-                self.path_buf.len(),
-            ).is_err() {
-                continue;
-            }
-        }
-
-        // Just in case ..
-        self.writer.flush()?;
-
-        Ok(self.stats)
-    }
-
-    #[inline(always)]
-    const fn get_buf(&self, kind: BufKind) -> &Vec<u8> {
-        match kind {
-            BufKind::Content   => &self.content_buf,
-            BufKind::Dir       => &self.dir_buf,
-            BufKind::Gitignore => &self.gitignore_buf,
-        }
-    }
-
-    #[inline(always)]
-    const fn get_buf_mut(&mut self, kind: BufKind) -> &mut Vec<u8> {
-        match kind {
-            BufKind::Content   => &mut self.content_buf,
-            BufKind::Dir       => &mut self.dir_buf,
-            BufKind::Gitignore => &mut self.gitignore_buf,
-        }
-    }
-
-    /// Called when either checking if a path is gitignored or printing the matches
-    #[inline(always)]
-    fn display_path_into_buf<'a>(&self, buf: &'a mut String) -> &'a str {
-        buf.clear();
-        buf.push_str(&String::from_utf8_lossy(self.path_buf.as_bytes()));
-        buf.as_str()
-    }
-
-    #[inline]
-    fn probe_is_binary(&mut self, inode: &Ext4Inode) -> bool {
-        let file_size = inode.size as usize;
-        if file_size == 0 {
-            return false;
-        }
-
-        let bytes_to_check = file_size.min(BINARY_PROBE_BYTE_SIZE);
-
-        if inode.flags & EXT4_EXTENTS_FL != 0 {
-            if self.parse_extents(inode).is_ok() {
-                if let Some(extent) = self.extent_buf.first() {
-                    let block = self.get_block(extent.start_lo);
-                    let first_block_file_bytes = file_size.min(block.len());
-                    let to_check = first_block_file_bytes.min(bytes_to_check);
-                    return is_binary_chunk(&block[..to_check]);
-                }
-            }
-        } else {
-            for &block_num in inode.blocks.iter().take(12) {
-                if block_num != 0 {
-                    let block = self.get_block(block_num);
-                    let first_block_file_bytes = file_size.min(block.len());
-                    let to_check = first_block_file_bytes.min(bytes_to_check);
-                    return is_binary_chunk(&block[..to_check]);
-                }
-            }
-        }
-
-        false
-    }
-
     /// Resolve a path like "/usr/bin" or "etc" into an inode number.
     /// @Note: Clobbers into `dir_buf`
-    fn try_resolve_path_to_inode(&mut self, path: &str) -> io::Result<INodeNum> {
+    pub fn try_resolve_path_to_inode(&mut self, path: &str) -> io::Result<INodeNum> {
         let mut inode_num = EXT4_ROOT_INODE;
         if path == "/" || path.is_empty() {
             return Ok(inode_num);
@@ -559,6 +461,141 @@ impl RawGrepper {
         }
 
         Ok(inode_num)
+    }
+
+    pub fn search(
+        mut self,
+        root_inode: INodeNum,
+        path_display_buf: &mut String,
+        running: &Arc<AtomicBool>,
+        root_gitignore: Gitignore,
+    ) -> io::Result<Stats> {
+        let mut dir_stack = Vec::with_capacity(1024);
+        let mut gi_stack = Vec::with_capacity(64);
+
+        dir_stack.push(DirFrame {
+            inode_num: root_inode,
+            parent_len: self.path_buf.len(),
+            name_offset: 0,
+            name_len: 0, // Root has no name to add
+        });
+        gi_stack.push(GitignoreFrame { matcher: root_gitignore });
+
+        self.init();
+
+        while let Some(frame) = dir_stack.pop() {
+            if unlikely(!running.load(Ordering::Relaxed)) {
+                break;
+            }
+
+            self.path_buf.truncate(frame.parent_len);
+            if frame.name_len > 0 {
+                if likely(frame.parent_len > 0)
+                    && self.path_buf.as_bytes().get(frame.parent_len - 1) != Some(&b'/')
+                {
+                    self.path_buf.push(b'/');
+                }
+                let name = &self.dir_name_buf[
+                    frame.name_offset..
+                    frame.name_offset + frame.name_len
+                ];
+                self.path_buf.extend_from_slice(name);
+            }
+
+            let Ok(inode) = self.read_inode(frame.inode_num) else {
+                continue;
+            };
+
+            if unlikely((inode.mode & EXT4_S_IFMT) != EXT4_S_IFDIR) {
+                continue;
+            }
+
+            let last_segment = match self.path_buf.as_bytes().iter().rposition(|&b| b == b'/') {
+                Some(pos) => &self.path_buf.as_bytes()[pos + 1..],
+                None => self.path_buf.as_bytes(),
+            };
+            if is_common_skip_dir(last_segment) {
+                self.stats.dirs_skipped_common += 1;
+                continue;
+            }
+
+            self.display_path_into_buf(path_display_buf);
+            if is_gitignored(&gi_stack, path_display_buf.as_ref(), true) {
+                self.stats.dirs_skipped_gitignore += 1;
+                continue;
+            }
+
+            if self.process_directory(
+                &inode,
+                path_display_buf,
+                &mut dir_stack,
+                &mut gi_stack,
+                self.path_buf.len(),
+            ).is_err() {
+                continue;
+            }
+        }
+
+        // Just in case ..
+        self.writer.flush()?;
+
+        Ok(self.stats)
+    }
+
+    #[inline(always)]
+    const fn get_buf(&self, kind: BufKind) -> &Vec<u8> {
+        match kind {
+            BufKind::Content   => &self.content_buf,
+            BufKind::Dir       => &self.dir_buf,
+            BufKind::Gitignore => &self.gitignore_buf,
+        }
+    }
+
+    #[inline(always)]
+    const fn get_buf_mut(&mut self, kind: BufKind) -> &mut Vec<u8> {
+        match kind {
+            BufKind::Content   => &mut self.content_buf,
+            BufKind::Dir       => &mut self.dir_buf,
+            BufKind::Gitignore => &mut self.gitignore_buf,
+        }
+    }
+
+    /// Called when either checking if a path is gitignored or printing the matches
+    #[inline(always)]
+    fn display_path_into_buf<'a>(&self, buf: &'a mut String) -> &'a str {
+        buf.clear();
+        buf.push_str(&String::from_utf8_lossy(self.path_buf.as_bytes()));
+        buf.as_str()
+    }
+
+    #[inline]
+    fn probe_is_binary(&mut self, inode: &Ext4Inode) -> bool {
+        let file_size = inode.size as usize;
+        if file_size == 0 {
+            return false;
+        }
+
+        let bytes_to_check = file_size.min(BINARY_PROBE_BYTE_SIZE);
+
+        if inode.flags & EXT4_EXTENTS_FL != 0 {
+            if self.parse_extents(inode).is_ok() && let Some(extent) = self.extent_buf.first() {
+                let block = self.get_block(extent.start_lo);
+                let first_block_file_bytes = file_size.min(block.len());
+                let to_check = first_block_file_bytes.min(bytes_to_check);
+                return is_binary_chunk(&block[..to_check]);
+            }
+        } else {
+            for &block_num in inode.blocks.iter().take(12) {
+                if block_num != 0 {
+                    let block = self.get_block(block_num);
+                    let first_block_file_bytes = file_size.min(block.len());
+                    let to_check = first_block_file_bytes.min(bytes_to_check);
+                    return is_binary_chunk(&block[..to_check]);
+                }
+            }
+        }
+
+        false
     }
 
     #[inline]
@@ -777,8 +814,8 @@ impl RawGrepper {
                 let ee_len = u16::from_le_bytes([data[base + 4], data[base + 5]]);
                 let ee_start_hi = u16::from_le_bytes([data[base + 6], data[base + 7]]);
                 let ee_start_lo = u32::from_le_bytes([
-                    data[base + 08],
-                    data[base + 09],
+                    data[base +  8],
+                    data[base +  9],
                     data[base + 10],
                     data[base + 11]
                 ]);
@@ -831,7 +868,6 @@ impl RawGrepper {
         &mut self,
         inode: &Ext4Inode,
         path_display_buf: &mut String,
-        matcher: &Matcher,
         dir_stack: &mut Vec<DirFrame>,
         gi_stack: &mut Vec<GitignoreFrame>,
         current_dir_path_len: usize,
@@ -854,7 +890,7 @@ impl RawGrepper {
         let mut offset = 0;
         while offset + 8 <= self.dir_buf.len() {
             let entry_inode = INodeNum::from_le_bytes([
-                self.dir_buf[offset + 0],
+                self.dir_buf[offset],
                 self.dir_buf[offset + 1],
                 self.dir_buf[offset + 2],
                 self.dir_buf[offset + 3],
@@ -887,7 +923,6 @@ impl RawGrepper {
                         entry_inode,
                         &name_bytes_copy,
                         path_display_buf,
-                        matcher,
                         dir_stack,
                         gi_stack,
                         current_dir_path_len,
@@ -911,7 +946,6 @@ impl RawGrepper {
         entry_inode: INodeNum,
         name: &[u8],
         path_display_buf: &mut String,
-        matcher: &Matcher,
         dir_stack: &mut Vec<DirFrame>,
         gi_stack: &[GitignoreFrame],
         current_dir_path_len: usize,
@@ -959,7 +993,6 @@ impl RawGrepper {
                     &child_inode,
                     name,
                     path_display_buf,
-                    matcher,
                     gi_stack,
                 )?;
             }
@@ -983,7 +1016,6 @@ impl RawGrepper {
         child_inode: &Ext4Inode,
         name: &[u8],
         path_display_buf: &mut String,
-        matcher: &Matcher,
         gi_stack: &[GitignoreFrame],
     ) -> io::Result<()> {
         self.stats.files_encountered += 1;
@@ -1020,7 +1052,7 @@ impl RawGrepper {
         if likely(self.read_file_into_buf(child_inode, size, BufKind::Content).is_ok()) {
             self.stats.files_searched += 1;
             self.stats.bytes_searched += self.get_buf(BufKind::Content).len();
-            self.find_and_print_matches(matcher, path_display_buf)?;
+            self.find_and_print_matches(path_display_buf)?;
         } else {
             self.stats.files_skipped_unreadable += 1;
         }
@@ -1158,7 +1190,7 @@ impl RawGrepper {
 
         while offset + 8 <= self.get_buf(kind).len() {
             let entry_inode = INodeNum::from_le_bytes([
-                self.get_buf(kind)[offset + 0],
+                self.get_buf(kind)[offset],
                 self.get_buf(kind)[offset + 1],
                 self.get_buf(kind)[offset + 2],
                 self.get_buf(kind)[offset + 3],
@@ -1193,13 +1225,9 @@ impl RawGrepper {
     }
 
     #[inline]
-    fn find_and_print_matches(
-        &mut self,
-        matcher: &Matcher,
-        path: &str,
-    ) -> io::Result<()> {
+    fn find_and_print_matches(&mut self, path: &str) -> io::Result<()> {
         let buf = &self.content_buf;
-        if unlikely(!matcher.is_match(buf)) {
+        if unlikely(!self.matcher.is_match(buf)) {
             return Ok(());
         }
 
@@ -1220,7 +1248,7 @@ impl RawGrepper {
                 }
             };
 
-            if likely(matcher.is_match(line)) {
+            if likely(self.matcher.is_match(line)) {
                 if unlikely(!found_any) {
                     // green `path:`
                     self.writer.write_all(COLOR_GREEN.as_bytes())?;
@@ -1239,7 +1267,7 @@ impl RawGrepper {
                 let display = truncate_utf8(line, 500);
                 let mut last = 0;
 
-                for (s, e) in matcher.find_matches(line) {
+                for (s, e) in self.matcher.find_matches(line) {
                     if unlikely(s >= display.len()) {
                         break;
                     }
@@ -1310,8 +1338,9 @@ fn main() -> io::Result<()> {
     let args = std::env::args().collect::<Vec<_>>();
 
     if args.len() < 4 {
-        eprintln!("usage: {} <device> <dir_path> <pattern>", args[0]);
-        eprintln!("example: {} /dev/sda1 'error|warning'", args[0]);
+        let program = &args[0];
+        eprintln!("usage: {program} <device> <dir_path> <pattern>");
+        eprintln!("example: {program} /dev/sda1 'error|warning'");
         eprintln!("note: Requires root/sudo to read raw devices");
         std::process::exit(1);
     }
@@ -1331,7 +1360,7 @@ fn main() -> io::Result<()> {
     let dir_path = dir_path.as_ref();
 
     // TODO: Detect the partition automatically
-    let mut reader = match RawGrepper::new(device, dir_path) {
+    let mut reader = match RawGrepper::new(device, dir_path, pattern) {
         Ok(ok) => ok,
         Err(e) => {
             eprint!("{COLOR_RED}");
@@ -1357,35 +1386,11 @@ fn main() -> io::Result<()> {
         }
     };
 
-    let matcher = match Matcher::new(&pattern) {
-        Ok(m) => m,
-        Err(e) => {
-            eprint!("{COLOR_RED}");
-            match e.kind() {
-                io::ErrorKind::InvalidInput => {
-                    eprintln!("error: invalid pattern '{pattern}'");
-                    eprintln!("help: patterns must be valid regex or a literal/alternation extractable form");
-                    eprintln!("tip: test your regex with `grep -E` or a regex tester before running");
-                }
-                io::ErrorKind::NotFound => {
-                    // unlikely for this constructor, but here for completeness
-                    eprintln!("error: referenced something that wasn't found: {e}");
-                }
-                _ => {
-                    eprintln!("error: failed to build matcher: {e}");
-                }
-            }
-            eprint!("{COLOR_RESET}");
-
-            std::process::exit(1);
-        }
-    };
-
     eprintln!("{COLOR_CYAN}Searching{COLOR_RESET} '{device}' for pattern: {COLOR_RED}'{pattern}'{COLOR_RESET}\n");
 
     let _cur = CursorHide::new();
 
-    let start_inode = match reader.try_resolve_path_to_inode(&dir_path) {
+    let start_inode = match reader.try_resolve_path_to_inode(dir_path) {
         Ok(ok) => ok,
         Err(e) => {
             eprintln!("{COLOR_RED}error: couldn't find {dir_path} in {device}: {e}{COLOR_RESET}");
@@ -1396,7 +1401,6 @@ fn main() -> io::Result<()> {
     let stats = reader.search(
         start_inode,
         &mut dir_path.to_string(),
-        &matcher,
         &setup_signal_handler(),
         build_gitignore(dir_path.as_ref())
     )?;

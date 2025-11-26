@@ -36,6 +36,14 @@ fn extract_alternation_literals(pattern: &str) -> Option<Vec<Vec<u8>>> {
     Some(literals)
 }
 
+// NOTE:
+//   `Literal::iter` is 320 bytes,
+//   the second-largest variant contains at least 120 bytes,
+//   so the entire enum is 352 bytes.
+//
+//   clippy advises us to Box `iter`, but I don't think that
+//   the overhead of having 1 more indirection (AND allocating on the heap) really worth it.
+#[allow(clippy::large_enum_variant)]
 pub enum MatchIterator<'a> {
     Literal {
         iter: memchr::memmem::FindIter<'a, 'a>,
@@ -64,6 +72,8 @@ impl<'a> Iterator for MatchIterator<'a> {
     }
 }
 
+// NOTE: Read the `NOTE` above
+#[allow(clippy::large_enum_variant)]
 pub enum Matcher {
     Literal(Finder<'static>),  // Single literal: "error"
     MultiLiteral(AhoCorasick), // Multiple: "error|warning|fatal"
@@ -129,4 +139,3 @@ impl Matcher {
         }
     }
 }
-
