@@ -17,9 +17,10 @@ use std::fmt::Display;
 use std::fs::{File, OpenOptions};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::io::{self, BufWriter, Write};
+#[cfg(target_arch = "x86_64")]
+use std::arch::x86_64::*;
 
 use aho_corasick::AhoCorasick;
-
 use memchr::memmem::Finder;
 use regex::bytes::Regex;
 use smallvec::{SmallVec, smallvec};
@@ -38,7 +39,7 @@ const EXT4_INODES_PER_GROUP_OFFSET: usize = 40;
 const EXT4_BLOCKS_PER_GROUP_OFFSET: usize = 32;
 const EXT4_BLOCK_SIZE_OFFSET: usize = 24;
 const EXT4_INODE_TABLE_OFFSET: usize = 8;
-const EXT4_ROOT_INODE: u32 = 2;
+const EXT4_ROOT_INODE: INodeNum = 2;
 const EXT4_DESC_SIZE_OFFSET: usize = 254;
 
 const EXT4_INODE_MODE_OFFSET: usize = 0;
@@ -58,16 +59,22 @@ const COLOR_RESET: &[u8] = b"\x1b[0m";
 const CURSOR_HIDE: &[u8] = b"\x1b[?25l";
 const CURSOR_UNHIDE: &[u8] = b"\x1b[?25h";
 
+type INodeNum = u32;
+type BlockNum = u32;
+
+#[derive(Copy, Clone)]
+enum BufKind { Content, Dir, Gitignore }
+
 struct DirFrame {
-    inode_num: u32,
+    inode_num: INodeNum,
+    parent_len: usize,      // Length of parent path (before this directory)
+    name_offset: usize,     // Offset into dir_name_buf
+    name_len: usize,        // Length of directory name
 }
 
 struct GitignoreFrame {
-    matcher: Arc<Gitignore>,
+    matcher: Gitignore,
 }
-
-#[cfg(target_arch = "x86_64")]
-use std::arch::x86_64::*;
 
 static BYTE_CLASS: [bool; 256] = {
     let mut table = [false; 256];
@@ -82,23 +89,26 @@ static BYTE_CLASS: [bool; 256] = {
     table
 };
 
-/// SIMD-accelerated binary detection (x86_64 only)
-#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+const fn is_dot_entry(name: &[u8]) -> bool {
+    name.len() == 1 && name[0] == b'.' ||
+    name.len() == 2 && name[0] == b'.' && name[1] == b'.'
+}
+
 #[inline]
 fn is_binary_chunk(data: &[u8]) -> bool {
     if data.is_empty() {
         return false;
     }
 
-    // NUL check (already SIMD with memchr)
     if memchr::memchr(0, data).is_some() {
         return true;
     }
 
-    if is_x86_feature_detected!("sse2") {
+    if cfg!(target_arch = "x86_64") && is_x86_feature_detected!("sse2") {
         unsafe { is_binary_chunk_simd_sse2(data) }
     } else {
-        is_binary_chunk_nosimd(data)
+        is_binary_chunk_(data)
     }
 }
 
@@ -108,18 +118,33 @@ unsafe fn is_binary_chunk_simd_sse2(data: &[u8]) -> bool {
     let check_len = data.len().min(512);
     let mut control_count = 0;
 
-    // Process 16 bytes at a time with SSE2
     let chunks = check_len / 16;
     let ptr = data.as_ptr();
+
+    // Create masks for allowed control chars: \t (0x09), \n (0x0A), \r (0x0D)
+    let tab = _mm_set1_epi8(0x09);
+    let lf = _mm_set1_epi8(0x0A);
+    let cr = _mm_set1_epi8(0x0D);
+    let space = _mm_set1_epi8(0x20);
 
     for i in 0..chunks {
         let chunk = unsafe { _mm_loadu_si128(ptr.add(i * 16) as *const __m128i) };
 
-        // Check for control characters (< 0x20 and not tab/LF/CR)
-        let low = _mm_set1_epi8(0x20);
-        let cmp = _mm_cmplt_epi8(chunk, low);
+        // Find bytes < 0x20 (potential control characters)
+        let below_space = _mm_cmplt_epi8(chunk, space);
 
-        let mask = _mm_movemask_epi8(cmp) as u32;
+        // Exclude allowed control chars: tab, LF, CR
+        let is_tab = _mm_cmpeq_epi8(chunk, tab);
+        let is_lf = _mm_cmpeq_epi8(chunk, lf);
+        let is_cr = _mm_cmpeq_epi8(chunk, cr);
+
+        // Combine: allowed = tab | lf | cr
+        let allowed = _mm_or_si128(_mm_or_si128(is_tab, is_lf), is_cr);
+
+        // Bad control chars = below_space AND NOT allowed
+        let bad_controls = _mm_andnot_si128(allowed, below_space);
+
+        let mask = _mm_movemask_epi8(bad_controls) as u32;
         control_count += mask.count_ones() as usize;
 
         if control_count > 51 {
@@ -141,25 +166,13 @@ unsafe fn is_binary_chunk_simd_sse2(data: &[u8]) -> bool {
 }
 
 #[inline]
-fn is_binary_chunk_nosimd(data: &[u8]) -> bool {
-    if data.is_empty() {
-        return false;
-    }
-
-    // NUL check with SIMD memchr
-    if memchr::memchr(0, data).is_some() {
-        return true;
-    }
-
-    // Only check first 512 bytes
+fn is_binary_chunk_(data: &[u8]) -> bool {
     let check_len = data.len().min(512);
     let mut control_count = 0;
 
-    // Unrolled loop for better performance
     let mut i = 0;
     while i + 4 <= check_len {
-        // Process 4 bytes at once (helps with instruction-level parallelism)
-        control_count += !BYTE_CLASS[data[i] as usize] as usize;
+        control_count += !BYTE_CLASS[data[i+0] as usize] as usize;
         control_count += !BYTE_CLASS[data[i+1] as usize] as usize;
         control_count += !BYTE_CLASS[data[i+2] as usize] as usize;
         control_count += !BYTE_CLASS[data[i+3] as usize] as usize;
@@ -182,18 +195,13 @@ fn is_binary_chunk_nosimd(data: &[u8]) -> bool {
     false
 }
 
-// Skip dirs: tiny set, just match strings directly
 #[inline(always)]
-fn is_skip_dir(dir: &[u8]) -> bool {
-    match dir {
-        b"node_modules" | b"target" | b".git" | b".hg" | b".svn" => true,
-        _ => false,
-    }
+const fn is_common_skip_dir(dir: &[u8]) -> bool {
+    matches!(dir, b"node_modules" | b"target" | b".git" | b".hg" | b".svn")
 }
 
 #[inline(always)]
 fn is_binary_ext(ext: &[u8]) -> bool {
-    // Binary extensions: tiny set, use slice search (fast for <20 items)
     const BINARY_EXTS: &[&[u8]] = &[
         b"png",b"jpg",b"jpeg",b"gif",b"class",b"so",b"o",b"a",
         b"pdf",b"zip",b"tar",b"gz",b"7z",b"exe",b"dll",b"bin",
@@ -219,21 +227,20 @@ fn build_gitignore(root: &Path) -> Gitignore {
     builder.build().unwrap()
 }
 
-/// Build a Gitignore matcher from raw file content (bytes), for a given parent directory
 #[inline(always)]
-fn build_gitignore_from_bytes(parent_path: &Path, bytes: &[u8]) -> Arc<Gitignore> {
+fn build_gitignore_from_bytes(parent_path: &Path, bytes: &[u8]) -> Gitignore {
     let mut builder = GitignoreBuilder::new(parent_path);
     for line in bytes.split(|&b| b == b'\n') {
         if let Ok(s) = std::str::from_utf8(line) {
             builder.add_line(None, s).ok();
         }
     }
-    Arc::new(builder.build().unwrap_or_else(|_| Gitignore::empty()))
+    builder.build().unwrap_or_else(|_| Gitignore::empty())
 }
 
 #[inline(always)]
 fn write_int(buf: &mut Vec<u8>, mut n: usize) {
-    if n == 0 {
+    if unlikely(n == 0) {
         buf.push(b'0');
         return;
     }
@@ -271,6 +278,67 @@ fn truncate_utf8(s: &[u8], max: usize) -> &[u8] {
         end -= 1;
     }
     &s[..end]
+}
+
+#[inline(always)]
+fn display_bytes_into_display_buf<'a>(buf: &'a mut String, bytes: &[u8]) -> &'a str {
+    buf.clear();
+    buf.push_str(&String::from_utf8_lossy(bytes));
+    buf.as_str()
+}
+
+const MAX_PATH: usize = 4096;
+
+struct FixedPathBuf {
+    buf: [u8; MAX_PATH],
+    len: usize,
+}
+
+impl FixedPathBuf {
+    #[inline]
+    fn new() -> Self {
+        Self {
+            buf: [0; MAX_PATH],
+            len: 0,
+        }
+    }
+
+    #[inline]
+    fn with_initial(s: &[u8]) -> Self {
+        let mut pb = Self::new();
+        pb.extend_from_slice(s);
+        pb
+    }
+
+    #[inline(always)]
+    fn push(&mut self, byte: u8) {
+        if likely(self.len < MAX_PATH) {
+            self.buf[self.len] = byte;
+            self.len += 1;
+        }
+    }
+
+    #[inline(always)]
+    fn extend_from_slice(&mut self, slice: &[u8]) {
+        let copy_len = slice.len().min(MAX_PATH - self.len);
+        self.buf[self.len..self.len + copy_len].copy_from_slice(&slice[..copy_len]);
+        self.len += copy_len;
+    }
+
+    #[inline(always)]
+    fn truncate(&mut self, len: usize) {
+        self.len = len;
+    }
+
+    #[inline(always)]
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    #[inline(always)]
+    fn as_bytes(&self) -> &[u8] {
+        &self.buf[..self.len]
+    }
 }
 
 pub enum FastMatcher {
@@ -365,13 +433,8 @@ fn extract_alternation_literals(pattern: &str) -> Option<Vec<Vec<u8>>> {
     Some(literals)
 }
 
-// ============================================================
-// Batched output writer - critical for performance
-// ============================================================
-
 pub struct BatchWriter {
     writer: BufWriter<io::Stdout>,
-    batch_size: usize,
 }
 
 impl BatchWriter {
@@ -380,7 +443,6 @@ impl BatchWriter {
         Self {
             // 256KB buffer - reduces syscalls dramatically
             writer: BufWriter::with_capacity(256 * 1024, io::stdout()),
-            batch_size: 64 * 1024, // Flush every 64KB
         }
     }
 
@@ -420,24 +482,25 @@ struct Ext4Inode {
     mode: u16,
     size: u64,
     flags: u32,
-    blocks: [u32; 15],
+    blocks: [BlockNum; 15],
 }
 
 #[derive(Debug, Clone, Copy)]
 struct Ext4Extent {
-    block: u32,
     start_lo: u32,
     len: u16,
 }
 
 #[derive(Default)]
 struct Stats {
-    files_read: usize,
+    files_searched: usize,
+    files_contained_matches: usize,
     files_skipped_large: usize,
     files_skipped_unreadable: usize,
     files_skipped_as_binary_due_to_ext: usize,
     files_skipped_as_binary_due_to_probe: usize,
     files_skipped_gitignore: usize,
+
     dirs_skipped_common: usize,
     dirs_skipped_gitignore: usize,
     dirs_parsed: usize,
@@ -445,19 +508,13 @@ struct Stats {
 
 impl Stats {
     pub fn print(&self) {
-        let total_files = self.files_read
-            + self.files_skipped_large
-            + self.files_skipped_unreadable
-            + self.files_skipped_as_binary_due_to_ext
-            + self.files_skipped_as_binary_due_to_probe
-            + self.files_skipped_gitignore;
+        let total_files = self.files_searched;
 
         let total_dirs = self.dirs_parsed
             + self.dirs_skipped_common
             + self.dirs_skipped_gitignore;
 
         eprintln!("\n\x1b[1;32mSearch complete\x1b[0m");
-        eprintln!("============================================================");
 
         eprintln!("\x1b[1;34mFiles Summary:\x1b[0m");
         macro_rules! file_row {
@@ -467,7 +524,8 @@ impl Stats {
             };
         }
 
-        file_row!("Files read", self.files_read);
+        file_row!("Files searched", self.files_searched);
+        file_row!("Files contained matches", self.files_contained_matches);
         file_row!("Skipped (large)", self.files_skipped_large);
         file_row!("Skipped (binary ext)", self.files_skipped_as_binary_due_to_ext);
         file_row!("Skipped (binary probe)", self.files_skipped_as_binary_due_to_probe);
@@ -485,13 +543,6 @@ impl Stats {
         dir_row!("Dirs parsed", self.dirs_parsed);
         dir_row!("Skipped (common)", self.dirs_skipped_common);
         dir_row!("Skipped (gitignore)", self.dirs_skipped_gitignore);
-
-        eprintln!("============================================================");
-
-        eprintln!(
-            "\x1b[1;33mTotals: {:>6} files, {:>6} dirs\x1b[0m",
-            total_files, total_dirs
-        );
     }
 }
 
@@ -502,9 +553,11 @@ struct RawGrepper {
     stats: Stats,
 
     // ----- reused buffers
-    extent_buf: Vec<Ext4Extent>,
-    output_buf: Vec<u8>,
-    content_buf: Vec<u8>,
+       extent_buf: Vec<Ext4Extent>,
+       output_buf: Vec<u8>,
+      content_buf: Vec<u8>,
+          dir_buf: Vec<u8>,
+    gitignore_buf: Vec<u8>,
 }
 
 impl RawGrepper {
@@ -537,7 +590,6 @@ impl RawGrepper {
                 .map(&file)?
         };
 
-        // Hint: sequential access pattern
         #[cfg(unix)]
         unsafe {
             libc::madvise(
@@ -547,8 +599,10 @@ impl RawGrepper {
             );
         }
 
-        // Parse superblock directly from mmap
-        let sb_bytes = &mmap[EXT4_SUPERBLOCK_OFFSET as usize..EXT4_SUPERBLOCK_OFFSET as usize + EXT4_SUPERBLOCK_SIZE];
+        let sb_bytes = &mmap[
+            EXT4_SUPERBLOCK_OFFSET as usize..
+            EXT4_SUPERBLOCK_OFFSET as usize + EXT4_SUPERBLOCK_SIZE
+        ];
 
         let magic = u16::from_le_bytes([
             sb_bytes[EXT4_MAGIC_OFFSET + 0],
@@ -568,13 +622,34 @@ impl RawGrepper {
             device_mmap: mmap,
             superblock,
             stats: Stats::default(),
+            dir_buf: Vec::with_capacity(256 * 1024),      // 256 KB for directories
+            content_buf: Vec::with_capacity(1024 * 1024), // 1 MB for file content
+            gitignore_buf: Vec::with_capacity(64 * 1024), // 64 KB for .gitignore
             extent_buf: Vec::with_capacity(256),
             output_buf: Vec::with_capacity(64 * 1024),
-            content_buf: Vec::with_capacity(1024 * 1024),
         })
     }
 
-    fn quick_is_binary(&mut self, inode: &Ext4Inode) -> bool {
+    #[inline(always)]
+    const fn get_buf(&self, kind: BufKind) -> &Vec<u8> {
+        match kind {
+            BufKind::Content   => &self.content_buf,
+            BufKind::Dir       => &self.dir_buf,
+            BufKind::Gitignore => &self.gitignore_buf,
+        }
+    }
+
+    #[inline(always)]
+    const fn get_buf_mut(&mut self, kind: BufKind) -> &mut Vec<u8> {
+        match kind {
+            BufKind::Content   => &mut self.content_buf,
+            BufKind::Dir       => &mut self.dir_buf,
+            BufKind::Gitignore => &mut self.gitignore_buf,
+        }
+    }
+
+    #[inline]
+    fn probe_is_binary(&mut self, inode: &Ext4Inode) -> bool {
         let file_size = inode.size as usize;
         if file_size == 0 {
             return false;
@@ -586,7 +661,8 @@ impl RawGrepper {
             if self.parse_extents(inode).is_ok() {
                 if let Some(extent) = self.extent_buf.first() {
                     let block = self.get_block(extent.start_lo);
-                    let to_check = block.len().min(bytes_to_check);
+                    let first_block_file_bytes = file_size.min(block.len());
+                    let to_check = first_block_file_bytes.min(bytes_to_check);
                     return is_binary_chunk(&block[..to_check]);
                 }
             }
@@ -594,7 +670,8 @@ impl RawGrepper {
             for &block_num in inode.blocks.iter().take(12) {
                 if block_num != 0 {
                     let block = self.get_block(block_num);
-                    let to_check = block.len().min(bytes_to_check);
+                    let first_block_file_bytes = file_size.min(block.len());
+                    let to_check = first_block_file_bytes.min(bytes_to_check);
                     return is_binary_chunk(&block[..to_check]);
                 }
             }
@@ -604,33 +681,65 @@ impl RawGrepper {
     }
 
     /// Resolve a path like "/usr/bin" or "etc" into an inode number.
-    fn try_resolve_path_to_inode(&mut self, path: &str) -> io::Result<u32> {
+    /// @Note: Clobbers into `dir_buf`
+    fn try_resolve_path_to_inode(&mut self, path: &str) -> io::Result<INodeNum> {
         let mut inode_num = EXT4_ROOT_INODE;
         if path == "/" || path.is_empty() {
             return Ok(inode_num);
         }
 
-        // Split and skip empty segments
         for part in path.split('/').filter(|p| !p.is_empty()) {
             let inode = self.read_inode(inode_num)?;
             if inode.mode & EXT4_S_IFMT != EXT4_S_IFDIR {
-                return Err(io::Error::new(io::ErrorKind::InvalidInput,
-                    format!("{} is not a directory", part)));
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("{path} is not a directory"),
+                ));
             }
 
-            let entries = self.read_directory_entries(&inode)?;
-            let mut found = None;
+            let dir_size = (inode.size as usize).min(MAX_DIR_BYTE_SIZE);
+            self.read_file_into_buf(&inode, dir_size, BufKind::Dir)?;
 
-            for (child_inode, name) in entries {
-                if name.as_slice() == part.as_bytes() {
-                    found = Some(child_inode);
+            // ---------- Scan for matching entry
+            let mut found = None;
+            let mut offset = 0;
+            let part_bytes = part.as_bytes();
+            while offset + 8 <= self.dir_buf.len() {
+                let entry_inode = INodeNum::from_le_bytes([
+                    self.dir_buf[offset + 0],
+                    self.dir_buf[offset + 1],
+                    self.dir_buf[offset + 2],
+                    self.dir_buf[offset + 3],
+                ]);
+                let rec_len = u16::from_le_bytes([
+                    self.dir_buf[offset + 4],
+                    self.dir_buf[offset + 5],
+                ]);
+                let name_len = self.dir_buf[offset + 6];
+
+                if rec_len == 0 {
                     break;
                 }
+
+                if entry_inode != 0 && name_len > 0 {
+                    let name_end = offset + 8 + name_len as usize;
+                    if name_end <= offset + rec_len as usize && name_end <= self.dir_buf.len() {
+                        let name_bytes = &self.dir_buf[offset + 8..name_end];
+                        if name_bytes == part_bytes {
+                            found = Some(entry_inode);
+                            break;
+                        }
+                    }
+                }
+
+                offset += rec_len as usize;
             }
 
             inode_num = found.ok_or_else(|| {
-                io::Error::new(io::ErrorKind::NotFound,
-                    format!("Component '{}' not found", part))
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("Component '{part}' not found"),
+                )
             })?;
         }
 
@@ -687,9 +796,13 @@ impl RawGrepper {
 
     // @Hot
     #[inline(always)]
-    fn get_block(&self, block_num: u32) -> &[u8] {
+    fn get_block(&self, block_num: BlockNum) -> &[u8] {
         let offset = (block_num as usize).wrapping_mul(self.superblock.block_size as usize);
-        debug_assert!(self.device_mmap.get(offset..offset + self.superblock.block_size as usize).is_some());
+        debug_assert!(
+            self.device_mmap
+                .get(offset..offset + self.superblock.block_size as usize)
+                .is_some()
+        );
         unsafe {
             let ptr = self.device_mmap.as_ptr().add(offset);
             std::slice::from_raw_parts(ptr, self.superblock.block_size as usize)
@@ -698,13 +811,12 @@ impl RawGrepper {
 
     #[cfg(unix)]
     #[inline(always)]
-    fn prefetch_blocks(&self, blocks: &[u32]) {
+    fn prefetch_blocks(&self, blocks: &[BlockNum]) {
         if blocks.is_empty() {
             return;
         }
 
-        // Sort blocks to find contiguous ranges
-        let mut sorted = SmallVec::<[u32; 16]>::from(blocks);
+        let mut sorted = SmallVec::<[BlockNum; 16]>::from(blocks);
         sorted.sort_unstable();
         sorted.dedup();
 
@@ -725,7 +837,7 @@ impl RawGrepper {
 
     #[cfg(unix)]
     #[inline]
-    fn advise_range(&self, start_block: u32, end_block: u32) {
+    fn advise_range(&self, start_block: BlockNum, end_block: BlockNum) {
         let offset = start_block as usize * self.superblock.block_size as usize;
         let length = (end_block - start_block + 1) as usize * self.superblock.block_size as usize;
 
@@ -741,8 +853,8 @@ impl RawGrepper {
     }
 
     #[inline]
-    fn read_inode(&mut self, inode_num: u32) -> io::Result<Ext4Inode> {
-        if inode_num == 0 {
+    fn read_inode(&mut self, inode_num: INodeNum) -> io::Result<Ext4Inode> {
+        if unlikely(inode_num == 0) {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "Invalid inode number 0"));
         }
 
@@ -755,20 +867,27 @@ impl RawGrepper {
             self.superblock.block_size as usize
         } + (group as usize * self.superblock.desc_size as usize);
 
-        // Direct read from mmap - no seek!
-        let bg_desc = &self.device_mmap[bg_desc_offset..bg_desc_offset + self.superblock.desc_size as usize];
+        let bg_desc = &self.device_mmap[
+            bg_desc_offset..
+            bg_desc_offset + self.superblock.desc_size as usize
+        ];
 
-        let inode_table_block = u32::from_le_bytes([
+        let inode_table_block = BlockNum::from_le_bytes([
             bg_desc[EXT4_INODE_TABLE_OFFSET + 0],
             bg_desc[EXT4_INODE_TABLE_OFFSET + 1],
             bg_desc[EXT4_INODE_TABLE_OFFSET + 2],
             bg_desc[EXT4_INODE_TABLE_OFFSET + 3],
         ]);
 
-        let inode_offset = inode_table_block as usize * self.superblock.block_size as usize
-            + index as usize * self.superblock.inode_size as usize;
+        let inode_offset = inode_table_block as usize *
+            self.superblock.block_size as usize +
+            index as usize *
+            self.superblock.inode_size as usize;
 
-        let inode_bytes = &self.device_mmap[inode_offset..inode_offset + self.superblock.inode_size as usize];
+        let inode_bytes = &self.device_mmap[
+            inode_offset..
+            inode_offset + self.superblock.inode_size as usize
+        ];
 
         let mode = u16::from_le_bytes([
             inode_bytes[EXT4_INODE_MODE_OFFSET + 0],
@@ -789,10 +908,10 @@ impl RawGrepper {
             inode_bytes[EXT4_INODE_FLAGS_OFFSET + 3],
         ]);
 
-        let mut blocks = [0u32; 15];
+        let mut blocks = [0; 15];
         for (i, block) in blocks.iter_mut().enumerate() {
             let offset = EXT4_INODE_BLOCK_OFFSET + i * 4;
-            *block = u32::from_le_bytes([
+            *block = BlockNum::from_le_bytes([
                 inode_bytes[offset + 0],
                 inode_bytes[offset + 1],
                 inode_bytes[offset + 2],
@@ -808,7 +927,7 @@ impl RawGrepper {
         self.extent_buf.clear();
 
         let mut block_bytes: SmallVec<[u8; 64]> = smallvec![0; 60];
-        for (i, bytes) in inode.blocks.into_iter().map(u32::to_le_bytes).enumerate() {
+        for (i, bytes) in inode.blocks.into_iter().map(BlockNum::to_le_bytes).enumerate() {
             block_bytes[i * 4 + 0] = bytes[0];
             block_bytes[i * 4 + 1] = bytes[1];
             block_bytes[i * 4 + 2] = bytes[2];
@@ -840,12 +959,6 @@ impl RawGrepper {
                     break;
                 }
 
-                let ee_block = u32::from_le_bytes([
-                    data[base + 0],
-                    data[base + 1],
-                    data[base + 2],
-                    data[base + 3]
-                ]);
                 let ee_len = u16::from_le_bytes([data[base + 4], data[base + 5]]);
                 let ee_start_hi = u16::from_le_bytes([data[base + 6], data[base + 7]]);
                 let ee_start_lo = u32::from_le_bytes([
@@ -859,15 +972,14 @@ impl RawGrepper {
 
                 if ee_len > 0 && ee_len <= 32768 {
                     self.extent_buf.push(Ext4Extent {
-                        block: ee_block,
-                        start_lo: start_block as u32,
+                        start_lo: start_block as BlockNum,
                         len: ee_len,
                     });
                 }
             }
         } else {
             // -------- Internal node - collect block numbers first
-            let mut child_blocks = SmallVec::<[u32; 16]>::new();
+            let mut child_blocks = SmallVec::<[BlockNum; 16]>::new();
             for i in 0..entries {
                 let base = 12 + (i as usize * 12);
                 if base + 12 > data.len() {
@@ -883,7 +995,7 @@ impl RawGrepper {
                 let ei_leaf_hi = u16::from_le_bytes([data[base + 8], data[base + 9]]);
 
                 let leaf_block = ((ei_leaf_hi as u64) << 32) | (ei_leaf_lo as u64);
-                child_blocks.push(leaf_block as u32);
+                child_blocks.push(leaf_block as BlockNum);
             }
 
             #[cfg(unix)]
@@ -899,299 +1011,435 @@ impl RawGrepper {
         Ok(())
     }
 
-    fn read_file_content(&mut self, inode: &Ext4Inode, max_size: usize) -> io::Result<()> {
-        self.content_buf.clear();
-        let size_to_read = std::cmp::min(inode.size as usize, max_size);
-        self.content_buf.reserve(size_to_read);
+    pub fn search(
+        &mut self,
+        root_inode: INodeNum,
+        path: &mut FixedPathBuf,
+        path_display_buf: &mut String,
+        matcher: &FastMatcher,
+        writer: &mut BatchWriter,
+        running: &Arc<AtomicBool>,
+        root_gitignore: Gitignore,
+    ) -> io::Result<()> {
+        let mut dir_stack = Vec::with_capacity(1024);
+        let mut gi_stack = Vec::with_capacity(64);
+        // TODO: Move dir_name_buf and path_display_buf into `RawGrepper`
+        let mut dir_name_buf = Vec::with_capacity(4096); // Shared buffer for all directory names
 
-        // Reusable temp buffer
-        let mut temp_buf: SmallVec<[u8; 4096]> = SmallVec::new();
+        dir_stack.push(DirFrame {
+            inode_num: root_inode,
+            parent_len: path.len(),
+            name_offset: 0,
+            name_len: 0,  // Root has no name to add
+        });
+        gi_stack.push(GitignoreFrame { matcher: root_gitignore });
 
-        if inode.flags & EXT4_EXTENTS_FL != 0 {
-            self.parse_extents(inode)?;
-            let extents = self.extent_buf.clone();
-
-            let mut blocks_to_prefetch = Vec::with_capacity(extents.len() * 4);
-            for extent in &extents {
-                for i in 0..extent.len {
-                    blocks_to_prefetch.push(extent.start_lo + i as u32);
-                }
+        while let Some(frame) = dir_stack.pop() {
+            if unlikely(!running.load(Ordering::Relaxed)) {
+                break;
             }
 
-            #[cfg(unix)]
-            self.prefetch_blocks(&blocks_to_prefetch);
-
-            for extent in &extents {
-                if self.content_buf.len() >= size_to_read {
-                    break;
+            path.truncate(frame.parent_len);
+            if frame.name_len > 0 {
+                if frame.parent_len > 0 && path.as_bytes().get(frame.parent_len - 1) != Some(&b'/') {
+                    path.push(b'/');
                 }
-
-                for i in 0..extent.len {
-                    if self.content_buf.len() >= size_to_read {
-                        break;
-                    }
-
-                    let phys_block = extent.start_lo + i as u32;
-
-                    // Copy to temp buffer to drop the borrow
-                    {
-                        let block_data = self.get_block(phys_block);
-                        let remaining = size_to_read - self.content_buf.len();
-                        let to_read = std::cmp::min(block_data.len(), remaining);
-
-                        temp_buf.clear();
-                        temp_buf.extend_from_slice(&block_data[..to_read]);
-                    } // block_data borrow dropped here
-
-                    self.content_buf.extend_from_slice(&temp_buf);
-                }
-            }
-        } else {
-            // Direct blocks - same pattern
-            let mut blocks_to_prefetch = Vec::with_capacity(12);
-            for i in 0..12 {
-                if inode.blocks[i] != 0 {
-                    blocks_to_prefetch.push(inode.blocks[i]);
-                }
+                let name = &dir_name_buf[frame.name_offset..frame.name_offset + frame.name_len];
+                path.extend_from_slice(name);
             }
 
-            #[cfg(unix)]
-            self.prefetch_blocks(&blocks_to_prefetch);
+            let Ok(inode) = self.read_inode(frame.inode_num) else {
+                continue;
+            };
 
-            for &block in &blocks_to_prefetch {
-                if self.content_buf.len() >= size_to_read {
-                    break;
-                }
+            if unlikely((inode.mode & EXT4_S_IFMT) != EXT4_S_IFDIR) {
+                continue;
+            }
 
-                {
-                    let block_data = self.get_block(block);
-                    let remaining = size_to_read - self.content_buf.len();
-                    let to_read = std::cmp::min(block_data.len(), remaining);
+            let last_segment = match path.as_bytes().iter().rposition(|&b| b == b'/') {
+                Some(pos) => &path.as_bytes()[pos + 1..],
+                None => path.as_bytes(),
+            };
+            if is_common_skip_dir(last_segment) {
+                self.stats.dirs_skipped_common += 1;
+                continue;
+            }
 
-                    temp_buf.clear();
-                    temp_buf.extend_from_slice(&block_data[..to_read]);
-                }
+            display_bytes_into_display_buf(path_display_buf, path.as_bytes());
+            if is_gitignored(&gi_stack, path_display_buf.as_ref(), true) {
+                self.stats.dirs_skipped_gitignore += 1;
+                continue;
+            }
 
-                self.content_buf.extend_from_slice(&temp_buf);
+            if self.process_directory(
+                &inode,
+                path,
+                path_display_buf,
+                matcher,
+                writer,
+                &mut dir_stack,
+                &mut gi_stack,
+                path.len(),
+                &mut dir_name_buf
+            ).is_err() {
+                continue;
             }
         }
 
-        self.content_buf.truncate(size_to_read);
         Ok(())
     }
 
-    fn read_directory_entries(
+    #[inline]
+    fn process_directory(
         &mut self,
         inode: &Ext4Inode,
-    ) -> io::Result<Vec<(u32, SmallVec<[u8; 256]>)>> {
-        let dir_size = inode.size as usize;
+        path: &mut FixedPathBuf,
+        path_display_buf: &mut String,
+        matcher: &FastMatcher,
+        writer: &mut BatchWriter,
+        dir_stack: &mut Vec<DirFrame>,
+        gi_stack: &mut Vec<GitignoreFrame>,
+        current_dir_path_len: usize,
+        dir_name_buf: &mut Vec<u8>,  // Shared buffer for directory names
+    ) -> io::Result<()> {
+        let dir_size = (inode.size as usize).min(MAX_DIR_BYTE_SIZE);
+        self.read_file_into_buf(inode, dir_size, BufKind::Dir)?;
+        self.stats.dirs_parsed += 1;
 
-        let to_read = std::cmp::min(dir_size, MAX_DIR_BYTE_SIZE);
-        self.read_file_content(inode, to_read)?;
+        // ------------- Quick scan for .gitignore
+        let gitignore_inode = self.find_gitignore_inode_in_buf(BufKind::Dir);
 
-        let mut entries = Vec::with_capacity(256);
-        let mut offset = 0usize;
-        let buf = &self.content_buf;
+        // ------------- Load .gitignore if found
+        let pushed_gi = if let Some(gi_inode_num) = gitignore_inode {
+            self.load_gitignore(gi_inode_num, path_display_buf, gi_stack)
+        } else {
+            false
+        };
 
-        while offset + 8 <= buf.len() {
-            // safe slices because of the earlier bound check
-            let entry_inode = u32::from_le_bytes(buf[offset..offset + 4].try_into().unwrap());
-            let rec_len = u16::from_le_bytes(buf[offset + 4..offset + 6].try_into().unwrap());
-            let name_len = buf[offset + 6];
+        // ------------- Process all entries
+        let mut offset = 0;
+        while offset + 8 <= self.dir_buf.len() {
+            let entry_inode = INodeNum::from_le_bytes([
+                self.dir_buf[offset + 0],
+                self.dir_buf[offset + 1],
+                self.dir_buf[offset + 2],
+                self.dir_buf[offset + 3],
+            ]);
+            let rec_len = u16::from_le_bytes([self.dir_buf[offset + 4], self.dir_buf[offset + 5]]);
+            let name_len = self.dir_buf[offset + 6];
 
-            if rec_len == 0 {
-                // corrupted dir; stop parsing to avoid infinite loop
-                break;
-            }
+            if unlikely(rec_len == 0) { break; }
 
             let rec_len_usize = rec_len as usize;
-            if offset + rec_len_usize > buf.len() {
-                // truncated directory data: stop parsing
-                break;
-            }
 
-            if entry_inode != 0 && name_len > 0 {
+            if unlikely(offset + rec_len_usize > self.dir_buf.len()) { break; }
+
+            if likely(entry_inode != 0 && name_len > 0) {
                 let name_end = offset + 8 + name_len as usize;
-                if name_end <= offset + rec_len_usize {
-                    let name_bytes = &buf[offset + 8..name_end];
-                    let mut name = SmallVec::new();
-                    name.extend_from_slice(name_bytes);
-                    entries.push((entry_inode, name));
+                if likely(name_end <= offset + rec_len_usize) {
+                    let name_bytes = &self.dir_buf[offset + 8..name_end];
+
+                    // reject . and ..
+                    if unlikely(is_dot_entry(name_bytes)) {
+                        offset += rec_len_usize;
+                        continue;
+                    }
+
+                    let name_bytes_copy = SmallVec::<[_; 256]>::from(
+                        &self.dir_buf[offset + 8..name_end]
+                    );
+
+                    self.process_entry(
+                        entry_inode,
+                        &name_bytes_copy,
+                        path,
+                        path_display_buf,
+                        matcher,
+                        writer,
+                        dir_stack,
+                        gi_stack,
+                        current_dir_path_len,
+                        dir_name_buf,
+                    )?;
                 }
             }
 
             offset += rec_len_usize;
         }
 
-        Ok(entries)
-    }
-
-    pub fn search_iterative(
-        &mut self,
-        root_inode: u32,
-        path: &mut Vec<u8>,
-        matcher: &FastMatcher,
-        writer: &mut BatchWriter,
-        running: &Arc<AtomicBool>,
-        root_gitignore: Arc<Gitignore>,
-    ) -> io::Result<()> {
-        #[inline(always)]
-        fn display_bytes_into_display_buf<'a>(buf: &'a mut String, path_bytes: &[u8]) -> &'a str {
-            buf.clear();
-            buf.push_str(&String::from_utf8_lossy(path_bytes));
-            buf
+        if pushed_gi {
+            gi_stack.pop();
         }
 
-        let mut dir_stack = Vec::with_capacity(1024);
-        let mut gi_stack = Vec::with_capacity(64);
-        let mut path_display_buf = String::with_capacity(512);
+        Ok(())
+    }
 
-        // start with root
-        dir_stack.push(DirFrame { inode_num: root_inode });
-        gi_stack.push(GitignoreFrame { matcher: root_gitignore });
+    #[inline]
+    fn process_entry(
+        &mut self,
+        entry_inode: INodeNum,
+        name: &[u8],
+        path: &mut FixedPathBuf,
+        path_display_buf: &mut String,
+        matcher: &FastMatcher,
+        writer: &mut BatchWriter,
+        dir_stack: &mut Vec<DirFrame>,
+        gi_stack: &[GitignoreFrame],
+        current_dir_path_len: usize,
+        dir_name_buf: &mut Vec<u8>,
+    ) -> io::Result<()> {
+        if is_common_skip_dir(name) {
+            self.stats.dirs_skipped_common += 1;
+            return Ok(());
+        }
 
-        while let Some(frame) = dir_stack.pop() {
-            if !running.load(Ordering::Relaxed) {
-                break;
+        // ------ Ensure we start from the current directory path
+        path.truncate(current_dir_path_len);
+
+        // ------ Build the full path: current_dir + '/' + name
+        if likely(current_dir_path_len > 0 && path.as_bytes().get(current_dir_path_len - 1) != Some(&b'/')) {
+            path.push(b'/');
+        }
+        path.extend_from_slice(name);
+
+        let Ok(child_inode) = self.read_inode(entry_inode) else {
+            path.truncate(current_dir_path_len);
+            return Ok(());
+        };
+
+        let ft = child_inode.mode & EXT4_S_IFMT;
+
+        if ft == EXT4_S_IFDIR {
+            // ------ Store directory name in shared buffer
+            let name_offset = dir_name_buf.len();
+            dir_name_buf.extend_from_slice(name);
+            let name_len = name.len();
+
+            // ----- For directories: push with name stored in buffer
+            dir_stack.push(DirFrame {
+                inode_num: entry_inode,
+                parent_len: current_dir_path_len, // parent path length (before this dir)
+                name_offset,
+                name_len,
+            });
+        } else if likely(ft == EXT4_S_IFREG) {
+            // ----- For files: path now contains the full path including filename
+            self.process_file(
+                &child_inode,
+                name,
+                path.as_bytes(),
+                path_display_buf,
+                matcher,
+                writer,
+                gi_stack,
+            )?;
+        }
+
+        path.truncate(current_dir_path_len);
+
+        Ok(())
+    }
+
+    #[inline]
+    fn process_file(
+        &mut self,
+        child_inode: &Ext4Inode,
+        name: &[u8],
+        path_bytes: &[u8],
+        path_display_buf: &mut String,
+        matcher: &FastMatcher,
+        writer: &mut BatchWriter,
+        gi_stack: &[GitignoreFrame],
+    ) -> io::Result<()> {
+        // -------------------- Rejection by size
+        if unlikely(child_inode.size > MAX_FILE_BYTE_SIZE as u64) {
+            self.stats.files_skipped_large += 1;
+            return Ok(());
+        }
+
+        // -------------------- Rejection by extension
+        if is_binary_ext(name) {
+            self.stats.files_skipped_as_binary_due_to_ext += 1;
+            return Ok(());
+        }
+
+        // -------------------- Build display path
+        // path_bytes contains the full path including filename
+        display_bytes_into_display_buf(path_display_buf, path_bytes);
+
+        // -------------------- Rejection by .gitignore
+        if is_gitignored(gi_stack, path_display_buf.as_ref(), false) {
+            self.stats.files_skipped_gitignore += 1;
+            return Ok(());
+        }
+
+        // -------------------- Rejection by a binary probe
+        if self.probe_is_binary(child_inode) {
+            self.stats.files_skipped_as_binary_due_to_probe += 1;
+            return Ok(());
+        }
+
+        let size = (child_inode.size as usize).min(MAX_FILE_BYTE_SIZE);
+        if likely(self.read_file_into_buf(child_inode, size, BufKind::Content).is_ok()) {
+            self.stats.files_searched += 1;
+            self.find_and_print_matches(matcher, path_display_buf, writer)?;
+        } else {
+            self.stats.files_skipped_unreadable += 1;
+        }
+
+        Ok(())
+    }
+
+    #[inline]
+    fn load_gitignore(
+        &mut self,
+        gi_inode_num: INodeNum,
+        path_display_buf: &str,
+        gi_stack: &mut Vec<GitignoreFrame>,
+    ) -> bool {
+        if let Ok(gi_inode) = self.read_inode(gi_inode_num) {
+            let size = (gi_inode.size as usize).min(MAX_FILE_BYTE_SIZE);
+            if self.read_file_into_buf(&gi_inode, size, BufKind::Gitignore).is_ok() {
+                let matcher = build_gitignore_from_bytes(
+                    path_display_buf.as_ref(),
+                    &self.gitignore_buf,
+                );
+                gi_stack.push(GitignoreFrame { matcher });
+                return true;
             }
+        }
+        false
+    }
 
-            // read dir inode
-            let inode = match self.read_inode(frame.inode_num) {
-                Ok(i) => i,
-                Err(_) => continue,
-            };
+    fn read_file_into_buf(
+        &mut self,
+        inode: &Ext4Inode,
+        max_size: usize,
+        kind: BufKind
+    ) -> io::Result<()> {
+        self.get_buf_mut(kind).clear();
+        let size_to_read = (inode.size as usize).min(max_size);
+        self.get_buf_mut(kind).reserve(size_to_read);
 
-            // we only push directories onto stack, but guard anyway
-            if (inode.mode & EXT4_S_IFMT) != EXT4_S_IFDIR {
-                continue;
-            }
+        let mut temp_buf: SmallVec<[u8; 4096]> = SmallVec::new();
 
-            let last_segment = match path.iter().rposition(|&b| b == b'/') {
-                Some(pos) => &path[pos+1..],
-                None => &path[..],
-            };
+        if inode.flags & EXT4_EXTENTS_FL != 0 {
+            self.parse_extents(inode)?;
+            let extents = self.extent_buf.clone();
 
-            if is_skip_dir(last_segment) {
-                self.stats.dirs_skipped_common += 1;
-                continue;
-            }
-
-            let path_str = display_bytes_into_display_buf(
-                &mut path_display_buf,
-                path
-            );
-            if is_gitignored(&gi_stack, path_str.as_ref(), true) {
-                self.stats.dirs_skipped_gitignore += 1;
-                continue;
-            }
-
-            // read entries
-            let entries = match self.read_directory_entries(&inode) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            self.stats.dirs_parsed += 1;
-
-            // Check if current dir contains a .gitignore and push its matcher if present.
-            let mut pushed_gi = false;
-            for (entry_inode, name) in entries.iter() {
-                if name.as_slice() == b".gitignore" {
-                    if let Ok(gi_inode) = self.read_inode(*entry_inode) {
-                        if let Ok(()) = self.read_file_content(&gi_inode, MAX_FILE_BYTE_SIZE) {
-                            let buf = &self.content_buf;
-                            let matcher = build_gitignore_from_bytes(path_str.as_ref(), buf);
-                            gi_stack.push(GitignoreFrame { matcher });
-                            pushed_gi = true;
-                        }
+            #[cfg(unix)]
+            {
+                let mut blocks_to_prefetch = SmallVec::<[_; 16]>::with_capacity(extents.len() * 4);
+                for extent in &extents {
+                    for i in 0..extent.len {
+                        blocks_to_prefetch.push(extent.start_lo + i as BlockNum);
                     }
+                }
+                self.prefetch_blocks(&blocks_to_prefetch);
+            }
+
+            for extent in &extents {
+                if self.get_buf(kind).len() >= size_to_read {
                     break;
                 }
+
+                for i in 0..extent.len {
+                    if self.get_buf(kind).len() >= size_to_read {
+                        break;
+                    }
+
+                    let phys_block = extent.start_lo + i as BlockNum;
+
+                    {
+                        let block_data = self.get_block(phys_block);
+                        let remaining = size_to_read - self.get_buf(kind).len();
+                        let to_read = block_data.len().min(remaining);
+
+                        temp_buf.clear();
+                        temp_buf.extend_from_slice(&block_data[..to_read]);
+                    }
+
+                    self.get_buf_mut(kind).extend_from_slice(&temp_buf);
+                }
+            }
+        } else {
+            // Direct blocks
+            #[cfg(unix)]
+            {
+                let mut blocks_to_prefetch = SmallVec::<[_; 12]>::with_capacity(12);
+                for i in 0..12 {
+                    if inode.blocks[i] != 0 {
+                        blocks_to_prefetch.push(inode.blocks[i]);
+                    }
+                }
+                self.prefetch_blocks(&blocks_to_prefetch);
             }
 
-            // iterate children; push directories, process files
-            for (entry_inode, name) in entries.into_iter().rev() {
-                if name.as_slice() == b"." || name.as_slice() == b".." { continue; }
+            for i in 0..12 {
+                if self.get_buf(kind).len() >= size_to_read {
+                    break;
+                }
 
-                // cheap name-only SKIP_DIRS check (avoid changing path first)
-                if is_skip_dir(&name) {
-                    self.stats.dirs_skipped_common += 1;
+                let block = inode.blocks[i];
+                if block == 0 {
                     continue;
                 }
 
-                let old_path_len = path.len();
-                if old_path_len > 1 { // Don't add '/' if we're at root "/"
-                    path.push(b'/');
-                }
-                path.extend_from_slice(&name);
+                {
+                    let block_data = self.get_block(block);
+                    let remaining = size_to_read - self.get_buf(kind).len();
+                    let to_read = block_data.len().min(remaining);
 
-                // read child inode header to decide file/dir
-                let child_inode = match self.read_inode(entry_inode) {
-                    Ok(i) => i,
-                    Err(_) => {
-                        path.truncate(old_path_len);
-                        continue;
-                    }
-                };
-
-                let ft = child_inode.mode & EXT4_S_IFMT;
-                if ft == EXT4_S_IFDIR {
-                    dir_stack.push(DirFrame { inode_num: entry_inode });
-                } else if ft == EXT4_S_IFREG {
-                    if child_inode.size > MAX_FILE_BYTE_SIZE as u64 {
-                        self.stats.files_skipped_large += 1;
-                        path.truncate(old_path_len);
-                        continue;
-                    }
-
-                    if is_binary_ext(&name) {
-                        self.stats.files_skipped_as_binary_due_to_ext += 1;
-                        path.truncate(old_path_len);
-                        continue;
-                    }
-
-                    let path_str = display_bytes_into_display_buf(
-                        &mut path_display_buf,
-                        path
-                    );
-
-                    if is_gitignored(&gi_stack, path_str.as_ref(), false) {
-                        self.stats.files_skipped_gitignore += 1;
-                        path.truncate(old_path_len);
-                        continue;
-                    }
-
-                    if self.quick_is_binary(&child_inode) {
-                        self.stats.files_skipped_as_binary_due_to_probe += 1;
-                        path.truncate(old_path_len);
-                        continue;
-                    }
-
-                    // full read and match
-                    match self.read_file_content(&child_inode, MAX_FILE_BYTE_SIZE) {
-                        Ok(()) => {
-                            self.stats.files_read += 1;
-                            _ = self.find_and_print_matches(
-                                matcher,
-                                path_str,
-                                writer
-                            );
-                        }
-                        Err(_) => {
-                            self.stats.files_skipped_unreadable += 1;
-                        }
-                    }
+                    temp_buf.clear();
+                    temp_buf.extend_from_slice(&block_data[..to_read]);
                 }
 
-                // restore path
-                path.truncate(old_path_len);
-            } // end for entries
-
-            if pushed_gi {
-                gi_stack.pop();
+                self.get_buf_mut(kind).extend_from_slice(&temp_buf);
             }
-        } // end while stack
+        }
 
+        self.get_buf_mut(kind).truncate(size_to_read);
         Ok(())
+    }
+
+    #[inline]
+    fn find_gitignore_inode_in_buf(&self, kind: BufKind) -> Option<INodeNum> {
+        let mut offset = 0;
+
+        while offset + 8 <= self.get_buf(kind).len() {
+            let entry_inode = INodeNum::from_le_bytes([
+                self.get_buf(kind)[offset + 0],
+                self.get_buf(kind)[offset + 1],
+                self.get_buf(kind)[offset + 2],
+                self.get_buf(kind)[offset + 3],
+            ]);
+            let rec_len = u16::from_le_bytes([
+                self.get_buf(kind)[offset + 4],
+                self.get_buf(kind)[offset + 5]
+            ]);
+            let name_len = self.get_buf(kind)[offset + 6];
+
+            if unlikely(rec_len == 0) {
+                break;
+            }
+
+            // Quick check: .gitignore is exactly 10 bytes
+            if entry_inode != 0 && name_len == 10 {
+                let name_end = offset + 8 + 10;
+                if name_end <= offset + rec_len as usize &&
+                    name_end <= self.get_buf(kind).len()
+                {
+                    let name_bytes = &self.get_buf(kind)[offset + 8..name_end];
+                    if name_bytes == b".gitignore" {
+                        return Some(entry_inode);
+                    }
+                }
+            }
+
+            offset += rec_len as usize;
+        }
+
+        None
     }
 
     #[inline]
@@ -1203,7 +1451,6 @@ impl RawGrepper {
     ) -> io::Result<()> {
         let buf = &self.content_buf;
 
-        // Quick rejection
         if unlikely(!matcher.is_match(buf)) {
             return Ok(());
         }
@@ -1215,7 +1462,6 @@ impl RawGrepper {
         let mut line_start = 0;
         let mut line_num = 1;
 
-        // Manual loop unrolling for better performance
         let mut newlines: SmallVec<[usize; 256]> = SmallVec::new();
         newlines.extend(memchr::memchr_iter(b'\n', buf));
 
@@ -1256,7 +1502,6 @@ impl RawGrepper {
                 self.output_buf.extend_from_slice(&display[last..]);
                 self.output_buf.push(b'\n');
 
-                // Periodic flush
                 if unlikely(self.output_buf.len() > 64 * 1024) {
                     writer.write(&self.output_buf)?;
                     self.output_buf.clear();
@@ -1306,9 +1551,11 @@ impl RawGrepper {
             }
         }
 
-        if found_any {
+        if likely(found_any) {
             writer.write(&self.output_buf)?;
             writer.flush()?;
+
+            self.stats.files_contained_matches += 1;
         }
 
         Ok(())
@@ -1410,18 +1657,19 @@ fn main() -> io::Result<()> {
         }
     };
 
-    let mut path = dir_path.as_bytes().to_vec();
+    let mut path = FixedPathBuf::with_initial(dir_path.as_bytes());
     let matcher = FastMatcher::new(&pattern)?;
     let mut writer = BatchWriter::new();
     let running = setup_signal_handler();
     let gitignore = build_gitignore(dir_path.as_ref());
-    reader.search_iterative(
+    reader.search(
         start_inode,
         &mut path,
+        &mut dir_path.to_string(),
         &matcher,
         &mut writer,
         &running,
-        gitignore.into(),
+        gitignore
     )?;
 
     reader.stats.print();
