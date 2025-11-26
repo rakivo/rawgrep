@@ -1,6 +1,7 @@
 use crate::GitignoreFrame;
 
-use std::path::Path;
+use std::{fs, io};
+use std::path::{Path, PathBuf};
 
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 
@@ -74,6 +75,98 @@ pub fn format_bytes(bytes: usize) -> String {
     }
 }
 
+/// Detect which partition/device a given path is mounted on
+pub fn detect_partition_for_path(canonicalized_path: &Path) -> io::Result<String> {
+    let mounts = fs::read_to_string("/proc/mounts")
+        .or_else(|_| fs::read_to_string("/etc/mtab"))?;
+
+    let mut best_match = None;
+    let mut best_match_len = 0;
+
+    for line in mounts.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() < 3 {
+            continue;
+        }
+
+        let device = parts[0];
+        let mountpoint_escaped = parts[1];
+        let fstype = parts[2];
+
+        // Skip non-ext4 filesystems
+        if fstype != "ext4" {
+            continue;
+        }
+
+        // Skip virtual/pseudo filesystems (not starting with /dev/)
+        if !device.starts_with("/dev/") {
+            continue;
+        }
+
+        let mountpoint = unescape_mountpoint(mountpoint_escaped);
+
+        match fs::canonicalize(&mountpoint) {
+            Ok(mount_path) => {
+                // Check if our path is under this mountpoint
+                if canonicalized_path.starts_with(&mount_path) {
+                    let mount_len = mount_path.as_os_str().len();
+                    // Find the longest matching mountpoint (most specific)
+                    if mount_len > best_match_len {
+                        best_match_len = mount_len;
+                        best_match = Some(device.to_owned());
+                    }
+                }
+            }
+            Err(_) => {
+                // If canonicalize fails, try direct string comparison as fallback
+                let mount_path = PathBuf::from(&mountpoint);
+                if canonicalized_path.starts_with(&mount_path) {
+                    let mount_len = mount_path.as_os_str().len();
+                    if mount_len > best_match_len {
+                        best_match_len = mount_len;
+                        best_match = Some(device.to_owned());
+                    }
+                }
+            }
+        }
+    }
+
+    best_match.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!{
+                "could not find ext4 partition for path: {}",
+                canonicalized_path.display()
+            }
+        )
+    })
+}
+
+/// Unescape mountpoint from /proc/mounts format
+/// Spaces are encoded as \040, tabs as \011, newlines as \012, backslashes as \134
+fn unescape_mountpoint(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut chars = s.chars();
+
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            // Read next 3 characters as octal
+            let octal: String = chars.by_ref().take(3).collect();
+            if let Ok(byte) = u8::from_str_radix(&octal, 8) {
+                result.push(byte as char);
+            } else {
+                // If parsing fails, just keep the backslash
+                result.push('\\');
+                result.push_str(&octal);
+            }
+        } else {
+            result.push(ch);
+        }
+    }
+
+    result
+}
+
 // ---------------
 // Nightly implementation
 // ----------------------
@@ -105,5 +198,3 @@ mod imp {
 }
 
 pub use imp::*;
-
-

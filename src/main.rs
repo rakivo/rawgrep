@@ -1446,16 +1446,15 @@ impl Drop for CursorHide {
 fn main() -> io::Result<()> {
     let args = std::env::args().collect::<Vec<_>>();
 
-    if args.len() < 4 {
+    if args.len() < 3 {
         let program = &args[0];
-        eprintln!("usage: {program} <device> <dir_path> <pattern>");
+        eprintln!("usage: {program} <pattern> <dir_path>");
         eprintln!("example: {program} /dev/sda1 'error|warning'");
         eprintln!("note: Requires root/sudo to read raw devices");
         std::process::exit(1);
     }
 
-    let device   = &args[1];
-    let pattern  = &args[3];
+    let pattern  = &args[1];
     let dir_path = &args[2];
 
     let dir_path = match std::fs::canonicalize(dir_path) {
@@ -1468,8 +1467,16 @@ fn main() -> io::Result<()> {
     let dir_path = dir_path.to_string_lossy();
     let dir_path = dir_path.as_ref();
 
+    let device = match crate::util::detect_partition_for_path(dir_path.as_ref()) {
+        Ok(ok) => ok,
+        Err(e) => {
+            eprintln!("error: couldn't find auto-detect partition: {e}");
+            std::process::exit(1);
+        }
+    };
+
     // TODO: Detect the partition automatically
-    let mut reader = match RawGrepper::new(device, dir_path, pattern) {
+    let mut reader = match RawGrepper::new(&device, dir_path, pattern) {
         Ok(ok) => ok,
         Err(e) => {
             eprint!("{COLOR_RED}");
