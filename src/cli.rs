@@ -1,5 +1,10 @@
 use clap::Parser;
 
+// TODO: Flag to disable ANSI coloring
+// TODO: Three-level filtering flags
+//   1: .gitignore filtering
+//   2: binary ext filtering
+//   3: binary probe filtering
 #[derive(Parser)]
 #[command(
     name = "rawgrep",

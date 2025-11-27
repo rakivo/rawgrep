@@ -143,6 +143,7 @@ pub struct RawGrepper {
      dir_name_buf: Vec<u8>,
 }
 
+/// impl block of public API
 impl RawGrepper {
     pub fn new(
         device_path: &str,
@@ -252,6 +253,85 @@ impl RawGrepper {
         self.extent_buf.reserve(0x100);      // 256 extents, very cheap, covers ~all files
     }
 
+    pub fn search(
+        mut self,
+        root_inode: INodeNum,
+        path_display_buf: &mut String,
+        running: &AtomicBool,
+        root_gitignore: Gitignore,
+    ) -> io::Result<(Cli, Stats)> {
+        let mut dir_stack = Vec::with_capacity(1024);
+        let mut gi_stack = Vec::with_capacity(64);
+
+        dir_stack.push(DirFrame {
+            inode_num: root_inode,
+            parent_len: self.path_buf.len(),
+            name_offset: 0,
+            name_len: 0, // Root has no name to add
+        });
+        gi_stack.push(GitignoreFrame { matcher: root_gitignore });
+
+        self.init();
+
+        while let Some(frame) = dir_stack.pop() {
+            if unlikely(!running.load(Ordering::Relaxed)) {
+                break;
+            }
+
+            self.path_buf.truncate(frame.parent_len);
+            if frame.name_len > 0 {
+                if likely(frame.parent_len > 0)
+                    && self.path_buf.as_bytes().get(frame.parent_len - 1) != Some(&b'/')
+                {
+                    self.path_buf.push(b'/');
+                }
+                let name = &self.dir_name_buf[
+                    frame.name_offset..
+                    frame.name_offset + frame.name_len
+                ];
+                self.path_buf.extend_from_slice(name);
+            }
+
+            let Ok(inode) = self.parse_inode(frame.inode_num) else {
+                continue;
+            };
+
+            if unlikely((inode.mode & EXT4_S_IFMT) != EXT4_S_IFDIR) {
+                continue;
+            }
+
+            let last_segment = match self.path_buf.as_bytes().iter().rposition(|&b| b == b'/') {
+                Some(pos) => &self.path_buf.as_bytes()[pos + 1..],
+                None => self.path_buf.as_bytes(),
+            };
+            if is_common_skip_dir(last_segment) {
+                self.stats.dirs_skipped_common += 1;
+                continue;
+            }
+
+            self.display_path_into_buf(path_display_buf);
+            if is_gitignored(&gi_stack, path_display_buf.as_ref(), true) {
+                self.stats.dirs_skipped_gitignore += 1;
+                continue;
+            }
+
+            if self.process_directory(
+                &inode,
+                path_display_buf,
+                &mut dir_stack,
+                &mut gi_stack,
+                self.path_buf.len(),
+            ).is_err() {
+                continue;
+            }
+        }
+
+        // Just in case ..
+        self.writer.flush()?;
+
+        Ok((self.cli, self.stats))
+    }
+
     /// Resolve a path like "/usr/bin" or "etc" into an inode number.
     /// @Note: Clobbers into `dir_buf`
     pub fn try_resolve_path_to_inode(&mut self, path: &str) -> io::Result<INodeNum> {
@@ -261,7 +341,7 @@ impl RawGrepper {
         }
 
         for part in path.split('/').filter(|p| !p.is_empty()) {
-            let inode = self.read_inode(inode_num)?;
+            let inode = self.parse_inode(inode_num)?;
             if inode.mode & EXT4_S_IFMT != EXT4_S_IFDIR {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -317,84 +397,445 @@ impl RawGrepper {
 
         Ok(inode_num)
     }
+}
 
-    pub fn search(
-        mut self,
-        root_inode: INodeNum,
+/// impl block of core processing
+impl RawGrepper {
+    fn process_directory(
+        &mut self,
+        inode: &Ext4Inode,
         path_display_buf: &mut String,
-        running: &AtomicBool,
-        root_gitignore: Gitignore,
-    ) -> io::Result<(Cli, Stats)> {
-        let mut dir_stack = Vec::with_capacity(1024);
-        let mut gi_stack = Vec::with_capacity(64);
+        dir_stack: &mut Vec<DirFrame>,
+        gi_stack: &mut Vec<GitignoreFrame>,
+        current_dir_path_len: usize,
+    ) -> io::Result<()> {
+        let dir_size = (inode.size as usize).min(MAX_DIR_BYTE_SIZE);
+        self.read_file_into_buf(inode, dir_size, BufKind::Dir)?;
+        self.stats.dirs_encountered += 1;
 
-        dir_stack.push(DirFrame {
-            inode_num: root_inode,
-            parent_len: self.path_buf.len(),
-            name_offset: 0,
-            name_len: 0, // Root has no name to add
-        });
-        gi_stack.push(GitignoreFrame { matcher: root_gitignore });
+        // ------------- Quick scan for .gitignore
+        let gitignore_inode = self.find_gitignore_inode_in_buf(BufKind::Dir);
 
-        self.init();
+        // ------------- Load .gitignore if found
+        let pushed_gi = if let Some(gi_inode_num) = gitignore_inode {
+            self.load_gitignore(gi_inode_num, path_display_buf, gi_stack)
+        } else {
+            false
+        };
 
-        while let Some(frame) = dir_stack.pop() {
-            if unlikely(!running.load(Ordering::Relaxed)) {
-                break;
-            }
+        // ------------- Process all entries
+        let mut offset = 0;
+        while offset + 8 <= self.dir_buf.len() {
+            let entry_inode = INodeNum::from_le_bytes([
+                self.dir_buf[offset + 0],
+                self.dir_buf[offset + 1],
+                self.dir_buf[offset + 2],
+                self.dir_buf[offset + 3],
+            ]);
+            let rec_len = u16::from_le_bytes([self.dir_buf[offset + 4], self.dir_buf[offset + 5]]);
+            let name_len = self.dir_buf[offset + 6];
 
-            self.path_buf.truncate(frame.parent_len);
-            if frame.name_len > 0 {
-                if likely(frame.parent_len > 0)
-                    && self.path_buf.as_bytes().get(frame.parent_len - 1) != Some(&b'/')
-                {
-                    self.path_buf.push(b'/');
+            if unlikely(rec_len == 0) { break; }
+
+            let rec_len_usize = rec_len as usize;
+
+            if unlikely(offset + rec_len_usize > self.dir_buf.len()) { break; }
+
+            if likely(entry_inode != 0 && name_len > 0) {
+                let name_end = offset + 8 + name_len as usize;
+                if likely(name_end <= offset + rec_len_usize) {
+                    let name_bytes = &self.dir_buf[offset + 8..name_end];
+
+                    // reject . and ..
+                    if unlikely(is_dot_entry(name_bytes)) {
+                        offset += rec_len_usize;
+                        continue;
+                    }
+
+                    let name_bytes_copy: SmallVec::<[_; 256]> = copy_data(
+                        &self.dir_buf[offset + 8..name_end]
+                    );
+
+                    self.process_entry(
+                        entry_inode,
+                        &name_bytes_copy,
+                        path_display_buf,
+                        dir_stack,
+                        gi_stack,
+                        current_dir_path_len,
+                    )?;
                 }
-                let name = &self.dir_name_buf[
-                    frame.name_offset..
-                    frame.name_offset + frame.name_len
-                ];
-                self.path_buf.extend_from_slice(name);
             }
 
-            let Ok(inode) = self.read_inode(frame.inode_num) else {
-                continue;
-            };
+            offset += rec_len_usize;
+        }
 
-            if unlikely((inode.mode & EXT4_S_IFMT) != EXT4_S_IFDIR) {
-                continue;
+        if pushed_gi {
+            gi_stack.pop();
+        }
+
+        Ok(())
+    }
+
+    fn process_entry(
+        &mut self,
+        entry_inode: INodeNum,
+        name: &[u8],
+        path_display_buf: &mut String,
+        dir_stack: &mut Vec<DirFrame>,
+        gi_stack: &[GitignoreFrame],
+        current_dir_path_len: usize,
+    ) -> io::Result<()> {
+        if is_common_skip_dir(name) {
+            self.stats.dirs_skipped_common += 1;
+            return Ok(());
+        }
+
+        // ------ Ensure we start from the current directory path
+        self.path_buf.truncate(current_dir_path_len);
+
+        // ------ Build the full path: current_dir + '/' + name
+        if likely(current_dir_path_len > 0)
+            && self.path_buf.as_bytes().get(current_dir_path_len - 1) != Some(&b'/')
+        {
+            self.path_buf.push(b'/');
+        }
+        self.path_buf.extend_from_slice(name);
+
+        let Ok(child_inode) = self.parse_inode(entry_inode) else {
+            self.path_buf.truncate(current_dir_path_len);
+            return Ok(());
+        };
+
+        let ft = child_inode.mode & EXT4_S_IFMT;
+
+        match ft {
+            EXT4_S_IFDIR => {
+                let name_offset = self.dir_name_buf.len();
+                self.dir_name_buf.extend_from_slice(name);
+                let name_len = name.len();
+
+                dir_stack.push(DirFrame {
+                    inode_num: entry_inode,
+                    parent_len: current_dir_path_len,
+                    name_offset,
+                    name_len,
+                });
             }
-
-            let last_segment = match self.path_buf.as_bytes().iter().rposition(|&b| b == b'/') {
-                Some(pos) => &self.path_buf.as_bytes()[pos + 1..],
-                None => self.path_buf.as_bytes(),
-            };
-            if is_common_skip_dir(last_segment) {
-                self.stats.dirs_skipped_common += 1;
-                continue;
+            EXT4_S_IFREG => {
+                self.process_file(
+                    &child_inode,
+                    name,
+                    path_display_buf,
+                    gi_stack,
+                )?;
             }
-
-            self.display_path_into_buf(path_display_buf);
-            if is_gitignored(&gi_stack, path_display_buf.as_ref(), true) {
-                self.stats.dirs_skipped_gitignore += 1;
-                continue;
+            EXT4_S_IFLNK => {
+                self.process_symlink(
+                    &child_inode,
+                    name,
+                    path_display_buf,
+                    gi_stack,
+                    current_dir_path_len
+                ).inspect_err(|_| {
+                    self.stats.symlinks_broken += 1;
+                })?;
             }
-
-            if self.process_directory(
-                &inode,
-                path_display_buf,
-                &mut dir_stack,
-                &mut gi_stack,
-                self.path_buf.len(),
-            ).is_err() {
-                continue;
+            _ => {
+                // ... skip special files (devices, FIFOs, sockets, etc.)
             }
         }
 
-        // Just in case ..
-        self.writer.flush()?;
+        self.path_buf.truncate(current_dir_path_len);
 
-        Ok((self.cli, self.stats))
+        Ok(())
+    }
+
+    #[inline]
+    fn process_symlink(
+        &mut self,
+        child_inode: &Ext4Inode,
+        name: &[u8],
+        path_display_buf: &mut String,
+        gi_stack: &[GitignoreFrame],
+        current_dir_path_len: usize
+    ) -> io::Result<()> {
+        if unlikely(current_dir_path_len > self.path_buf.capacity()) {
+            self.stats.symlinks_broken += 1;
+            return Ok(());
+        }
+
+        let target_inode_num = self.resolve_symlink(&child_inode, current_dir_path_len)?;
+        let target_inode = self.parse_inode(target_inode_num)?;
+        let target_ft = target_inode.mode & EXT4_S_IFMT;
+
+        if target_ft == EXT4_S_IFREG {
+            self.stats.symlinks_followed += 1;
+            self.process_file(
+                &target_inode,
+                name,
+                path_display_buf,
+                gi_stack,
+            )?;
+        } else {
+            // ... skip directory symlinks to avoid potential loops
+        }
+
+        Ok(())
+    }
+
+    #[inline]
+    fn process_file(
+        &mut self,
+        child_inode: &Ext4Inode,
+        name: &[u8],
+        path_display_buf: &mut String,
+        gi_stack: &[GitignoreFrame],
+    ) -> io::Result<()> {
+        self.stats.files_encountered += 1;
+
+        // -------------------- Rejection by size
+        if unlikely(child_inode.size > MAX_FILE_BYTE_SIZE as u64) {
+            self.stats.files_skipped_large += 1;
+            return Ok(());
+        }
+
+        // -------------------- Rejection by extension
+        if is_binary_ext(name) {
+            self.stats.files_skipped_as_binary_due_to_ext += 1;
+            return Ok(());
+        }
+
+        // -------------------- Build display path
+        // path_bytes contains the full path including filename
+        self.display_path_into_buf(path_display_buf);
+
+        // -------------------- Rejection by .gitignore
+        if is_gitignored(gi_stack, path_display_buf.as_ref(), false) {
+            self.stats.files_skipped_gitignore += 1;
+            return Ok(());
+        }
+
+        // -------------------- Rejection by a binary probe
+        if self.probe_is_binary(child_inode) {
+            self.stats.files_skipped_as_binary_due_to_probe += 1;
+            return Ok(());
+        }
+
+        let size = (child_inode.size as usize).min(MAX_FILE_BYTE_SIZE);
+        if likely(self.read_file_into_buf(child_inode, size, BufKind::Content).is_ok()) {
+            self.stats.files_searched += 1;
+            self.stats.bytes_searched += self.get_buf(BufKind::Content).len();
+            self.find_and_print_matches(path_display_buf)?;
+        } else {
+            self.stats.files_skipped_unreadable += 1;
+        }
+
+        Ok(())
+    }
+}
+
+/// impl block of symlink helpers
+impl RawGrepper {
+    /// Resolve a symlink to its target inode number
+    #[inline]
+    fn resolve_symlink(
+        &mut self,
+        inode: &Ext4Inode,
+        current_dir_len: usize
+    ) -> io::Result<INodeNum> {
+        if unlikely(current_dir_len > PATH_VERY_LONG_LENGTH) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Path too long (possible symlink loop)"
+            ));
+        }
+
+        // symlink targets < `FAST_SYMLINK_SIZE` bytes are stored directly in inode.blocks
+        if inode.size < FAST_SYMLINK_SIZE as u64 {
+            let target = unsafe {
+                std::slice::from_raw_parts(
+                    inode.blocks.as_ptr() as *const u8,
+                    inode.size as usize
+                )
+            };
+            return self.resolve_symlink_target(target, current_dir_len);
+        }
+
+        // slow symlinks: target stored in file blocks
+        let size = (inode.size as usize).min(MAX_SYMLINK_TARGET_SIZE);
+        self.read_file_into_buf(inode, size, BufKind::Content)?;
+
+        let target: SmallVec<[_; 256]> = copy_data(&self.content_buf[..]);
+        self.resolve_symlink_target(&target, current_dir_len)
+    }
+
+    /// Resolve the symlink target path to an inode number
+    fn resolve_symlink_target(
+        &mut self,
+        target: &[u8],
+        current_dir_len: usize
+    ) -> io::Result<INodeNum> {
+        if target.first() == Some(&b'/') {
+            // This is an absolute path
+            let path_str = String::from_utf8_lossy(target);
+            return self.try_resolve_path_to_inode(&path_str);
+        }
+
+        let current_dir = &self.path_buf.as_bytes()[..current_dir_len];
+
+        let mut resolved_path = SmallVec::<[_; 512]>::new();
+        resolved_path.extend_from_slice(current_dir);
+
+        for component in target.split(|&b| b == b'/') {
+            if component.is_empty() || component == b"." {
+                continue;
+            }
+
+            if component == b".." {
+                // Go up one directory - find last '/'
+                if let Some(pos) = resolved_path.iter().rposition(|&b| b == b'/') {
+                    resolved_path.truncate(pos);
+                } else {
+                    // Already at root
+                    resolved_path.clear();
+                }
+                continue;
+            }
+
+            // Add component to path
+            if !resolved_path.is_empty() && resolved_path.last() != Some(&b'/') {
+                resolved_path.push(b'/');
+            }
+            resolved_path.extend_from_slice(component);
+
+            if unlikely(resolved_path.len() > PATH_VERY_LONG_LENGTH) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "Path too long during symlink resolution"
+                ));
+            }
+        }
+
+        let path_str = String::from_utf8_lossy(&resolved_path);
+        self.try_resolve_path_to_inode(&path_str)
+    }
+}
+
+/// impl block of misc helper functions
+impl RawGrepper {
+    fn read_file_into_buf(
+        &mut self,
+        inode: &Ext4Inode,
+        max_size: usize,
+        kind: BufKind
+    ) -> io::Result<()> {
+        let buf = self.get_buf_mut(kind);
+        buf.clear();
+        let size_to_read = (inode.size as usize).min(max_size);
+        buf.reserve(size_to_read);
+
+        let copy_block_to_buf = |this: &mut RawGrepper, block_num: u64| {
+            let offset = this.get_buf(kind).len();
+            let remaining = size_to_read - offset;
+
+            let (src_ptr, to_copy) = {
+                let block_data = this.get_block(block_num.into());
+                let to_copy = block_data.len().min(remaining);
+                (block_data.as_ptr(), to_copy)
+            };
+
+            let buf = this.get_buf_mut(kind);
+            let old_len = buf.len();
+            buf.resize(old_len + to_copy, 0);
+
+            // SAFETY: We obtain the source pointer from `block_data` while it's borrowed,
+            // then drop that borrow before getting a mutable borrow to the destination buffer.
+            // The source pointer remains valid because `get_block()` returns data from an mmap
+            // that won't be invalidated during this operation. We ensure no overlap between
+            // source and destination, and both pointers are valid for the copy length.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    src_ptr,
+                    buf.as_mut_ptr().add(old_len),
+                    to_copy
+                );
+            }
+        };
+
+        if inode.flags & EXT4_EXTENTS_FL != 0 {
+            self.parse_extents(inode)?;
+
+            let extent_count = self.extent_buf.len();
+            let extents_copy: SmallVec::<[_; MAX_EXTENTS_UNTIL_SPILL]> = copy_data(
+                &self.extent_buf[..extent_count]
+            );
+
+            // ------- Prefetch the blooooooocks
+            {
+                let mut blocks_to_prefetch = SmallVec::<[_; MAX_EXTENTS_UNTIL_SPILL]>::with_capacity(
+                    MAX_EXTENTS_UNTIL_SPILL
+                );
+                for extent in &extents_copy {
+                    for i in 0..extent.len.min((MAX_EXTENTS_UNTIL_SPILL / extents_copy.len().max(1)) as _) {
+                        blocks_to_prefetch.push(extent.start + i as u64);
+                        if blocks_to_prefetch.len() >= MAX_EXTENTS_UNTIL_SPILL {
+                            break;
+                        }
+                    }
+                    if blocks_to_prefetch.len() >= MAX_EXTENTS_UNTIL_SPILL {
+                        break;
+                    }
+                }
+                self.prefetch_blocks(&blocks_to_prefetch);
+            }
+
+            for extent in &extents_copy {
+                if self.get_buf(kind).len() >= size_to_read {
+                    break;
+                }
+                for j in 0..extent.len {
+                    if self.get_buf(kind).len() >= size_to_read {
+                        break;
+                    }
+
+                    let phys_block = extent.start + j as u64;
+                    copy_block_to_buf(self, phys_block);
+                }
+            }
+        } else {
+            // ------- Prefetch the blooooooocks
+            {
+                let mut blocks_to_prefetch = SmallVec::<[_; EXT4_BLOCK_POINTERS_COUNT]>::with_capacity(
+                    EXT4_BLOCK_POINTERS_COUNT
+                );
+                for &block in inode.blocks.iter().take(EXT4_BLOCK_POINTERS_COUNT) {
+                    if block != 0 {
+                        blocks_to_prefetch.push(block as _);
+                    }
+                }
+                self.prefetch_blocks(&blocks_to_prefetch);
+            }
+
+            for &block in inode.blocks.iter().take(EXT4_BLOCK_POINTERS_COUNT) {
+                if block == 0 || self.get_buf(kind).len() >= size_to_read {
+                    break;
+                }
+
+                copy_block_to_buf(self, block.into());
+            }
+        }
+
+        self.get_buf_mut(kind).truncate(size_to_read);
+        Ok(())
+    }
+
+    /// Called when either checking if a path is gitignored or printing the matches
+    #[inline(always)]
+    fn display_path_into_buf<'a>(&self, buf: &'a mut String) -> &'a str {
+        buf.clear();
+        buf.push_str(&String::from_utf8_lossy(self.path_buf.as_bytes()));
+        buf.as_str()
     }
 
     #[inline(always)]
@@ -413,14 +854,6 @@ impl RawGrepper {
             BufKind::Dir       => &mut self.dir_buf,
             BufKind::Gitignore => &mut self.gitignore_buf,
         }
-    }
-
-    /// Called when either checking if a path is gitignored or printing the matches
-    #[inline(always)]
-    fn display_path_into_buf<'a>(&self, buf: &'a mut String) -> &'a str {
-        buf.clear();
-        buf.push_str(&String::from_utf8_lossy(self.path_buf.as_bytes()));
-        buf.as_str()
     }
 
     #[inline]
@@ -453,54 +886,6 @@ impl RawGrepper {
         }
 
         false
-    }
-
-    #[inline]
-    fn parse_superblock(data: &[u8]) -> io::Result<Ext4SuperBlock> {
-        let block_size_log = u32::from_le_bytes([
-            data[EXT4_BLOCK_SIZE_OFFSET + 0],
-            data[EXT4_BLOCK_SIZE_OFFSET + 1],
-            data[EXT4_BLOCK_SIZE_OFFSET + 2],
-            data[EXT4_BLOCK_SIZE_OFFSET + 3],
-        ]);
-        let block_size = 1024 << block_size_log;
-
-        let blocks_per_group = u32::from_le_bytes([
-            data[EXT4_BLOCKS_PER_GROUP_OFFSET + 0],
-            data[EXT4_BLOCKS_PER_GROUP_OFFSET + 1],
-            data[EXT4_BLOCKS_PER_GROUP_OFFSET + 2],
-            data[EXT4_BLOCKS_PER_GROUP_OFFSET + 3],
-        ]);
-
-        let inodes_per_group = u32::from_le_bytes([
-            data[EXT4_INODES_PER_GROUP_OFFSET + 0],
-            data[EXT4_INODES_PER_GROUP_OFFSET + 1],
-            data[EXT4_INODES_PER_GROUP_OFFSET + 2],
-            data[EXT4_INODES_PER_GROUP_OFFSET + 3],
-        ]);
-
-        let inode_size = u16::from_le_bytes([
-            data[EXT4_INODE_SIZE_OFFSET + 0],
-            data[EXT4_INODE_SIZE_OFFSET + 1],
-        ]);
-
-        let desc_size = if data.len() > EXT4_DESC_SIZE_OFFSET + 1 {
-            let ds = u16::from_le_bytes([
-                data[EXT4_DESC_SIZE_OFFSET + 0],
-                data[EXT4_DESC_SIZE_OFFSET + 1],
-            ]);
-            if ds >= 32 { ds } else { 32 }
-        } else {
-            32
-        };
-
-        Ok(Ext4SuperBlock {
-            block_size,
-            blocks_per_group,
-            inodes_per_group,
-            inode_size,
-            desc_size,
-        })
     }
 
     // @Hot
@@ -558,9 +943,200 @@ impl RawGrepper {
             }
         }
     }
+}
+
+/// impl block of gitignore helper functions
+impl RawGrepper {
+    #[inline]
+    fn load_gitignore(
+        &mut self,
+        gi_inode_num: INodeNum,
+        path_display_buf: &str,
+        gi_stack: &mut Vec<GitignoreFrame>,
+    ) -> bool {
+        if let Ok(gi_inode) = self.parse_inode(gi_inode_num) {
+            let size = (gi_inode.size as usize).min(MAX_FILE_BYTE_SIZE);
+            if likely(self.read_file_into_buf(&gi_inode, size, BufKind::Gitignore).is_ok()) {
+                let matcher = build_gitignore_from_bytes(
+                    path_display_buf.as_ref(),
+                    &self.gitignore_buf,
+                );
+                gi_stack.push(GitignoreFrame { matcher });
+                return true;
+            }
+        }
+        false
+    }
 
     #[inline]
-    fn read_inode(&mut self, inode_num: INodeNum) -> io::Result<Ext4Inode> {
+    fn find_gitignore_inode_in_buf(&self, kind: BufKind) -> Option<INodeNum> {
+        let mut offset = 0;
+
+        while offset + 8 <= self.get_buf(kind).len() {
+            let entry_inode = INodeNum::from_le_bytes([
+                self.get_buf(kind)[offset],
+                self.get_buf(kind)[offset + 1],
+                self.get_buf(kind)[offset + 2],
+                self.get_buf(kind)[offset + 3],
+            ]);
+            let rec_len = u16::from_le_bytes([
+                self.get_buf(kind)[offset + 4],
+                self.get_buf(kind)[offset + 5]
+            ]);
+            let name_len = self.get_buf(kind)[offset + 6];
+
+            if unlikely(rec_len == 0) {
+                break;
+            }
+
+            // @Quickcheck: .gitignore is exactly 10 bytes
+            if entry_inode != 0 && name_len == 10 {
+                let name_end = offset + 8 + 10;
+                if name_end <= offset + rec_len as usize &&
+                    name_end <= self.get_buf(kind).len()
+                {
+                    let name_bytes = &self.get_buf(kind)[offset + 8..name_end];
+                    if name_bytes == b".gitignore" {
+                        return Some(entry_inode);
+                    }
+                }
+            }
+
+            offset += rec_len as usize;
+        }
+
+        None
+    }
+}
+
+/// impl block of matching and printing
+impl RawGrepper {
+    fn find_and_print_matches(&mut self, path: &str) -> io::Result<()> {
+        let buf = &self.content_buf;
+        if unlikely(!self.matcher.is_match(buf)) {
+            return Ok(());
+        }
+
+        let mut found_any = false;
+        let mut line_start = 0;
+        let mut line_num = 1;
+        let buf_len = buf.len();
+
+        for nl in memchr::memchr_iter(b'\n', buf).chain(std::iter::once(buf_len)) {
+            let line = if nl < buf_len {
+                &buf[line_start..nl]
+            } else {
+                debug_assert!(nl == buf_len);
+                if line_start < buf_len {
+                    &buf[line_start..]
+                } else {
+                    break;
+                }
+            };
+
+            if likely(self.matcher.is_match(line)) {
+                if unlikely(!found_any) {
+                    // green `path:`
+                    self.writer.write_all(COLOR_GREEN.as_bytes())?;
+                    self.writer.write_all(path.as_bytes())?;
+                    self.writer.write_all(COLOR_RESET.as_bytes())?;
+                    self.writer.write_all(b":\n")?;
+                    found_any = true;
+                }
+
+                // cyan `line_num:`
+                self.writer.write_all(COLOR_CYAN.as_bytes())?;
+                self.writer.write_int(line_num)?;
+                self.writer.write_all(COLOR_RESET.as_bytes())?;
+                self.writer.write_all(b": ")?;
+
+                let display = truncate_utf8(line, 500);
+                let mut last = 0;
+
+                for (s, e) in self.matcher.find_matches(line) {
+                    if unlikely(s >= display.len()) {
+                        break;
+                    }
+                    let e = e.min(display.len());
+
+                    // text before match
+                    self.writer.write_all(&display[last..s])?;
+                    // red `match`
+                    self.writer.write_all(COLOR_RED.as_bytes())?;
+                    self.writer.write_all(&display[s..e])?;
+                    self.writer.write_all(COLOR_RESET.as_bytes())?;
+                    last = e;
+                }
+
+                // stuff after the match
+                self.writer.write_all(&display[last..])?;
+                self.writer.write_all(b"\n")?;
+            }
+
+            line_start = nl + 1;
+            line_num += 1;
+        }
+
+        if likely(found_any) {
+            self.stats.files_contained_matches += 1;
+        }
+
+        Ok(())
+    }
+}
+
+/// impl block of ext4 parsing
+impl RawGrepper {
+    #[inline]
+    fn parse_superblock(data: &[u8]) -> io::Result<Ext4SuperBlock> {
+        let block_size_log = u32::from_le_bytes([
+            data[EXT4_BLOCK_SIZE_OFFSET + 0],
+            data[EXT4_BLOCK_SIZE_OFFSET + 1],
+            data[EXT4_BLOCK_SIZE_OFFSET + 2],
+            data[EXT4_BLOCK_SIZE_OFFSET + 3],
+        ]);
+        let block_size = 1024 << block_size_log;
+
+        let blocks_per_group = u32::from_le_bytes([
+            data[EXT4_BLOCKS_PER_GROUP_OFFSET + 0],
+            data[EXT4_BLOCKS_PER_GROUP_OFFSET + 1],
+            data[EXT4_BLOCKS_PER_GROUP_OFFSET + 2],
+            data[EXT4_BLOCKS_PER_GROUP_OFFSET + 3],
+        ]);
+
+        let inodes_per_group = u32::from_le_bytes([
+            data[EXT4_INODES_PER_GROUP_OFFSET + 0],
+            data[EXT4_INODES_PER_GROUP_OFFSET + 1],
+            data[EXT4_INODES_PER_GROUP_OFFSET + 2],
+            data[EXT4_INODES_PER_GROUP_OFFSET + 3],
+        ]);
+
+        let inode_size = u16::from_le_bytes([
+            data[EXT4_INODE_SIZE_OFFSET + 0],
+            data[EXT4_INODE_SIZE_OFFSET + 1],
+        ]);
+
+        let desc_size = if data.len() > EXT4_DESC_SIZE_OFFSET + 1 {
+            let ds = u16::from_le_bytes([
+                data[EXT4_DESC_SIZE_OFFSET + 0],
+                data[EXT4_DESC_SIZE_OFFSET + 1],
+            ]);
+            if ds >= 32 { ds } else { 32 }
+        } else {
+            32
+        };
+
+        Ok(Ext4SuperBlock {
+            block_size,
+            blocks_per_group,
+            inodes_per_group,
+            inode_size,
+            desc_size,
+        })
+    }
+
+    #[inline]
+    fn parse_inode(&mut self, inode_num: INodeNum) -> io::Result<Ext4Inode> {
         if unlikely(inode_num == 0) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -734,557 +1310,4 @@ impl RawGrepper {
 
         Ok(())
     }
-
-    fn process_directory(
-        &mut self,
-        inode: &Ext4Inode,
-        path_display_buf: &mut String,
-        dir_stack: &mut Vec<DirFrame>,
-        gi_stack: &mut Vec<GitignoreFrame>,
-        current_dir_path_len: usize,
-    ) -> io::Result<()> {
-        let dir_size = (inode.size as usize).min(MAX_DIR_BYTE_SIZE);
-        self.read_file_into_buf(inode, dir_size, BufKind::Dir)?;
-        self.stats.dirs_encountered += 1;
-
-        // ------------- Quick scan for .gitignore
-        let gitignore_inode = self.find_gitignore_inode_in_buf(BufKind::Dir);
-
-        // ------------- Load .gitignore if found
-        let pushed_gi = if let Some(gi_inode_num) = gitignore_inode {
-            self.load_gitignore(gi_inode_num, path_display_buf, gi_stack)
-        } else {
-            false
-        };
-
-        // ------------- Process all entries
-        let mut offset = 0;
-        while offset + 8 <= self.dir_buf.len() {
-            let entry_inode = INodeNum::from_le_bytes([
-                self.dir_buf[offset],
-                self.dir_buf[offset + 1],
-                self.dir_buf[offset + 2],
-                self.dir_buf[offset + 3],
-            ]);
-            let rec_len = u16::from_le_bytes([self.dir_buf[offset + 4], self.dir_buf[offset + 5]]);
-            let name_len = self.dir_buf[offset + 6];
-
-            if unlikely(rec_len == 0) { break; }
-
-            let rec_len_usize = rec_len as usize;
-
-            if unlikely(offset + rec_len_usize > self.dir_buf.len()) { break; }
-
-            if likely(entry_inode != 0 && name_len > 0) {
-                let name_end = offset + 8 + name_len as usize;
-                if likely(name_end <= offset + rec_len_usize) {
-                    let name_bytes = &self.dir_buf[offset + 8..name_end];
-
-                    // reject . and ..
-                    if unlikely(is_dot_entry(name_bytes)) {
-                        offset += rec_len_usize;
-                        continue;
-                    }
-
-                    let name_bytes_copy: SmallVec::<[_; 256]> = copy_data(
-                        &self.dir_buf[offset + 8..name_end]
-                    );
-
-                    self.process_entry(
-                        entry_inode,
-                        &name_bytes_copy,
-                        path_display_buf,
-                        dir_stack,
-                        gi_stack,
-                        current_dir_path_len,
-                    )?;
-                }
-            }
-
-            offset += rec_len_usize;
-        }
-
-        if pushed_gi {
-            gi_stack.pop();
-        }
-
-        Ok(())
-    }
-
-    fn process_entry(
-        &mut self,
-        entry_inode: INodeNum,
-        name: &[u8],
-        path_display_buf: &mut String,
-        dir_stack: &mut Vec<DirFrame>,
-        gi_stack: &[GitignoreFrame],
-        current_dir_path_len: usize,
-    ) -> io::Result<()> {
-        if is_common_skip_dir(name) {
-            self.stats.dirs_skipped_common += 1;
-            return Ok(());
-        }
-
-        // ------ Ensure we start from the current directory path
-        self.path_buf.truncate(current_dir_path_len);
-
-        // ------ Build the full path: current_dir + '/' + name
-        if likely(current_dir_path_len > 0)
-            && self.path_buf.as_bytes().get(current_dir_path_len - 1) != Some(&b'/')
-        {
-            self.path_buf.push(b'/');
-        }
-        self.path_buf.extend_from_slice(name);
-
-        let Ok(child_inode) = self.read_inode(entry_inode) else {
-            self.path_buf.truncate(current_dir_path_len);
-            return Ok(());
-        };
-
-        let ft = child_inode.mode & EXT4_S_IFMT;
-
-        match ft {
-            EXT4_S_IFDIR => {
-                let name_offset = self.dir_name_buf.len();
-                self.dir_name_buf.extend_from_slice(name);
-                let name_len = name.len();
-
-                dir_stack.push(DirFrame {
-                    inode_num: entry_inode,
-                    parent_len: current_dir_path_len,
-                    name_offset,
-                    name_len,
-                });
-            }
-            EXT4_S_IFREG => {
-                self.process_file(
-                    &child_inode,
-                    name,
-                    path_display_buf,
-                    gi_stack,
-                )?;
-            }
-            EXT4_S_IFLNK => {
-                self.process_symlink(
-                    &child_inode,
-                    name,
-                    path_display_buf,
-                    gi_stack,
-                    current_dir_path_len
-                ).inspect_err(|_| {
-                    self.stats.symlinks_broken += 1;
-                })?;
-            }
-            _ => {
-                // ... skip special files (devices, FIFOs, sockets, etc.)
-            }
-        }
-
-        self.path_buf.truncate(current_dir_path_len);
-
-        Ok(())
-    }
-
-    #[inline]
-    fn process_symlink(
-        &mut self,
-        child_inode: &Ext4Inode,
-        name: &[u8],
-        path_display_buf: &mut String,
-        gi_stack: &[GitignoreFrame],
-        current_dir_path_len: usize
-    ) -> io::Result<()> {
-        if unlikely(current_dir_path_len > self.path_buf.capacity()) {
-            self.stats.symlinks_broken += 1;
-            return Ok(());
-        }
-
-        let target_inode_num = self.resolve_symlink(&child_inode, current_dir_path_len)?;
-        let target_inode = self.read_inode(target_inode_num)?;
-        let target_ft = target_inode.mode & EXT4_S_IFMT;
-
-        if target_ft == EXT4_S_IFREG {
-            self.stats.symlinks_followed += 1;
-            self.process_file(
-                &target_inode,
-                name,
-                path_display_buf,
-                gi_stack,
-            )?;
-        } else {
-            // ... skip directory symlinks to avoid potential loops
-        }
-
-        Ok(())
-    }
-
-    #[inline]
-    fn process_file(
-        &mut self,
-        child_inode: &Ext4Inode,
-        name: &[u8],
-        path_display_buf: &mut String,
-        gi_stack: &[GitignoreFrame],
-    ) -> io::Result<()> {
-        self.stats.files_encountered += 1;
-
-        // -------------------- Rejection by size
-        if unlikely(child_inode.size > MAX_FILE_BYTE_SIZE as u64) {
-            self.stats.files_skipped_large += 1;
-            return Ok(());
-        }
-
-        // -------------------- Rejection by extension
-        if is_binary_ext(name) {
-            self.stats.files_skipped_as_binary_due_to_ext += 1;
-            return Ok(());
-        }
-
-        // -------------------- Build display path
-        // path_bytes contains the full path including filename
-        self.display_path_into_buf(path_display_buf);
-
-        // -------------------- Rejection by .gitignore
-        if is_gitignored(gi_stack, path_display_buf.as_ref(), false) {
-            self.stats.files_skipped_gitignore += 1;
-            return Ok(());
-        }
-
-        // -------------------- Rejection by a binary probe
-        if self.probe_is_binary(child_inode) {
-            self.stats.files_skipped_as_binary_due_to_probe += 1;
-            return Ok(());
-        }
-
-        let size = (child_inode.size as usize).min(MAX_FILE_BYTE_SIZE);
-        if likely(self.read_file_into_buf(child_inode, size, BufKind::Content).is_ok()) {
-            self.stats.files_searched += 1;
-            self.stats.bytes_searched += self.get_buf(BufKind::Content).len();
-            self.find_and_print_matches(path_display_buf)?;
-        } else {
-            self.stats.files_skipped_unreadable += 1;
-        }
-
-        Ok(())
-    }
-
-    #[inline]
-    fn load_gitignore(
-        &mut self,
-        gi_inode_num: INodeNum,
-        path_display_buf: &str,
-        gi_stack: &mut Vec<GitignoreFrame>,
-    ) -> bool {
-        if let Ok(gi_inode) = self.read_inode(gi_inode_num) {
-            let size = (gi_inode.size as usize).min(MAX_FILE_BYTE_SIZE);
-            if likely(self.read_file_into_buf(&gi_inode, size, BufKind::Gitignore).is_ok()) {
-                let matcher = build_gitignore_from_bytes(
-                    path_display_buf.as_ref(),
-                    &self.gitignore_buf,
-                );
-                gi_stack.push(GitignoreFrame { matcher });
-                return true;
-            }
-        }
-        false
-    }
-
-    fn read_file_into_buf(&mut self, inode: &Ext4Inode, max_size: usize, kind: BufKind) -> io::Result<()> {
-        let buf = self.get_buf_mut(kind);
-        buf.clear();
-        let size_to_read = (inode.size as usize).min(max_size);
-        buf.reserve(size_to_read);
-
-        let copy_block_to_buf = |this: &mut RawGrepper, block_num: u64| {
-            let offset = this.get_buf(kind).len();
-            let remaining = size_to_read - offset;
-
-            let (src_ptr, to_copy) = {
-                let block_data = this.get_block(block_num.into());
-                let to_copy = block_data.len().min(remaining);
-                (block_data.as_ptr(), to_copy)
-            };
-
-            let buf = this.get_buf_mut(kind);
-            let old_len = buf.len();
-            buf.resize(old_len + to_copy, 0);
-
-            // SAFETY: We obtain the source pointer from block_data while it's borrowed,
-            // then drop that borrow before getting a mutable borrow to the destination buffer.
-            // The source pointer remains valid because get_block() returns data from a cache
-            // that won't be invalidated during this operation. We ensure no overlap between
-            // source and destination, and both pointers are valid for the copy length.
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    src_ptr,
-                    buf.as_mut_ptr().add(old_len),
-                    to_copy
-                );
-            }
-        };
-
-        if inode.flags & EXT4_EXTENTS_FL != 0 {
-            self.parse_extents(inode)?;
-
-            let extent_count = self.extent_buf.len();
-            let extents_copy: SmallVec::<[_; MAX_EXTENTS_UNTIL_SPILL]> = copy_data(
-                &self.extent_buf[..extent_count]
-            );
-
-            // ------- Prefetch the blooooooocks
-            {
-                let mut blocks_to_prefetch = SmallVec::<[_; MAX_EXTENTS_UNTIL_SPILL]>::with_capacity(
-                    MAX_EXTENTS_UNTIL_SPILL
-                );
-                for extent in &extents_copy {
-                    for i in 0..extent.len.min((MAX_EXTENTS_UNTIL_SPILL / extents_copy.len().max(1)) as _) {
-                        blocks_to_prefetch.push(extent.start + i as u64);
-                        if blocks_to_prefetch.len() >= MAX_EXTENTS_UNTIL_SPILL {
-                            break;
-                        }
-                    }
-                    if blocks_to_prefetch.len() >= MAX_EXTENTS_UNTIL_SPILL {
-                        break;
-                    }
-                }
-                self.prefetch_blocks(&blocks_to_prefetch);
-            }
-
-            for extent in &extents_copy {
-                if self.get_buf(kind).len() >= size_to_read {
-                    break;
-                }
-                for j in 0..extent.len {
-                    if self.get_buf(kind).len() >= size_to_read {
-                        break;
-                    }
-
-                    let phys_block = extent.start + j as u64;
-                    copy_block_to_buf(self, phys_block);
-                }
-            }
-        } else {
-            // ------- Prefetch the blooooooocks
-            {
-                let mut blocks_to_prefetch = SmallVec::<[_; EXT4_BLOCK_POINTERS_COUNT]>::with_capacity(
-                    EXT4_BLOCK_POINTERS_COUNT
-                );
-                for &block in inode.blocks.iter().take(EXT4_BLOCK_POINTERS_COUNT) {
-                    if block != 0 {
-                        blocks_to_prefetch.push(block as _);
-                    }
-                }
-                self.prefetch_blocks(&blocks_to_prefetch);
-            }
-
-            for &block in inode.blocks.iter().take(EXT4_BLOCK_POINTERS_COUNT) {
-                if block == 0 || self.get_buf(kind).len() >= size_to_read {
-                    break;
-                }
-
-                copy_block_to_buf(self, block.into());
-            }
-        }
-
-        self.get_buf_mut(kind).truncate(size_to_read);
-        Ok(())
-    }
-
-    /// Resolve a symlink to its target inode number
-    #[inline]
-    fn resolve_symlink(
-        &mut self,
-        inode: &Ext4Inode,
-        current_dir_len: usize
-    ) -> io::Result<INodeNum> {
-        if unlikely(current_dir_len > PATH_VERY_LONG_LENGTH) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Path too long (possible symlink loop)"
-            ));
-        }
-
-        // symlink targets < `FAST_SYMLINK_SIZE` bytes are stored directly in inode.blocks
-        if inode.size < FAST_SYMLINK_SIZE as u64 {
-            let target = unsafe {
-                std::slice::from_raw_parts(
-                    inode.blocks.as_ptr() as *const u8,
-                    inode.size as usize
-                )
-            };
-            return self.resolve_symlink_target(target, current_dir_len);
-        }
-
-        // slow symlinks: target stored in file blocks
-        let size = (inode.size as usize).min(MAX_SYMLINK_TARGET_SIZE);
-        self.read_file_into_buf(inode, size, BufKind::Content)?;
-
-        let target: SmallVec<[_; 256]> = copy_data(&self.content_buf[..]);
-        self.resolve_symlink_target(&target, current_dir_len)
-    }
-
-    /// Resolve the symlink target path to an inode number
-    fn resolve_symlink_target(
-        &mut self,
-        target: &[u8],
-        current_dir_len: usize
-    ) -> io::Result<INodeNum> {
-        if target.first() == Some(&b'/') {
-            // This is an absolute path
-            let path_str = String::from_utf8_lossy(target);
-            return self.try_resolve_path_to_inode(&path_str);
-        }
-
-        let current_dir = &self.path_buf.as_bytes()[..current_dir_len];
-
-        let mut resolved_path = SmallVec::<[_; 512]>::new();
-        resolved_path.extend_from_slice(current_dir);
-
-        for component in target.split(|&b| b == b'/') {
-            if component.is_empty() || component == b"." {
-                continue;
-            }
-
-            if component == b".." {
-                // Go up one directory - find last '/'
-                if let Some(pos) = resolved_path.iter().rposition(|&b| b == b'/') {
-                    resolved_path.truncate(pos);
-                } else {
-                    // Already at root
-                    resolved_path.clear();
-                }
-                continue;
-            }
-
-            // Add component to path
-            if !resolved_path.is_empty() && resolved_path.last() != Some(&b'/') {
-                resolved_path.push(b'/');
-            }
-            resolved_path.extend_from_slice(component);
-
-            if unlikely(resolved_path.len() > PATH_VERY_LONG_LENGTH) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "Path too long during symlink resolution"
-                ));
-            }
-        }
-
-        let path_str = String::from_utf8_lossy(&resolved_path);
-        self.try_resolve_path_to_inode(&path_str)
-    }
-
-    #[inline]
-    fn find_gitignore_inode_in_buf(&self, kind: BufKind) -> Option<INodeNum> {
-        let mut offset = 0;
-
-        while offset + 8 <= self.get_buf(kind).len() {
-            let entry_inode = INodeNum::from_le_bytes([
-                self.get_buf(kind)[offset],
-                self.get_buf(kind)[offset + 1],
-                self.get_buf(kind)[offset + 2],
-                self.get_buf(kind)[offset + 3],
-            ]);
-            let rec_len = u16::from_le_bytes([
-                self.get_buf(kind)[offset + 4],
-                self.get_buf(kind)[offset + 5]
-            ]);
-            let name_len = self.get_buf(kind)[offset + 6];
-
-            if unlikely(rec_len == 0) {
-                break;
-            }
-
-            // @Quickcheck: .gitignore is exactly 10 bytes
-            if entry_inode != 0 && name_len == 10 {
-                let name_end = offset + 8 + 10;
-                if name_end <= offset + rec_len as usize &&
-                    name_end <= self.get_buf(kind).len()
-                {
-                    let name_bytes = &self.get_buf(kind)[offset + 8..name_end];
-                    if name_bytes == b".gitignore" {
-                        return Some(entry_inode);
-                    }
-                }
-            }
-
-            offset += rec_len as usize;
-        }
-
-        None
-    }
-
-    fn find_and_print_matches(&mut self, path: &str) -> io::Result<()> {
-        let buf = &self.content_buf;
-        if unlikely(!self.matcher.is_match(buf)) {
-            return Ok(());
-        }
-
-        let mut found_any = false;
-        let mut line_start = 0;
-        let mut line_num = 1;
-        let buf_len = buf.len();
-
-        for nl in memchr::memchr_iter(b'\n', buf).chain(std::iter::once(buf_len)) {
-            let line = if nl < buf_len {
-                &buf[line_start..nl]
-            } else {
-                debug_assert!(nl == buf_len);
-                if line_start < buf_len {
-                    &buf[line_start..]
-                } else {
-                    break;
-                }
-            };
-
-            if likely(self.matcher.is_match(line)) {
-                if unlikely(!found_any) {
-                    // green `path:`
-                    self.writer.write_all(COLOR_GREEN.as_bytes())?;
-                    self.writer.write_all(path.as_bytes())?;
-                    self.writer.write_all(COLOR_RESET.as_bytes())?;
-                    self.writer.write_all(b":\n")?;
-                    found_any = true;
-                }
-
-                // cyan `line_num:`
-                self.writer.write_all(COLOR_CYAN.as_bytes())?;
-                self.writer.write_int(line_num)?;
-                self.writer.write_all(COLOR_RESET.as_bytes())?;
-                self.writer.write_all(b": ")?;
-
-                let display = truncate_utf8(line, 500);
-                let mut last = 0;
-
-                for (s, e) in self.matcher.find_matches(line) {
-                    if unlikely(s >= display.len()) {
-                        break;
-                    }
-                    let e = e.min(display.len());
-
-                    // text before match
-                    self.writer.write_all(&display[last..s])?;
-                    // red `match`
-                    self.writer.write_all(COLOR_RED.as_bytes())?;
-                    self.writer.write_all(&display[s..e])?;
-                    self.writer.write_all(COLOR_RESET.as_bytes())?;
-                    last = e;
-                }
-
-                // stuff after the match
-                self.writer.write_all(&display[last..])?;
-                self.writer.write_all(b"\n")?;
-            }
-
-            line_start = nl + 1;
-            line_num += 1;
-        }
-
-        if likely(found_any) {
-            self.stats.files_contained_matches += 1;
-        }
-
-        Ok(())
-    }
 }
-
