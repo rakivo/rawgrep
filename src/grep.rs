@@ -121,6 +121,14 @@ pub struct Ext4Extent {
     pub len: u16,
 }
 
+pub struct BufferConfig {
+    pub dir_name_buf: usize,
+    pub dir_buf: usize,
+    pub content_buf: usize,
+    pub gitignore_buf: usize,
+    pub extent_buf: usize,
+}
+
 pub struct RawGrepper {
     device_mmap: Mmap,
     sb: Ext4SuperBlock,
@@ -246,11 +254,12 @@ impl RawGrepper {
 
     #[inline(always)]
     fn init(&mut self) {
-        self.dir_name_buf.reserve(0x2000);   // 8 KB for directory names
-        self.dir_buf.reserve(256 * 1024);    // 256 KB for parsing directories
-        self.content_buf.reserve(0x100000);  // 1 MB for file content
-        self.gitignore_buf.reserve(0x4000);  // 16 KB for .gitignore
-        self.extent_buf.reserve(0x100);      // 256 extents, very cheap, covers ~all files
+        let config = self.cli.get_buffer_config();
+        self.dir_name_buf.reserve(config.dir_name_buf);
+        self.dir_buf.reserve(config.dir_buf);
+        self.content_buf.reserve(config.content_buf);
+        self.gitignore_buf.reserve(config.gitignore_buf);
+        self.extent_buf.reserve(config.extent_buf);
     }
 
     pub fn search(
@@ -258,10 +267,14 @@ impl RawGrepper {
         root_inode: INodeNum,
         path_display_buf: &mut String,
         running: &AtomicBool,
-        root_gitignore: Gitignore,
+        root_gitignore: Option<Gitignore>,
     ) -> io::Result<(Cli, Stats)> {
         let mut dir_stack = Vec::with_capacity(1024);
-        let mut gi_stack = Vec::with_capacity(64);
+        let mut gi_stack = if self.cli.should_ignore_gitignore() {
+            Vec::new()
+        } else {
+            Vec::with_capacity(64)
+        };
 
         dir_stack.push(DirFrame {
             inode_num: root_inode,
@@ -269,7 +282,9 @@ impl RawGrepper {
             name_offset: 0,
             name_len: 0, // Root has no name to add
         });
-        gi_stack.push(GitignoreFrame { matcher: root_gitignore });
+        if let Some(root_gitignore) = root_gitignore {
+            gi_stack.push(GitignoreFrame { matcher: root_gitignore });
+        }
 
         self.init();
 
@@ -310,7 +325,9 @@ impl RawGrepper {
             }
 
             self.display_path_into_buf(path_display_buf);
-            if is_gitignored(&gi_stack, path_display_buf.as_ref(), true) {
+            if !self.cli.should_ignore_gitignore() &&
+                is_gitignored(&gi_stack, path_display_buf.as_ref(), true)
+            {
                 self.stats.dirs_skipped_gitignore += 1;
                 continue;
             }
@@ -414,7 +431,11 @@ impl RawGrepper {
         self.stats.dirs_encountered += 1;
 
         // ------------- Quick scan for .gitignore
-        let gitignore_inode = self.find_gitignore_inode_in_buf(BufKind::Dir);
+        let gitignore_inode = if self.cli.should_ignore_gitignore() {
+            None
+        } else {
+            self.find_gitignore_inode_in_buf(BufKind::Dir)
+        };
 
         // ------------- Load .gitignore if found
         let pushed_gi = if let Some(gi_inode_num) = gitignore_inode {
@@ -595,13 +616,17 @@ impl RawGrepper {
         self.stats.files_encountered += 1;
 
         // -------------------- Rejection by size
-        if unlikely(child_inode.size > MAX_FILE_BYTE_SIZE as u64) {
+        if !self.cli.should_ignore_all_filters() &&
+            unlikely(child_inode.size > MAX_FILE_BYTE_SIZE as u64)
+        {
             self.stats.files_skipped_large += 1;
             return Ok(());
         }
 
         // -------------------- Rejection by extension
-        if is_binary_ext(name) {
+        if !self.cli.should_search_binary() &&
+            is_binary_ext(name)
+        {
             self.stats.files_skipped_as_binary_due_to_ext += 1;
             return Ok(());
         }
@@ -611,13 +636,17 @@ impl RawGrepper {
         self.display_path_into_buf(path_display_buf);
 
         // -------------------- Rejection by .gitignore
-        if is_gitignored(gi_stack, path_display_buf.as_ref(), false) {
+        if !self.cli.should_ignore_gitignore() &&
+            is_gitignored(gi_stack, path_display_buf.as_ref(), false)
+        {
             self.stats.files_skipped_gitignore += 1;
             return Ok(());
         }
 
         // -------------------- Rejection by a binary probe
-        if self.probe_is_binary(child_inode) {
+        if !self.cli.should_search_binary() &&
+            self.probe_is_binary(child_inode)
+        {
             self.stats.files_skipped_as_binary_due_to_probe += 1;
             return Ok(());
         }

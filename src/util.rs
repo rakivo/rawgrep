@@ -27,10 +27,10 @@ pub fn is_gitignored(frames: &[GitignoreFrame], path: &Path, is_dir: bool) -> bo
 }
 
 #[inline(always)]
-pub fn build_gitignore(root: &Path) -> Gitignore {
+pub fn build_gitignore(root: &Path) -> Option<Gitignore> {
     let mut builder = GitignoreBuilder::new(root);
     builder.add(root.join(".gitignore"));
-    builder.build().unwrap()
+    builder.build().ok()
 }
 
 #[inline(always)]

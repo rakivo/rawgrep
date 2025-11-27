@@ -88,17 +88,17 @@ impl Drop for CursorHide {
 fn main() -> io::Result<()> {
     let cli = Cli::parse();
 
-    let dir_path = match fs::canonicalize(&cli.search_root_path) {
+    let search_root_path = match fs::canonicalize(&cli.search_root_path) {
         Ok(path) => path,
         Err(e) => {
-            let dir_path = &cli.search_root_path;
-            eprintln!("error: couldn't canonicalize '{dir_path}': {e}");
+            let search_root_path = &cli.search_root_path;
+            eprintln!("error: couldn't canonicalize '{search_root_path}': {e}");
             std::process::exit(1);
         }
     };
 
     let device = cli.device.as_ref().cloned().unwrap_or_else(|| {
-        match crate::util::detect_partition_for_path(dir_path.as_ref()) {
+        match crate::util::detect_partition_for_path(search_root_path.as_ref()) {
             Ok(ok) => ok,
             Err(e) => {
                 eprintln!("error: couldn't find auto-detect partition: {e}");
@@ -107,10 +107,9 @@ fn main() -> io::Result<()> {
         }
     });
 
-    let dir_path = dir_path.to_string_lossy();
+    let dir_path = search_root_path.to_string_lossy();
     let dir_path = dir_path.as_ref();
 
-    // TODO: Detect the partition automatically
     let mut grep = match RawGrepper::new(&device, dir_path, cli) {
         Ok(ok) => ok,
         Err(e) => {
@@ -137,13 +136,6 @@ fn main() -> io::Result<()> {
         }
     };
 
-    eprintln!{
-        "{COLOR_CYAN}Searching{COLOR_RESET} '{device}' for pattern: {COLOR_RED}'{pattern}'{COLOR_RESET}\n",
-        pattern = grep.cli.pattern
-    };
-
-    let _cur = CursorHide::new();
-
     let start_inode = match grep.try_resolve_path_to_inode(dir_path) {
         Ok(ok) => ok,
         Err(e) => {
@@ -151,6 +143,13 @@ fn main() -> io::Result<()> {
             std::process::exit(1);
         }
     };
+
+    eprintln!{
+        "{COLOR_CYAN}Searching{COLOR_RESET} '{device}' for pattern: {COLOR_RED}'{pattern}'{COLOR_RESET}\n",
+        pattern = grep.cli.pattern
+    };
+
+    let _cur = CursorHide::new();
 
     let (cli, stats) = grep.search(
         start_inode,
