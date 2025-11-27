@@ -1,5 +1,4 @@
-use crate::grep::GitignoreFrame;
-
+use std::sync::Arc;
 use std::{fs, io};
 use std::path::{Path, PathBuf};
 
@@ -16,12 +15,11 @@ pub const fn is_common_skip_dir(dir: &[u8]) -> bool {
     matches!(dir, b"node_modules" | b"target" | b".git" | b".hg" | b".svn")
 }
 
+
 #[inline(always)]
-pub fn is_gitignored(frames: &[GitignoreFrame], path: &Path, is_dir: bool) -> bool {
-    for frame in frames.iter().rev() {
-        if frame.matcher.matched(path, is_dir).is_ignore() {
-            return true;
-        }
+pub fn is_gitignored(gi: &Gitignore, path: &Path, is_dir: bool) -> bool {
+    if gi.matched(path, is_dir).is_ignore() {
+        return true;
     }
     false
 }
@@ -171,6 +169,81 @@ fn unescape_mountpoint(s: &str) -> String {
     result
 }
 
+/// `std::vec::Vec::into_boxed_slice` takes CPU cycles to shrink
+/// itself to the `.len`, this function does not shrink and saves
+/// us some CPU cycles
+#[inline]
+#[must_use]
+pub fn vec_into_boxed_slice_noshrink<T>(mut v: Vec<T>) -> Box<[T]> {
+    let len = v.len();
+    let ptr = v.as_mut_ptr();
+
+    core::mem::forget(v);
+
+    unsafe {
+        Box::from_raw(core::slice::from_raw_parts_mut(ptr, len))
+    }
+}
+
+/// `std::vec::Vec::into_boxed_slice` takes CPU cycles to shrink
+/// itself to the `.len`, this function does not shrink and saves
+/// us some time
+#[inline]
+#[must_use]
+pub fn vec_into_arc_slice_noshrink<T>(mut v: Vec<T>) -> Arc<[T]> {
+    let len = v.len();
+    let ptr = v.as_mut_ptr();
+
+    let boxed_slice = unsafe {
+        // SAFETY: We use the raw parts from Vec to reconstruct a Box<[T]>.
+        // This transfers ownership of the heap memory from Vec to Box.
+        // This is safe ONLY because we are immediately calling core::mem::forget(v) below,
+        // preventing the original Vec from attempting to free the memory.
+        let slice_ptr = core::slice::from_raw_parts_mut(ptr, len);
+        Box::from_raw(slice_ptr)
+    };
+
+    core::mem::forget(v);
+
+    Arc::from(boxed_slice)
+}
+
+#[inline]
+#[must_use]
+pub fn smallvec_into_arc_slice_noshrink<A, T>(mut v: SmallVec<A>) -> Arc<[T]>
+where
+    A: smallvec::Array<Item = T>,
+{
+    if v.spilled() {
+        // SAFETY: we are taking ownership of the allocated buffer.
+        let boxed = unsafe {
+            Box::from_raw(v.as_mut_slice())
+        };
+        core::mem::forget(v);
+        Arc::from(boxed)
+    } else {
+        vec_into_arc_slice_noshrink(v.into_vec())
+    }
+}
+
+#[inline]
+#[must_use]
+pub fn smallvec_into_boxed_slice_noshrink<A, T>(mut v: SmallVec<A>) -> Box<[T]>
+where
+    A: smallvec::Array<Item = T>,
+{
+    if v.spilled() {
+        // SAFETY: we are taking ownership of the allocated buffer.
+        let boxed = unsafe {
+            Box::from_raw(v.as_mut_slice())
+        };
+        core::mem::forget(v);
+        boxed
+    } else {
+        vec_into_boxed_slice_noshrink(v.into_vec())
+    }
+}
+
 // ---------------
 // Nightly implementation
 // ----------------------
@@ -202,3 +275,5 @@ mod imp {
 }
 
 pub use imp::*;
+use smallvec::SmallVec;
+

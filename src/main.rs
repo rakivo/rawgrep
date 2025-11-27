@@ -16,7 +16,6 @@ mod util;
 mod stats;
 mod tracy;
 mod binary;
-mod writer;
 mod matcher;
 mod path_buf;
 
@@ -108,10 +107,10 @@ fn main() -> io::Result<()> {
         }
     });
 
-    let dir_path = search_root_path.to_string_lossy();
-    let dir_path = dir_path.as_ref();
+    let search_root_path = search_root_path.to_string_lossy();
+    let search_root_path = search_root_path.as_ref();
 
-    let mut grep = match RawGrepper::new(&device, dir_path, cli) {
+    let mut grep = match RawGrepper::new(&device, cli) {
         Ok(ok) => ok,
         Err(e) => {
             eprint!("{COLOR_RED}");
@@ -137,10 +136,10 @@ fn main() -> io::Result<()> {
         }
     };
 
-    let start_inode = match grep.try_resolve_path_to_inode(dir_path) {
+    let start_inode = match grep.try_resolve_path_to_inode(search_root_path) {
         Ok(ok) => ok,
         Err(e) => {
-            eprintln!("{COLOR_RED}error: couldn't find {dir_path} in {device}: {e}{COLOR_RESET}");
+            eprintln!("{COLOR_RED}error: couldn't find {search_root_path} in {device}: {e}{COLOR_RESET}");
             std::process::exit(1);
         }
     };
@@ -152,11 +151,12 @@ fn main() -> io::Result<()> {
 
     let _cur = CursorHide::new();
 
-    let (cli, stats) = grep.search(
+    let (cli, stats) = grep.search_parallel(
         start_inode,
-        &mut dir_path.to_owned(),
+        search_root_path,
         &setup_signal_handler(),
-        build_gitignore(dir_path.as_ref())
+        build_gitignore(search_root_path.as_ref()),
+        16
     )?;
 
     if cli.stats {

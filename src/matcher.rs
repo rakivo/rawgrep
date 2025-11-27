@@ -127,35 +127,6 @@ impl Matcher {
     }
 
     #[inline(always)]
-    pub fn find_at(&self, haystack: &[u8], start: usize) -> Option<(usize, usize)> {
-        // Bounds check to prevent panics in slicing
-        if start >= haystack.len() {
-            return None;
-        }
-
-        match self {
-            Matcher::Literal(finder) => {
-                // memchr returns index relative to the slice provided
-                finder.find(&haystack[start..]).map(|i| {
-                    let real_start = start + i;
-                    (real_start, real_start + finder.needle().len())
-                })
-            }
-            Matcher::MultiLiteral(ac) => {
-                // Aho-Corasick returns index relative to the slice provided
-                ac.find(&haystack[start..]).map(|m| {
-                    (start + m.start(), start + m.end())
-                })
-            }
-            Matcher::Regex(re) => {
-                // Regex::find_at takes the WHOLE buffer and a start index.
-                // It returns ABSOLUTE indices, so we do NOT add `start` here.
-                re.find_at(haystack, start).map(|m| (m.start(), m.end()))
-            }
-        }
-    }
-
-    #[inline(always)]
     pub fn find_matches<'a>(&'a self, haystack: &'a [u8]) -> MatchIterator<'a> {
         match self {
             Matcher::Literal(finder) => {

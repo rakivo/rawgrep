@@ -30,9 +30,9 @@ pub struct Cli {
 
     /// Reduce filtering (can be repeated)
     ///
-    /// -u: disable .gitignore filtering
-    /// -uu: also disable binary file filtering
-    /// -uuu: disable all filtering
+    /// -u: disable size filtering
+    /// -uu: also disable .gitignore filtering
+    /// -uuu: disable all filtering, including  binary file filtering (by extension, probe)
     #[arg(short = 'u', long = "unrestricted", action = clap::ArgAction::Count)]
     pub unrestricted: u8,
 
@@ -44,6 +44,11 @@ pub struct Cli {
     #[arg(long = "binary", conflicts_with = "unrestricted")]
     pub binary: bool,
 
+    /// Search large files and large directories (don't skip them)
+    /// Default FILE_MAX_SIZE is 8 MB and DIRECTORY_MAX_SIZE is 16 MB
+    #[arg(long, conflicts_with = "unrestricted")]
+    pub large: bool,
+
     /// Disable all filtering (search everything)
     ///
     /// Equivalent to -uuu or --no-ignore --binary --hidden
@@ -52,16 +57,22 @@ pub struct Cli {
 }
 
 impl Cli {
+    /// Returns true if should search large files
+    #[inline(always)]
+    pub const fn should_ignore_size_filter(&self) -> bool {
+        self.unrestricted >= 1 || self.large || self.all
+    }
+
     /// Returns true if .gitignore files should be ignored
     #[inline(always)]
     pub const fn should_ignore_gitignore(&self) -> bool {
-        self.unrestricted >= 1 || self.no_ignore || self.all
+        self.unrestricted >= 2 || self.no_ignore || self.all
     }
 
     /// Returns true if binary files should be searched
     #[inline(always)]
     pub const fn should_search_binary(&self) -> bool {
-        self.unrestricted >= 2 || self.binary || self.all
+        self.unrestricted >= 3 || self.binary || self.all
     }
 
     /// Returns true if all filters should be disabled
@@ -76,20 +87,20 @@ impl Cli {
         if self.should_ignore_all_filters() || self.should_search_binary() {
             // Unfiltered search: processing MANY more LARGE files
             BufferConfig {
-                dir_name_buf: 16 * 1024,      // 16 KB - more directories to track
-                dir_buf: 1024 * 1024,         // 1 MB - larger directory listings
-                content_buf: 4 * 1024 * 1024, // 4 MB - reading more larger files
+                dir_buf: 1 * 1024 * 1024,     // 1 MB
+                content_buf: 4 * 1024 * 1024, // 4 MB
+                output_buf: 2 * 1024 * 1024,  // 2 MB
                 gitignore_buf: 0,             // 0 KB - not using .gitignore
                 extent_buf: 1024,             // Large files have more extents
             }
         } else {
             // Default filtered search: optimal for text files
             BufferConfig {
-                dir_name_buf: 8 * 1024,      // 8 KB
-                dir_buf: 256 * 1024,         // 256 KB
-                content_buf: 1024 * 1024,    // 1 MB
+                dir_buf: 256 * 1024,          // 256 KB
+                content_buf: 1 * 1024 * 1024, // 1 MB
+                output_buf: 1 * 1024 * 1024,  // 1 MB
                 gitignore_buf: if self.should_ignore_gitignore() { 0 } else { 16 * 1024 },
-                extent_buf: 256,             // Most text files fit in few extents
+                extent_buf: 256,              // Most text files fit in few extents
             }
         }
     }
