@@ -4,6 +4,8 @@ use regex::bytes::Regex;
 use memchr::memmem::Finder;
 use aho_corasick::AhoCorasick;
 
+use crate::tracy;
+
 #[inline]
 fn extract_literal(pattern: &str) -> Option<Vec<u8>> {
     let trimmed = pattern.trim_start_matches('^').trim_end_matches('$');
@@ -58,6 +60,7 @@ impl<'a> Iterator for MatchIterator<'a> {
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
+        let _span = tracy::span!("MatchIterator::next");
         match self {
             MatchIterator::Literal { iter, needle_len } => {
                 iter.next().map(|pos| (pos, pos + *needle_len))
@@ -82,6 +85,8 @@ pub enum Matcher {
 
 impl Matcher {
     pub fn new(pattern: &str) -> io::Result<Self> {
+        let _span = tracy::span!("Matcher::new");
+
         // Try literal extraction first
         if let Some(literal) = extract_literal(pattern) {
             return Ok(Matcher::Literal(Finder::new(&literal).into_owned()));
@@ -118,6 +123,35 @@ impl Matcher {
             Matcher::Literal(finder) => finder.find(haystack).is_some(),
             Matcher::MultiLiteral(ac) => ac.is_match(haystack),
             Matcher::Regex(re) => re.is_match(haystack),
+        }
+    }
+
+    #[inline(always)]
+    pub fn find_at(&self, haystack: &[u8], start: usize) -> Option<(usize, usize)> {
+        // Bounds check to prevent panics in slicing
+        if start >= haystack.len() {
+            return None;
+        }
+
+        match self {
+            Matcher::Literal(finder) => {
+                // memchr returns index relative to the slice provided
+                finder.find(&haystack[start..]).map(|i| {
+                    let real_start = start + i;
+                    (real_start, real_start + finder.needle().len())
+                })
+            }
+            Matcher::MultiLiteral(ac) => {
+                // Aho-Corasick returns index relative to the slice provided
+                ac.find(&haystack[start..]).map(|m| {
+                    (start + m.start(), start + m.end())
+                })
+            }
+            Matcher::Regex(re) => {
+                // Regex::find_at takes the WHOLE buffer and a start index.
+                // It returns ABSOLUTE indices, so we do NOT add `start` here.
+                re.find_at(haystack, start).map(|m| (m.start(), m.end()))
+            }
         }
     }
 

@@ -7,6 +7,7 @@ edition = "2024"
 default = ["dep:mimalloc"]
 mimalloc = ["dep:mimalloc"]
 use_nightly = []
+tracy = ["tracy-client/enable"]
 
 [dependencies]
 regex = "1"
@@ -23,6 +24,7 @@ ignore = "0.4.25"
 phf = { version = "0.13.1", features = ["macros"] }
 bytecount = "0.6.9"
 clap = { version = "4.5", features = ["std", "help", "derive"], default-features = false }
+tracy-client = { version = "0.17.3", default-features = false }
 
 [profile.release-fast]
 inherits = "release"
@@ -34,3 +36,16 @@ debug = false
 strip = true
 overflow-checks = false
 debug-assertions = false
+
+# also: set RUSTFLAGS="-C force-frame-pointers=yes"
+[profile.profiling]
+inherits = "release"
+debug = true                      # keep DWARF symbols
+split-debuginfo = "packed"        # so perf can find them easily (Linux)
+strip = "none"                    # don’t strip symbols
+lto = false
+codegen-units = 16
+overflow-checks = false
+panic = "abort"                   # optional: less noise, smaller code
+
+

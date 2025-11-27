@@ -14,6 +14,7 @@ mod cli;
 mod grep;
 mod util;
 mod stats;
+mod tracy;
 mod binary;
 mod writer;
 mod matcher;

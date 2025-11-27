@@ -3,7 +3,7 @@ use crate::matcher::Matcher;
 use crate::stats::Stats;
 use crate::writer::SmoothWriter;
 use crate::path_buf::FixedPathBuf;
-use crate::{copy_data, COLOR_CYAN, COLOR_GREEN, COLOR_RED, COLOR_RESET};
+use crate::{copy_data, tracy, COLOR_CYAN, COLOR_GREEN, COLOR_RED, COLOR_RESET};
 use crate::binary::{is_binary_chunk, is_binary_ext};
 use crate::util::{
     likely,
@@ -269,6 +269,8 @@ impl RawGrepper {
         running: &AtomicBool,
         root_gitignore: Option<Gitignore>,
     ) -> io::Result<(Cli, Stats)> {
+        let _span = tracy::span!("RawGrepper::search");
+
         let mut dir_stack = Vec::with_capacity(1024);
         let mut gi_stack = if self.cli.should_ignore_gitignore() {
             Vec::new()
@@ -352,6 +354,8 @@ impl RawGrepper {
     /// Resolve a path like "/usr/bin" or "etc" into an inode number.
     /// @Note: Clobbers into `dir_buf`
     pub fn try_resolve_path_to_inode(&mut self, path: &str) -> io::Result<INodeNum> {
+        let _span = tracy::span!("RawGrepper::try_resolve_path_to_inode");
+
         let mut inode_num = EXT4_ROOT_INODE;
         if path == "/" || path.is_empty() {
             return Ok(inode_num);
@@ -367,7 +371,7 @@ impl RawGrepper {
             }
 
             let dir_size = (inode.size as usize).min(MAX_DIR_BYTE_SIZE);
-            self.read_file_into_buf(&inode, dir_size, BufKind::Dir)?;
+            self.read_file_into_buf(&inode, dir_size, BufKind::Dir, false)?;
 
             // ---------- Scan for matching entry
             let mut found = None;
@@ -426,8 +430,10 @@ impl RawGrepper {
         gi_stack: &mut Vec<GitignoreFrame>,
         current_dir_path_len: usize,
     ) -> io::Result<()> {
+        let _span = tracy::span!("RawGrepper::process_directory");
+
         let dir_size = (inode.size as usize).min(MAX_DIR_BYTE_SIZE);
-        self.read_file_into_buf(inode, dir_size, BufKind::Dir)?;
+        self.read_file_into_buf(inode, dir_size, BufKind::Dir, false)?;
         self.stats.dirs_encountered += 1;
 
         // ------------- Quick scan for .gitignore
@@ -507,6 +513,8 @@ impl RawGrepper {
         gi_stack: &[GitignoreFrame],
         current_dir_path_len: usize,
     ) -> io::Result<()> {
+        let _span = tracy::span!("RawGrepper::process_entry");
+
         if is_common_skip_dir(name) {
             self.stats.dirs_skipped_common += 1;
             return Ok(());
@@ -581,6 +589,8 @@ impl RawGrepper {
         gi_stack: &[GitignoreFrame],
         current_dir_path_len: usize
     ) -> io::Result<()> {
+        let _span = tracy::span!("RawGrepper::process_symlink");
+
         if unlikely(current_dir_path_len > self.path_buf.capacity()) {
             self.stats.symlinks_broken += 1;
             return Ok(());
@@ -613,6 +623,8 @@ impl RawGrepper {
         path_display_buf: &mut String,
         gi_stack: &[GitignoreFrame],
     ) -> io::Result<()> {
+        let _span = tracy::span!("RawGrepper::process_file");
+
         self.stats.files_encountered += 1;
 
         // -------------------- Rejection by size
@@ -643,21 +655,24 @@ impl RawGrepper {
             return Ok(());
         }
 
-        // -------------------- Rejection by a binary probe
-        if !self.cli.should_search_binary() &&
-            self.probe_is_binary(child_inode)
-        {
-            self.stats.files_skipped_as_binary_due_to_probe += 1;
-            return Ok(());
-        }
-
         let size = (child_inode.size as usize).min(MAX_FILE_BYTE_SIZE);
-        if likely(self.read_file_into_buf(child_inode, size, BufKind::Content).is_ok()) {
-            self.stats.files_searched += 1;
-            self.stats.bytes_searched += self.get_buf(BufKind::Content).len();
-            self.find_and_print_matches(path_display_buf)?;
-        } else {
-            self.stats.files_skipped_unreadable += 1;
+
+        match self.read_file_into_buf(
+            child_inode,
+            size,
+            BufKind::Content,
+            !self.cli.should_search_binary()
+        )? {
+            true => {
+                // Success: file is loaded and is not binary (or we allow binary)
+                self.stats.files_searched += 1;
+                self.stats.bytes_searched += self.get_buf(BufKind::Content).len();
+                self.find_and_print_matches(path_display_buf)?;
+            }
+            false => {
+                // Read stopped early because binary was detected
+                self.stats.files_skipped_as_binary_due_to_probe += 1;
+            }
         }
 
         Ok(())
@@ -673,6 +688,8 @@ impl RawGrepper {
         inode: &Ext4Inode,
         current_dir_len: usize
     ) -> io::Result<INodeNum> {
+        let _span = tracy::span!("RawGrepper::resolve_symlink");
+
         if unlikely(current_dir_len > PATH_VERY_LONG_LENGTH) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -693,7 +710,7 @@ impl RawGrepper {
 
         // slow symlinks: target stored in file blocks
         let size = (inode.size as usize).min(MAX_SYMLINK_TARGET_SIZE);
-        self.read_file_into_buf(inode, size, BufKind::Content)?;
+        self.read_file_into_buf(inode, size, BufKind::Content, false)?;
 
         let target: SmallVec<[_; 256]> = copy_data(&self.content_buf[..]);
         self.resolve_symlink_target(&target, current_dir_len)
@@ -705,6 +722,8 @@ impl RawGrepper {
         target: &[u8],
         current_dir_len: usize
     ) -> io::Result<INodeNum> {
+        let _span = tracy::span!("RawGrepper::resolve_symlink_target");
+
         if target.first() == Some(&b'/') {
             // This is an absolute path
             let path_str = String::from_utf8_lossy(target);
@@ -757,14 +776,35 @@ impl RawGrepper {
         &mut self,
         inode: &Ext4Inode,
         max_size: usize,
-        kind: BufKind
-    ) -> io::Result<()> {
+        kind: BufKind,
+        check_and_stop_if_binary: bool,
+    ) -> io::Result<bool> {
+        let _span = tracy::span!("RawGrepper::read_file_into_buf");
+
         let buf = self.get_buf_mut(kind);
         buf.clear();
+
         let size_to_read = (inode.size as usize).min(max_size);
         buf.reserve(size_to_read);
 
+        let file_size = inode.size as usize;
+
+        let is_binary = |this: &mut RawGrepper| -> bool {
+            let buf = this.get_buf(kind);
+            if buf.len() >= BINARY_PROBE_BYTE_SIZE || buf.len() == file_size {
+                if is_binary_chunk(&buf[..file_size.min(BINARY_PROBE_BYTE_SIZE)]) {
+                    // It's binary! Clear and exit.
+                    this.get_buf_mut(kind).clear();
+                    return true;
+                }
+            }
+
+            false
+        };
+
         let copy_block_to_buf = |this: &mut RawGrepper, block_num: u64| {
+            let _span = tracy::span!("RawGrepper::read_file_into_buf::copy_block_to_buf");
+
             let offset = this.get_buf(kind).len();
             let remaining = size_to_read - offset;
 
@@ -802,6 +842,8 @@ impl RawGrepper {
 
             // ------- Prefetch the blooooooocks
             {
+                let _span = tracy::span!("RawGrepper::read_file_into_buf::prefetch_blocks");
+
                 let mut blocks_to_prefetch = SmallVec::<[_; MAX_EXTENTS_UNTIL_SPILL]>::with_capacity(
                     MAX_EXTENTS_UNTIL_SPILL
                 );
@@ -819,22 +861,32 @@ impl RawGrepper {
                 self.prefetch_blocks(&blocks_to_prefetch);
             }
 
-            for extent in &extents_copy {
-                if self.get_buf(kind).len() >= size_to_read {
-                    break;
-                }
-                for j in 0..extent.len {
-                    if self.get_buf(kind).len() >= size_to_read {
-                        break;
-                    }
+            {
+                let _span = tracy::span!("RawGrepper::read_file_into_buf::copy_blocks_to_buf_loop");
 
-                    let phys_block = extent.start + j as u64;
-                    copy_block_to_buf(self, phys_block);
+                for extent in &extents_copy {
+                    if self.get_buf(kind).len() >= size_to_read { break; }
+
+                    for j in 0..extent.len {
+                        let len = self.get_buf(kind).len();
+                        if len >= size_to_read { break }
+
+                        let phys_block = extent.start + j as u64;
+                        copy_block_to_buf(self, phys_block);
+
+                        if check_and_stop_if_binary && is_binary(self) {
+                            // It's binary! Clear and exit.
+                            self.get_buf_mut(kind).clear();
+                            return Ok(false);
+                        }
+                    }
                 }
             }
         } else {
             // ------- Prefetch the blooooooocks
             {
+                let _span = tracy::span!("RawGrepper::read_file_into_buf::prefetch_blocks");
+
                 let mut blocks_to_prefetch = SmallVec::<[_; EXT4_BLOCK_POINTERS_COUNT]>::with_capacity(
                     EXT4_BLOCK_POINTERS_COUNT
                 );
@@ -846,17 +898,26 @@ impl RawGrepper {
                 self.prefetch_blocks(&blocks_to_prefetch);
             }
 
-            for &block in inode.blocks.iter().take(EXT4_BLOCK_POINTERS_COUNT) {
-                if block == 0 || self.get_buf(kind).len() >= size_to_read {
-                    break;
-                }
+            {
+                let _span = tracy::span!("RawGrepper::read_file_into_buf::copy_blocks_to_buf_loop");
+                for &block in inode.blocks.iter().take(EXT4_BLOCK_POINTERS_COUNT) {
+                    if block == 0 || self.get_buf(kind).len() >= size_to_read {
+                        break;
+                    }
 
-                copy_block_to_buf(self, block.into());
+                    copy_block_to_buf(self, block.into());
+
+                    if check_and_stop_if_binary && is_binary(self) {
+                        // It's binary! Clear and exit.
+                        self.get_buf_mut(kind).clear();
+                        return Ok(false);
+                    }
+                }
             }
         }
 
         self.get_buf_mut(kind).truncate(size_to_read);
-        Ok(())
+        Ok(true)
     }
 
     /// Called when either checking if a path is gitignored or printing the matches
@@ -885,38 +946,6 @@ impl RawGrepper {
         }
     }
 
-    #[inline]
-    fn probe_is_binary(&mut self, inode: &Ext4Inode) -> bool {
-        let file_size = inode.size as usize;
-        if file_size == 0 {
-            return false;
-        }
-
-        let bytes_to_check = file_size.min(BINARY_PROBE_BYTE_SIZE);
-
-        if inode.flags & EXT4_EXTENTS_FL != 0 {
-            if likely(self.parse_extents(inode).is_ok())
-                && let Some(extent) = self.extent_buf.first()
-            {
-                let block = self.get_block(extent.start);
-                let first_block_file_bytes = file_size.min(block.len());
-                let to_check = first_block_file_bytes.min(bytes_to_check);
-                return is_binary_chunk(&block[..to_check]);
-            }
-        } else {
-            for &block_num in inode.blocks.iter().take(12) {
-                if block_num != 0 {
-                    let block = self.get_block(block_num.into());
-                    let first_block_file_bytes = file_size.min(block.len());
-                    let to_check = first_block_file_bytes.min(bytes_to_check);
-                    return is_binary_chunk(&block[..to_check]);
-                }
-            }
-        }
-
-        false
-    }
-
     // @Hot
     #[inline(always)]
     fn get_block(&self, block_num: u64) -> &[u8] {
@@ -934,6 +963,8 @@ impl RawGrepper {
 
     #[inline(always)]
     fn prefetch_blocks(&self, blocks: &[u64]) {
+        let _span = tracy::span!("RawGrepper::prefetch_blocks");
+
         if blocks.is_empty() {
             return;
         }
@@ -983,9 +1014,11 @@ impl RawGrepper {
         path_display_buf: &str,
         gi_stack: &mut Vec<GitignoreFrame>,
     ) -> bool {
+        let _span = tracy::span!("RawGrepper::load_gitignore");
+
         if let Ok(gi_inode) = self.parse_inode(gi_inode_num) {
             let size = (gi_inode.size as usize).min(MAX_FILE_BYTE_SIZE);
-            if likely(self.read_file_into_buf(&gi_inode, size, BufKind::Gitignore).is_ok()) {
+            if likely(self.read_file_into_buf(&gi_inode, size, BufKind::Gitignore, true).is_ok()) {
                 let matcher = build_gitignore_from_bytes(
                     path_display_buf.as_ref(),
                     &self.gitignore_buf,
@@ -994,11 +1027,14 @@ impl RawGrepper {
                 return true;
             }
         }
+
         false
     }
 
     #[inline]
     fn find_gitignore_inode_in_buf(&self, kind: BufKind) -> Option<INodeNum> {
+        let _span = tracy::span!("RawGrepper::find_gitignore_inode_in_buf");
+
         let mut offset = 0;
 
         while offset + 8 <= self.get_buf(kind).len() {
@@ -1040,7 +1076,10 @@ impl RawGrepper {
 
 /// impl block of matching and printing
 impl RawGrepper {
+    #[inline(never)]
     fn find_and_print_matches(&mut self, path: &str) -> io::Result<()> {
+        let _span = tracy::span!("RawGrepper::find_and_print_matches");
+
         let buf = &self.content_buf;
         if unlikely(!self.matcher.is_match(buf)) {
             return Ok(());
@@ -1063,7 +1102,11 @@ impl RawGrepper {
                 }
             };
 
-            if likely(self.matcher.is_match(line)) {
+            if {
+                let _span = tracy::span!("RawGrepper::find_and_print_matches::is_match");
+
+                self.matcher.is_match(line)
+            } {
                 if unlikely(!found_any) {
                     // green `path:`
                     self.writer.write_all(COLOR_GREEN.as_bytes())?;
@@ -1118,6 +1161,8 @@ impl RawGrepper {
 impl RawGrepper {
     #[inline]
     fn parse_superblock(data: &[u8]) -> io::Result<Ext4SuperBlock> {
+        let _span = tracy::span!("RawGrepper::parse_superblock");
+
         let block_size_log = u32::from_le_bytes([
             data[EXT4_BLOCK_SIZE_OFFSET + 0],
             data[EXT4_BLOCK_SIZE_OFFSET + 1],
@@ -1166,6 +1211,8 @@ impl RawGrepper {
 
     #[inline]
     fn parse_inode(&mut self, inode_num: INodeNum) -> io::Result<Ext4Inode> {
+        let _span = tracy::span!("RawGrepper::parse_inode");
+
         if unlikely(inode_num == 0) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -1254,6 +1301,8 @@ impl RawGrepper {
 
     #[inline]
     fn parse_extents(&mut self, inode: &Ext4Inode) -> io::Result<()> {
+        let _span = tracy::span!("RawGrepper::parse_extents");
+
         self.extent_buf.clear();
 
         let mut block_bytes: SmallVec<[_; 64]> = smallvec![0; 64];
@@ -1269,6 +1318,8 @@ impl RawGrepper {
     }
 
     fn parse_extent_node(&mut self, data: &[u8], level: usize) -> io::Result<()> {
+        let _span = tracy::span!("RawGrepper::parse_extent_node");
+
         if data.len() < EXT4_EXTENT_HEADER_SIZE {
             return Ok(());
         }
