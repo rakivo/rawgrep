@@ -126,7 +126,7 @@ sudo setcap -r ./target/release/rawgrep
 
 ## Limitations (IMPORTANT)
 
-- **ext4 only:** Currently only supports ext4 filesystems (most common on Linux)
+- **ext4 only:** Currently only supports ext4 filesystems, and most likely only Linux (didn't test that)
 
 ## Development
 
