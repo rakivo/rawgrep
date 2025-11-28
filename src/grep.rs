@@ -136,7 +136,7 @@ pub struct Ext4Extent {
 pub struct BufferConfig {
     pub output_buf: usize,
     pub dir_buf: usize,
-    pub content_buf: usize,
+    pub file_buf: usize,
     pub gitignore_buf: usize,
     pub extent_buf: usize,
 }
@@ -373,10 +373,11 @@ struct WorkerContext<'a> {
 }
 
 impl<'a> WorkerContext<'a> {
-    fn init(&mut self, cli: &Cli) {
-        let config = cli.get_buffer_config();
+    #[inline(always)]
+    fn init(&mut self) {
+        let config = self.cli.get_buffer_config();
         self.dir_buf.reserve(config.dir_buf);
-        self.file_buf.reserve(config.content_buf);
+        self.file_buf.reserve(config.file_buf);
         self.output_buf.reserve(config.output_buf);
         self.gitignore_buf.reserve(config.gitignore_buf);
         self.extent_buf.reserve(config.extent_buf);
@@ -1862,7 +1863,7 @@ impl RawGrepper {
                         output_buf: Vec::with_capacity(64 * 1024)
                     };
 
-                    worker.init(cli);
+                    worker.init();
 
                     let mut consecutive_steals = 0;
                     let mut idle_iterations = 0;

@@ -89,7 +89,7 @@ impl Cli {
             // Unfiltered search: processing MANY more LARGE files
             BufferConfig {
                 dir_buf: 1 * 1024 * 1024,     // 1 MB
-                content_buf: 4 * 1024 * 1024, // 4 MB
+                file_buf: 4 * 1024 * 1024,    // 4 MB
                 output_buf: 2 * 1024 * 1024,  // 2 MB
                 gitignore_buf: 0,             // 0 KB - not using .gitignore
                 extent_buf: 1024,             // Large files have more extents
@@ -98,7 +98,7 @@ impl Cli {
             // Default filtered search: optimal for text files
             BufferConfig {
                 dir_buf: 256 * 1024,          // 256 KB
-                content_buf: 1 * 1024 * 1024, // 1 MB
+                file_buf: 1 * 1024 * 1024,    // 1 MB
                 output_buf: 1 * 1024 * 1024,  // 1 MB
                 gitignore_buf: if self.should_ignore_gitignore() { 0 } else { 16 * 1024 },
                 extent_buf: 256,              // Most text files fit in few extents
