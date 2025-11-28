@@ -2095,7 +2095,7 @@ impl RawGrepper {
 //
 //   2: Just use the `WorkerContext` instead .. too hacky IMO.
 //
-// TODO: Eliminate ext4 parsing code-repetition
+// TODO(#2): Eliminate ext4 parsing code-repetition
 //
 
 /// impl block of misc helper functions
@@ -2594,4 +2594,3 @@ impl RawGrepper {
         Ok(())
     }
 }
-    
