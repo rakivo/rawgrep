@@ -2,6 +2,16 @@
 name = "rawgrep"
 version = "0.1.0"
 edition = "2024"
+authors = ["Mark Tyrkba <marktyrkba456@gmail.com>"]
+readme = "README.md"
+license = "LICENSE"
+description = "The fastest grep in the world"
+homepage = "https://github.com/rakivo/rawgrep"
+repository = "https://github.com/rakivo/rawgrep"
+keywords = ["regex", "grep", "egrep", "search", "pattern"]
+categories = ["command-line-utilities", "text-processing"]
+build = "build.rs"
+rust-version = "1.85.1"
 
 [features]
 default = ["dep:mimalloc"]
@@ -10,21 +20,21 @@ use_nightly = []
 tracy = ["tracy-client/enable"]
 
 [dependencies]
-regex = "1"
-memmap2 = "0.9"
+regex = { version = "1", default-features = false, features = ["std"] }
+memmap2 = { version = "0.9", default-features = false }
 smallvec = { version = "1.15.1", features = ["const_generics"] }
 mimalloc = { version = "=0.1.47", optional = true }
-ctrlc = "3.5.1"
-memchr = "2.7.6"
-aho-corasick = "1.1.4"
-libc = "0.2.177"
-ignore = "0.4.25"
-clap = { version = "4.5", features = ["std", "help", "derive"], default-features = false }
+ctrlc = { version = "3.5.1", default-features = false }
+memchr = { version = "2.7.6", default-features = false, features = ["std"] }
+aho-corasick = { version = "1.1.4", default-features = false }
+libc = { version = "0.2.177", default-features = false }
+ignore = { version = "0.4.25", default-features = false }
+clap = { version = "4.5", default-features = false, features = ["std", "help", "derive"] }
 tracy-client = { version = "0.17.3", default-features = false }
-crossbeam-channel = "0.5.15"
-crossbeam-deque = "0.8.6"
-itoa = "1.0.15"
-fastrand = "2.3.0"
+crossbeam-channel = { version = "0.5.15", default-features = false, features = ["std"] }
+crossbeam-deque = { version = "0.8.6", default-features = false, features = ["std"] }
+itoa = { version = "1.0.15", default-features = false }
+fastrand = { version = "2.3.0", default-features = false, features = ["std"] }
 bytemuck = { version = "1.24", features = ["derive"] }
 
 [build-dependencies]
@@ -38,6 +48,17 @@ codegen-units = 1
 lto = "fat"
 debug = false
 strip = true
+overflow-checks = false
+debug-assertions = false
+
+[profile.release-small]
+inherits = "release"
+opt-level = "z"
+panic = "abort"
+codegen-units = 1
+lto = "fat"
+strip = true
+debug = false
 overflow-checks = false
 debug-assertions = false
 

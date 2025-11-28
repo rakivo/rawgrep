@@ -10,6 +10,7 @@ use crate::grep::BufferConfig;
     long_about = None,
     version = "1.0",
     arg_required_else_help = true,
+    override_usage = "<PATTERN> [PATH ...]"
 )]
 pub struct Cli {
     /// Pattern to search for (supports regex syntax)
