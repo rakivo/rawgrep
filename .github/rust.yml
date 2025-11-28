@@ -1,0 +1,80 @@
+name: Rust CI
+
+on:
+  push:
+    branches: ["master"]
+  pull_request:
+    branches: ["master"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        os: [ubuntu-latest]
+        rust: [stable, beta, nightly]
+        features: ["default", "tracy"]
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: ${{ matrix.rust }}
+          profile: minimal
+          override: true
+          components: clippy
+
+      - name: Cache Cargo registry
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-reg-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache Cargo build
+        uses: actions/cache@v3
+        with:
+          path: target
+          key: ${{ runner.os }}-cargo-build-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-build-
+
+      # Build
+      - name: Build
+        run: |
+          if [ "${{ matrix.rust }}" = "nightly" ]; then
+            cargo build --no-default-features --features "${{ matrix.features }},use_nightly"
+          else
+            cargo build --no-default-features --features "${{ matrix.features }}"
+          fi
+
+      # Clippy
+      - name: Clippy
+        run: |
+          if [ "${{ matrix.rust }}" = "nightly" ]; then
+            cargo clippy --no-default-features --features "${{ matrix.features }},use_nightly" --all-targets -- -D warnings
+          else
+            cargo clippy --no-default-features --features "${{ matrix.features }}" --all-targets -- -D warnings
+          fi
+
+
+  # --------------------------
+  # SECURITY CHECKS
+  # --------------------------
+  dep-checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tools
+        run: cargo install cargo-audit || true
+
+      - name: cargo audit
+        run: cargo audit
