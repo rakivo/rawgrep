@@ -1,4 +1,4 @@
-// TODO: Implement symlinks
+// TODO(#1): Implement symlinks
 
 use crate::cli::Cli;
 use crate::matcher::Matcher;
@@ -2594,3 +2594,4 @@ impl RawGrepper {
         Ok(())
     }
 }
+        
