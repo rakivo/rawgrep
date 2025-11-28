@@ -2,7 +2,7 @@ use clap::Parser;
 
 use crate::grep::BufferConfig;
 
-// TODO: Flag to disable ANSI coloring
+// TODO(#4): Flag to disable ANSI coloring
 #[derive(Parser)]
 #[command(
     name = "rawgrep",
