@@ -1,6 +1,14 @@
-use clap::Parser;
-
 use crate::grep::BufferConfig;
+
+use clap::Parser;
+use std::sync::OnceLock;
+
+pub static SHOULD_ENABLE_ANSI_COLORING: OnceLock<bool> = OnceLock::new();
+
+#[inline(always)]
+pub fn should_enable_ansi_coloring() -> bool {
+    SHOULD_ENABLE_ANSI_COLORING.get().copied().unwrap_or(false)
+}
 
 // TODO(#4): Flag to disable ANSI coloring
 #[derive(Parser)]
@@ -55,9 +63,22 @@ pub struct Cli {
     /// Equivalent to -uuu or --no-ignore --binary --hidden
     #[arg(short = 'a', long = "all", conflicts_with = "unrestricted")]
     pub all: bool,
+
+    /// Disable colored output (force plain text)
+    #[arg(long = "no-color")]
+    pub no_color: bool,
 }
 
 impl Cli {
+    #[inline(always)]
+    pub fn parse() -> Self {
+        let cli = <Self as Parser>::parse();
+
+        _ = SHOULD_ENABLE_ANSI_COLORING.set(!cli.no_color);
+
+        cli
+    }
+
     /// Returns true if should search large files
     #[inline(always)]
     pub const fn should_ignore_size_filter(&self) -> bool {

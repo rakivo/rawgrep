@@ -29,7 +29,6 @@ use std::sync::Arc;
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use clap::Parser;
 use smallvec::SmallVec;
 
 pub const COLOR_RED: &str = "\x1b[1;31m";
@@ -95,7 +94,7 @@ fn main() -> io::Result<()> {
         Ok(path) => path,
         Err(e) => {
             let search_root_path = &cli.search_root_path;
-            eprintln!("error: couldn't canonicalize '{search_root_path}': {e}");
+            eprintln_red!("error: couldn't canonicalize '{search_root_path}': {e}");
             std::process::exit(1);
         }
     };
@@ -104,7 +103,7 @@ fn main() -> io::Result<()> {
         match crate::util::detect_partition_for_path(search_root_path.as_ref()) {
             Ok(ok) => ok,
             Err(e) => {
-                eprintln!("error: couldn't find auto-detect partition: {e}");
+                eprintln_red!("error: couldn't find auto-detect partition: {e}");
                 std::process::exit(1);
             }
         }
@@ -116,25 +115,22 @@ fn main() -> io::Result<()> {
     let mut grep = match RawGrepper::new(&device, cli) {
         Ok(ok) => ok,
         Err(e) => {
-            // @Color
-            eprint!("{COLOR_RED}");
             match e.kind() {
                 io::ErrorKind::NotFound => {
-                    eprintln!("error: device or partition not found: '{device}'");
+                    eprintln_red!("error: device or partition not found: '{device}'");
                 }
                 io::ErrorKind::PermissionDenied => {
-                    eprintln!("error: permission denied. Try running with sudo/root to read raw devices.");
+                    eprintln_red!("error: permission denied. Try running with sudo/root to read raw devices.");
                 }
                 io::ErrorKind::InvalidData => {
-                    eprintln!("error: invalid ext4 filesystem on this path: {e}");
-                    eprintln!("help: make sure the path points to a partition (e.g., /dev/sda1) and not a whole disk (e.g., /dev/sda)");
-                    eprintln!("tip: try running `df -Th /` to find your root partition");
+                    eprintln_red!("error: invalid ext4 filesystem on this path: {e}");
+                    eprintln_red!("help: make sure the path points to a partition (e.g., /dev/sda1) and not a whole disk (e.g., /dev/sda)");
+                    eprintln_red!("tip: try running `df -Th /` to find your root partition");
                 }
                 _ => {
-                    eprintln!("error: failed to initialize ext4 reader: {e}");
+                    eprintln_red!("error: failed to initialize ext4 reader: {e}");
                 }
             }
-            eprint!("{COLOR_RESET}");
 
             std::process::exit(1);
         }
@@ -143,17 +139,15 @@ fn main() -> io::Result<()> {
     let start_inode = match grep.try_resolve_path_to_inode(search_root_path) {
         Ok(ok) => ok,
         Err(e) => {
-            // @Color
-            eprintln!("{COLOR_RED}error: couldn't find {search_root_path} in {device}: {e}{COLOR_RESET}");
+            eprintln_red!("error: couldn't find {search_root_path} in {device}: {e}");
             std::process::exit(1);
         }
     };
 
-    // @Color
-    eprintln!{
-        "{COLOR_CYAN}Searching{COLOR_RESET} '{device}' for pattern: {COLOR_RED}'{pattern}'{COLOR_RESET}\n",
-        pattern = grep.cli.pattern
-    };
+    eprint_blue!("Searching ");
+    eprint_green!("'{device}' ");
+    eprint_blue!("for pattern: ");
+    eprintln_red!("'{pattern}'", pattern = grep.cli.pattern);
 
     let _cur = CursorHide::new();
 

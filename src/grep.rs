@@ -1,10 +1,10 @@
 // TODO(#1): Implement symlinks
 
-use crate::cli::Cli;
+use crate::cli::{should_enable_ansi_coloring, Cli};
 use crate::matcher::Matcher;
 use crate::path_buf::SmallPathBuf;
 use crate::stats::{ParallelStats, Stats};
-use crate::{copy_data, tracy, COLOR_CYAN, COLOR_GREEN, COLOR_RED, COLOR_RESET};
+use crate::{copy_data, eprintln_red, tracy, COLOR_CYAN, COLOR_GREEN, COLOR_RED, COLOR_RESET};
 use crate::binary::{is_binary_chunk, is_binary_ext};
 use crate::util::{
     build_gitignore_from_bytes,
@@ -1593,6 +1593,8 @@ impl WorkerContext<'_> {
         let mut line_num: u32 = 1;
         let mut line_start = 0;
 
+        let should_print_color = should_enable_ansi_coloring();
+
         while line_start < buf_len {
             let line_end = memchr::memchr(b'\n', &buf[line_start..])
                 .map(|p| line_start + p)
@@ -1631,20 +1633,26 @@ impl WorkerContext<'_> {
                         path_display_buf.as_mut_vec().set_len(old_len + add);
                     }
 
-                    // @Color
-                    self.output_buf.extend_from_slice(COLOR_GREEN.as_bytes());
+                    if should_print_color {
+                        self.output_buf.extend_from_slice(COLOR_GREEN.as_bytes());
+                    }
                     self.output_buf.extend_from_slice(path_display_buf.as_bytes());
-                    self.output_buf.extend_from_slice(COLOR_RESET.as_bytes());
+                    if should_print_color {
+                        self.output_buf.extend_from_slice(COLOR_RESET.as_bytes());
+                    }
                     self.output_buf.extend_from_slice(b":\n");
                     found_any = true;
                 }
 
-                // @Color
-                self.output_buf.extend_from_slice(COLOR_CYAN.as_bytes());
+                if should_print_color {
+                    self.output_buf.extend_from_slice(COLOR_CYAN.as_bytes());
+                }
                 let mut line_num_buf = itoa::Buffer::new();
                 let line_num = line_num_buf.format(line_num);
                 self.output_buf.extend_from_slice(line_num.as_bytes());
-                self.output_buf.extend_from_slice(COLOR_RESET.as_bytes());
+                if should_print_color {
+                    self.output_buf.extend_from_slice(COLOR_RESET.as_bytes());
+                }
                 self.output_buf.extend_from_slice(b": ");
 
                 let display = truncate_utf8(line, 500);
@@ -1655,11 +1663,14 @@ impl WorkerContext<'_> {
 
                     let e = e.min(display.len());
 
-                    // @Color
                     self.output_buf.extend_from_slice(&display[last..s]);
-                    self.output_buf.extend_from_slice(COLOR_RED.as_bytes());
+                    if should_print_color {
+                        self.output_buf.extend_from_slice(COLOR_RED.as_bytes());
+                    }
                     self.output_buf.extend_from_slice(&display[s..e]);
-                    self.output_buf.extend_from_slice(COLOR_RESET.as_bytes());
+                    if should_print_color {
+                        self.output_buf.extend_from_slice(COLOR_RESET.as_bytes());
+                    }
                     last = e;
                 }
 
@@ -1715,23 +1726,20 @@ impl RawGrepper {
         let matcher = match Matcher::new(&cli.pattern) {
             Ok(m) => m,
             Err(e) => {
-                // @Color
-                eprint!("{COLOR_RED}");
                 match e.kind() {
                     io::ErrorKind::InvalidInput => {
-                        eprintln!("error: invalid pattern '{pattern}'", pattern = cli.pattern);
-                        eprintln!("help: patterns must be valid regex or a literal/alternation extractable form");
-                        eprintln!("tip: test your regex with `grep -E` or a regex tester before running");
+                        eprintln_red!("error: invalid pattern '{pattern}'", pattern = cli.pattern);
+                        eprintln_red!("help: patterns must be valid regex or a literal/alternation extractable form");
+                        eprintln_red!("tip: test your regex with `grep -E` or a regex tester before running");
                     }
                     io::ErrorKind::NotFound => {
                         // unlikely for this constructor, but here for completeness
-                        eprintln!("error: referenced something that wasn't found: {e}");
+                        eprintln_red!("error: referenced something that wasn't found: {e}");
                     }
                     _ => {
-                        eprintln!("error: failed to build matcher: {e}");
+                        eprintln_red!("error: failed to build matcher: {e}");
                     }
                 }
-                eprint!("{COLOR_RESET}");
 
                 std::process::exit(1);
             }

@@ -276,3 +276,226 @@ mod imp {
 }
 
 pub use imp::*;
+
+#[macro_export]
+macro_rules! ceprintln {
+    ($color:expr, $($arg:tt)*) => {{
+        if $crate::cli::should_enable_ansi_coloring() {
+            eprintln!(concat!("\x1b[", "{}", "{}", "\x1b[0m"), $color, format_args!($($arg)*));
+        } else {
+            eprintln!($($arg)*);
+        }
+    }};
+}
+
+#[macro_export]
+macro_rules! ceprint {
+    ($color:expr, $($arg:tt)*) => {{
+        if $crate::cli::should_enable_ansi_coloring() {
+            eprint!(concat!("\x1b[", "{}", "{}", "\x1b[0m"), $color, format_args!($($arg)*));
+        } else {
+            eprint!($($arg)*);
+        }
+    }};
+}
+
+#[macro_export]
+macro_rules! eprintln_red {
+    ($($arg:tt)*) => {{
+        if $crate::cli::should_enable_ansi_coloring() {
+            eprintln!(concat!("\x1b[1;31m", "{}", "\x1b[0m"), format_args!($($arg)*));
+        } else {
+            eprintln!($($arg)*);
+        }
+    }};
+}
+
+#[macro_export]
+macro_rules! eprintln_green {
+    ($($arg:tt)*) => {{
+        if $crate::cli::should_enable_ansi_coloring() {
+            eprintln!(concat!("\x1b[1;32m", "{}", "\x1b[0m"), format_args!($($arg)*));
+        } else {
+            eprintln!($($arg)*);
+        }
+    }};
+}
+
+#[macro_export]
+macro_rules! eprintln_blue {
+    ($($arg:tt)*) => {{
+        if $crate::cli::should_enable_ansi_coloring() {
+            eprintln!(concat!("\x1b[1;34m", "{}", "\x1b[0m"), format_args!($($arg)*));
+        } else {
+            eprintln!($($arg)*);
+        }
+    }};
+}
+
+#[macro_export]
+macro_rules! eprintln_cyan {
+    ($($arg:tt)*) => {{
+        if $crate::cli::should_enable_ansi_coloring() {
+            eprintln!(concat!("\x1b[1;36m", "{}", "\x1b[0m"), format_args!($($arg)*));
+        } else {
+            eprintln!($($arg)*);
+        }
+    }};
+}
+
+// eprint! versions (no newline)
+#[macro_export]
+macro_rules! eprint_red {
+    ($($arg:tt)*) => {{
+        if $crate::cli::should_enable_ansi_coloring() {
+            eprint!(concat!("\x1b[1;31m", "{}", "\x1b[0m"), format_args!($($arg)*));
+        } else {
+            eprint!($($arg)*);
+        }
+    }};
+}
+
+#[macro_export]
+macro_rules! eprint_green {
+    ($($arg:tt)*) => {{
+        if $crate::cli::should_enable_ansi_coloring() {
+            eprint!(concat!("\x1b[1;32m", "{}", "\x1b[0m"), format_args!($($arg)*));
+        } else {
+            eprint!($($arg)*);
+        }
+    }};
+}
+
+#[macro_export]
+macro_rules! eprint_blue {
+    ($($arg:tt)*) => {{
+        if $crate::cli::should_enable_ansi_coloring() {
+            eprint!(concat!("\x1b[1;34m", "{}", "\x1b[0m"), format_args!($($arg)*));
+        } else {
+            eprint!($($arg)*);
+        }
+    }};
+}
+
+#[macro_export]
+macro_rules! eprint_cyan {
+    ($($arg:tt)*) => {{
+        if $crate::cli::should_enable_ansi_coloring() {
+            eprint!(concat!("\x1b[1;36m", "{}", "\x1b[0m"), format_args!($($arg)*));
+        } else {
+            eprint!($($arg)*);
+        }
+    }};
+}
+
+// writeln! versions
+#[macro_export]
+macro_rules! cwriteln {
+    ($writer:expr, $color:expr, $($arg:tt)*) => {{
+        if $crate::cli::should_enable_ansi_coloring() {
+            writeln!($writer, concat!("\x1b[", "{}", "{}", "\x1b[0m"), $color, format_args!($($arg)*))
+        } else {
+            writeln!($writer, $($arg)*)
+        }
+    }};
+}
+
+#[macro_export]
+macro_rules! cwrite {
+    ($writer:expr, $color:expr, $($arg:tt)*) => {{
+        if $crate::cli::should_enable_ansi_coloring() {
+            write!($writer, concat!("\x1b[", "{}", "{}", "\x1b[0m"), $color, format_args!($($arg)*))
+        } else {
+            write!($writer, $($arg)*)
+        }
+    }};
+}
+
+#[macro_export]
+macro_rules! writeln_red {
+    ($writer:expr, $($arg:tt)*) => {{
+        if $crate::cli::should_enable_ansi_coloring() {
+            writeln!($writer, concat!("\x1b[1;31m", "{}", "\x1b[0m"), format_args!($($arg)*))
+        } else {
+            writeln!($writer, $($arg)*)
+        }
+    }};
+}
+
+#[macro_export]
+macro_rules! writeln_green {
+    ($writer:expr, $($arg:tt)*) => {{
+        if $crate::cli::should_enable_ansi_coloring() {
+            writeln!($writer, concat!("\x1b[1;32m", "{}", "\x1b[0m"), format_args!($($arg)*))
+        } else {
+            writeln!($writer, $($arg)*)
+        }
+    }};
+}
+
+#[macro_export]
+macro_rules! writeln_blue {
+    ($writer:expr, $($arg:tt)*) => {{
+        if $crate::cli::should_enable_ansi_coloring() {
+            writeln!($writer, concat!("\x1b[1;34m", "{}", "\x1b[0m"), format_args!($($arg)*))
+        } else {
+            writeln!($writer, $($arg)*)
+        }
+    }};
+}
+
+#[macro_export]
+macro_rules! writeln_cyan {
+    ($writer:expr, $($arg:tt)*) => {{
+        if $crate::cli::should_enable_ansi_coloring() {
+            writeln!($writer, concat!("\x1b[1;36m", "{}", "\x1b[0m"), format_args!($($arg)*))
+        } else {
+            writeln!($writer, $($arg)*)
+        }
+    }};
+}
+
+// write! versions (no newline)
+#[macro_export]
+macro_rules! write_red {
+    ($writer:expr, $($arg:tt)*) => {{
+        if $crate::cli::should_enable_ansi_coloring() {
+            write!($writer, concat!("\x1b[1;31m", "{}", "\x1b[0m"), format_args!($($arg)*))
+        } else {
+            write!($writer, $($arg)*)
+        }
+    }};
+}
+
+#[macro_export]
+macro_rules! write_green {
+    ($writer:expr, $($arg:tt)*) => {{
+        if $crate::cli::should_enable_ansi_coloring() {
+            write!($writer, concat!("\x1b[1;32m", "{}", "\x1b[0m"), format_args!($($arg)*))
+        } else {
+            write!($writer, $($arg)*)
+        }
+    }};
+}
+
+#[macro_export]
+macro_rules! write_blue {
+    ($writer:expr, $($arg:tt)*) => {{
+        if $crate::cli::should_enable_ansi_coloring() {
+            write!($writer, concat!("\x1b[1;34m", "{}", "\x1b[0m"), format_args!($($arg)*))
+        } else {
+            write!($writer, $($arg)*)
+        }
+    }};
+}
+
+#[macro_export]
+macro_rules! write_cyan {
+    ($writer:expr, $($arg:tt)*) => {{
+        if $crate::cli::should_enable_ansi_coloring() {
+            write!($writer, concat!("\x1b[1;36m", "{}", "\x1b[0m"), format_args!($($arg)*))
+        } else {
+            write!($writer, $($arg)*)
+        }
+    }};
+}

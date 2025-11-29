@@ -1,6 +1,7 @@
-use std::{fmt::Display, sync::atomic::{AtomicU64, Ordering}};
+use std::fmt::Display;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::{COLOR_BLUE, COLOR_GREEN, COLOR_RESET};
+use crate::{writeln_blue, writeln_green};
 
 #[derive(Default)]
 pub struct Stats {
@@ -33,9 +34,9 @@ impl Display for Stats {
 
         let total_symlinks = self.symlinks_followed + self.symlinks_broken;
 
-        writeln!(f, "\n{COLOR_GREEN}Search complete{COLOR_RESET}")?;
+        writeln_green!(f, "\nSearch complete")?;
+        writeln_blue!(f, "Files Summary:")?;
 
-        writeln!(f, "{COLOR_BLUE}Files Summary:{COLOR_RESET}")?;
         macro_rules! file_row {
             ($label:expr, $count:expr) => {
                 let pct = if total_files == 0 { 0.0 } else { ($count as f64 / total_files as f64) * 100.0 };
@@ -53,7 +54,7 @@ impl Display for Stats {
         file_row!("Skipped (gitignore)", self.files_skipped_gitignore);
 
         if total_symlinks > 0 {
-            writeln!(f, "\n{COLOR_BLUE}Symlinks Summary:{COLOR_RESET}")?;
+            writeln_blue!(f, "\nSymlinks Summary:")?;
             macro_rules! symlink_row {
                 ($label:expr, $count:expr) => {
                     let pct = if total_symlinks == 0 { 0.0 } else { ($count as f64 / total_symlinks as f64) * 100.0 };
@@ -65,7 +66,7 @@ impl Display for Stats {
             symlink_row!("Broken/skipped", self.symlinks_broken);
         }
 
-        writeln!(f, "\n{COLOR_BLUE}Bytes Summary:{COLOR_RESET}")?;
+        writeln_blue!(f, "\nBytes Summary:")?;
         macro_rules! bytes_row {
             ($label:expr, $count:expr) => {
                 writeln!(f, "  {:<25} {:>12}", $label, $crate::util::format_bytes($count))?;
@@ -74,7 +75,7 @@ impl Display for Stats {
 
         bytes_row!("Bytes searched", self.bytes_searched);
 
-        writeln!(f, "\n{COLOR_BLUE}Directories Summary:{COLOR_RESET}")?;
+        writeln_blue!(f, "\nDirectories Summary:")?;
         macro_rules! dir_row {
             ($label:expr, $count:expr) => {
                 let pct = if total_dirs == 0 { 0.0 } else { ($count as f64 / total_dirs as f64) * 100.0 };
