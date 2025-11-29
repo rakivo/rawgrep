@@ -71,6 +71,10 @@ pub struct Cli {
     /// Print matches in conventional jumpable format (for VIM, EMACS, etc)
     #[arg(short, long)]
     pub jump: bool,
+
+    /// Force `Matcher` to use literal search even if there's regex stuff in the pattern
+    #[arg(short, long = "force-literal")]
+    pub force_literal: bool
 }
 
 impl Cli {

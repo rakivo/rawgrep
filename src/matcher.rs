@@ -4,7 +4,7 @@ use regex::bytes::Regex;
 use memchr::memmem::Finder;
 use aho_corasick::AhoCorasick;
 
-use crate::tracy;
+use crate::{cli::Cli, tracy};
 
 #[inline]
 fn extract_literal(pattern: &str) -> Option<Vec<u8>> {
@@ -84,8 +84,14 @@ pub enum Matcher {
 }
 
 impl Matcher {
-    pub fn new(pattern: &str) -> io::Result<Self> {
+    pub fn new(cli: &Cli) -> io::Result<Self> {
         let _span = tracy::span!("Matcher::new");
+
+        let pattern = &cli.pattern;
+
+        if cli.force_literal {
+            return Ok(Matcher::Literal(Finder::new(pattern).into_owned()));
+        }
 
         // Try literal extraction first
         if let Some(literal) = extract_literal(pattern) {

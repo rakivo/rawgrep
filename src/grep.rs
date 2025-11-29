@@ -1808,7 +1808,7 @@ impl RawGrepper {
             Ok(size)
         }
 
-        let matcher = match Matcher::new(&cli.pattern) {
+        let matcher = match Matcher::new(&cli) {
             Ok(m) => m,
             Err(e) => {
                 match e.kind() {
