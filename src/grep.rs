@@ -506,7 +506,6 @@ impl WorkerContext<'_> {
             if buf.len() >= BINARY_PROBE_BYTE_SIZE || buf.len() == file_size {
                 if is_binary_chunk(&buf[..file_size.min(BINARY_PROBE_BYTE_SIZE)]) {
                     // It's binary!
-                    this.get_buf_mut(kind).clear();
                     return true;
                 }
             }
@@ -1809,7 +1808,7 @@ impl RawGrepper {
 
         let (output_tx, output_rx) = unbounded();
 
-        let injector = Arc::new(Injector::new());
+        let injector = &Injector::new();
         injector.push(WorkItem::Directory(DirWork {
             inode_num: root_inode,
             path_bytes: Arc::default(),
@@ -1837,7 +1836,6 @@ impl RawGrepper {
             });
 
             let handles = workers.into_iter().enumerate().map(|(worker_id, local_worker)| {
-                let injector = injector.clone();
                 let stealers = stealers.clone();
                 let output_tx = output_tx.clone();
                 let sb = &self.sb;
@@ -1868,6 +1866,7 @@ impl RawGrepper {
                     let mut consecutive_steals = 0;
                     let mut idle_iterations = 0;
 
+                    // @Constant
                     let mut path_display_buf = String::with_capacity(0x1000);
 
                     loop {
@@ -1916,6 +1915,7 @@ impl RawGrepper {
                                     }
                                 }
 
+                                // @Constant
                                 if idle_iterations < 10 {
                                     std::hint::spin_loop();
                                 } else if idle_iterations < 20 {
@@ -2034,11 +2034,13 @@ impl RawGrepper {
         let num_groups = total_size.div_ceil(bytes_per_group) as usize;
 
         // Prefetch group descriptor table (starts after superblock)
+        // @Constant
         let gdt_offset = if block_size == 1024 { 2048 } else { block_size };
         // @Constant
         let gdt_size = (num_groups as u64 * desc_size).min(1024 * 1024); // Cap at 1MB
 
         // Touch group descriptor table pages
+        // @Constant
         for i in (0..gdt_size).step_by(4096) {
             let offset = gdt_offset + i;
             if offset < total_size {
