@@ -431,7 +431,7 @@ impl<'a> WorkerContext<'a> {
         for component in path_str.split('/').filter(|s| !s.is_empty()) {
             let inode = self.parse_inode(inode_num)?;
 
-            if (inode.mode & EXT4_S_IFMT) != EXT4_S_IFDIR {
+            if unlikely((inode.mode & EXT4_S_IFMT) != EXT4_S_IFDIR) {
                 return Err(io::Error::new(
                     io::ErrorKind::NotFound,
                     "Not a directory",
@@ -457,11 +457,11 @@ impl<'a> WorkerContext<'a> {
                 ]);
                 let name_len = self.dir_buf[offset + 6];
 
-                if rec_len == 0 {
+                if unlikely(rec_len == 0) {
                     break;
                 }
 
-                if entry_inode != 0 && name_len > 0 {
+                if likely(entry_inode != 0 && name_len > 0) {
                     let name_end = offset + 8 + name_len as usize;
                     if name_end <= offset + rec_len as usize && name_end <= self.dir_buf.len() {
                         let name_bytes = &self.dir_buf[offset + 8..name_end];
@@ -558,7 +558,7 @@ impl WorkerContext<'_> {
     ) -> io::Result<bool> {
         let mut blocks = SmallVec::<[_; EXT4_BLOCK_POINTERS_COUNT]>::new();
         for &block in inode.blocks.iter().take(EXT4_BLOCK_POINTERS_COUNT) {
-            if block != 0 {
+            if likely(block != 0) {
                 blocks.push(block as u64);
             }
         }
@@ -973,7 +973,7 @@ impl WorkerContext<'_> {
     fn parse_extent_node(&mut self, data: &[u8], level: usize) -> io::Result<()> {
         let _span = tracy::span!("RawGrepper::parse_extent_node");
 
-        if data.len() < mem::size_of::<raw::Ext4ExtentHeader>() {
+        if likely(data.len() < mem::size_of::<raw::Ext4ExtentHeader>()) {
             return Ok(());
         }
 
@@ -985,7 +985,7 @@ impl WorkerContext<'_> {
             )
         )?;
 
-        if u16::from_le(header.eh_magic) != EXT4_EXTENT_MAGIC {
+        if likely(u16::from_le(header.eh_magic) != EXT4_EXTENT_MAGIC) {
             return Ok(());
         }
 
@@ -1001,7 +1001,7 @@ impl WorkerContext<'_> {
 
             for i in 0..entries as usize {
                 let offset = extents_start + i * extent_size;
-                if offset + extent_size > data.len() {
+                if unlikely(offset + extent_size > data.len()) {
                     break;
                 }
 
@@ -1021,7 +1021,7 @@ impl WorkerContext<'_> {
                 let start_block = ((ee_start_hi as u64) << 32) | (ee_start_lo as u64);
 
                 // Validate extent length (max 32768 blocks = 128MB for 4K blocks)
-                if ee_len > 0 && ee_len <= 32768 {
+                if likely(ee_len > 0 && ee_len <= 32768) {
                     self.extent_buf.push(Ext4Extent {
                         start: start_block,
                         len: ee_len,
@@ -1038,7 +1038,7 @@ impl WorkerContext<'_> {
 
             for i in 0..entries as usize {
                 let offset = indices_start + i * index_size;
-                if offset + index_size > data.len() {
+                if likely(offset + index_size > data.len()) {
                     break;
                 }
 
@@ -1159,7 +1159,7 @@ impl WorkerContext<'_> {
             return Ok(());
         }
 
-        if !work.path_bytes.is_empty() {
+        if likely(!work.path_bytes.is_empty()) {
             let last_segment = work.path_bytes
                 .iter()
                 .rposition(|&b| b == b'/')
@@ -1231,14 +1231,14 @@ impl WorkerContext<'_> {
             let name_len = entry.name_len;
             let file_type = entry.file_type;
 
-            if rec_len == 0 {
+            if unlikely(rec_len == 0) {
                 break;
             }
 
             // @Refactor @Cutnpaste from process_not_large_directory
-            if entry_inode != 0 && name_len > 0 {
+            if likely(entry_inode != 0 && name_len > 0) {
                 let name_end = offset + entry_size + name_len as usize;
-                if name_end <= offset + rec_len as usize && name_end <= self.dir_buf.len() {
+                if likely(name_end <= offset + rec_len as usize && name_end <= self.dir_buf.len()) {
                     // SAFETY: `self.dir_buf` contains valid Ext4DirEntry2 data
                     let name_bytes = unsafe {
                         self.dir_buf.get_unchecked(offset + entry_size..name_end)
@@ -1313,17 +1313,17 @@ impl WorkerContext<'_> {
 
             let rec_len_usize = rec_len as usize;
 
-            if entry_inode != 0 && name_len > 0 {
+            if likely(entry_inode != 0 && name_len > 0) {
                 let name_start = offset + entry_size;
                 let name_end = name_start + name_len as usize;
 
-                if name_end <= offset + rec_len_usize && name_end <= self.dir_buf.len() {
+                if likely(name_end <= offset + rec_len_usize && name_end <= self.dir_buf.len()) {
                     // SAFETY: `self.dir_buf` contains valid Ext4DirEntry2 data
                     let name_bytes = unsafe {
                         self.dir_buf.get_unchecked(name_start..name_end)
                     };
 
-                    if !is_dot_entry(name_bytes) {
+                    if likely(!is_dot_entry(name_bytes)) {
                         let Ok(child_inode) = self.parse_inode(entry_inode) else {
                             offset += rec_len_usize;
                             continue;
@@ -2413,7 +2413,7 @@ impl RawGrepper {
         );
         unsafe {
             let ptr = self.device_mmap.as_ptr().add(offset);
-            std::slice::from_raw_parts(ptr, self.sb.block_size as usize)
+            core::slice::from_raw_parts(ptr, self.sb.block_size as usize)
         }
     }
 
