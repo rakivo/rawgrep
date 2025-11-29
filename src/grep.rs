@@ -1900,16 +1900,7 @@ impl RawGrepper {
         root_search_directory: &str,
         running: &AtomicBool,
         root_gitignore: Option<Gitignore>,
-        num_threads: usize,
     ) -> io::Result<(Cli, Stats)> {
-        let threads = if num_threads == 0 {
-            std::thread::available_parallelism()
-                .map_or(1, |n| n.get())
-                .min(12)
-        } else {
-            num_threads
-        };
-
         let device_mmap = &self.device_mmap;
         let matcher = &self.matcher;
         let stats = &ParallelStats::new();
@@ -1928,6 +1919,8 @@ impl RawGrepper {
             gitignore: root_gi,
             depth: 0,
         }));
+
+        let threads = self.cli.threads.get().min(12);
 
         let workers = (0..threads)
             .map(|_| DequeWorker::new_lifo())

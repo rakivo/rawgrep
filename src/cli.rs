@@ -1,6 +1,7 @@
 use crate::grep::BufferConfig;
 
 use std::sync::OnceLock;
+use std::num::NonZeroUsize;
 
 use clap::Parser;
 
@@ -93,7 +94,19 @@ pub struct Cli {
 
     /// Force `Matcher` to use literal search even if there's regex stuff in the pattern
     #[arg(short, long = "force-literal")]
-    pub force_literal: bool
+    pub force_literal: bool,
+
+    /// Number of worker threads to use
+    ///
+    /// Defaults to number of logical CPUs. Use fewer to reduce load,
+    /// or increase to oversubscribe the machine.
+    #[arg(
+        short = 't',
+        long = "threads",
+        default_value_t = std::thread::available_parallelism()
+            .unwrap_or(unsafe { NonZeroUsize::new_unchecked(1) })
+    )]
+    pub threads: NonZeroUsize,
 }
 
 impl Cli {

@@ -156,7 +156,6 @@ fn main() -> io::Result<()> {
         search_root_path,
         &setup_signal_handler(),
         build_gitignore(search_root_path.as_ref()),
-        16
     )?;
 
     if cli.stats {
