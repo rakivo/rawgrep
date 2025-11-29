@@ -1,4 +1,5 @@
 // TODO(#1): Implement symlinks
+// TODO(#24): Support for searching in large file(s). (detect that)
 
 use crate::cli::{should_enable_ansi_coloring, Cli};
 use crate::matcher::Matcher;
