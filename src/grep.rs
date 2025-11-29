@@ -15,6 +15,7 @@ use crate::util::{
 
 use std::mem;
 use std::sync::Arc;
+use std::borrow::Cow;
 use std::fmt::Display;
 use std::time::Duration;
 use std::os::fd::AsRawFd;
@@ -337,6 +338,7 @@ struct Outputter {
 }
 
 impl Outputter {
+    #[inline]
     fn run(mut self) {
         let _span = tracy::span!("OutputThread::run");
 
@@ -484,6 +486,7 @@ impl<'a> WorkerContext<'a> {
 
 /// impl block of misc helper functions
 impl WorkerContext<'_> {
+    #[inline]
     fn read_file_into_buf(
         &mut self,
         inode: &Ext4Inode,
@@ -491,146 +494,184 @@ impl WorkerContext<'_> {
         kind: BufKind,
         check_and_stop_if_binary: bool,
     ) -> io::Result<bool> {
-        let _span = tracy::span!("WorkerContext::read_file_into_buf");
-
         let buf = self.get_buf_mut(kind);
         buf.clear();
 
-        let size_to_read = (inode.size as usize).min(max_size);
+        let file_size = inode.size as usize;
+        let size_to_read = file_size.min(max_size);
         buf.reserve(size_to_read);
 
-        let file_size = inode.size as usize;
+        if inode.flags & EXT4_EXTENTS_FL != 0 {
+            self.read_extents_optimized(inode, size_to_read, file_size, kind, check_and_stop_if_binary)
+        } else {
+            self.read_direct_blocks_optimized(inode, size_to_read, file_size, kind, check_and_stop_if_binary)
+        }
+    }
 
-        let is_binary = |this: &mut WorkerContext| -> bool {
-            let buf = this.get_buf(kind);
-            if buf.len() >= BINARY_PROBE_BYTE_SIZE || buf.len() == file_size {
-                if is_binary_chunk(&buf[..file_size.min(BINARY_PROBE_BYTE_SIZE)]) {
-                    // It's binary!
-                    return true;
+    #[inline]
+    fn read_extents_optimized(
+        &mut self,
+        inode: &Ext4Inode,
+        size_to_read: usize,
+        file_size: usize,
+        kind: BufKind,
+        check_binary: bool,
+    ) -> io::Result<bool> {
+        self.parse_extents(inode)?;
+
+        let extent_count = self.extent_buf.len();
+
+        let extents: SmallVec<[_; MAX_EXTENTS_UNTIL_SPILL]> = copy_data(
+            &self.extent_buf[..extent_count]
+        );
+
+        self.prefetch_extent_blocks(&extents, size_to_read);
+
+        // Binary check: Only check FIRST block if enabled
+        if check_binary {
+            if let Some(first_extent) = extents.first() {
+                let first_block = self.get_block(first_extent.start);
+                let probe_size = file_size.min(BINARY_PROBE_BYTE_SIZE).min(first_block.len());
+
+                if is_binary_chunk(&first_block[..probe_size]) {
+                    self.get_buf_mut(kind).clear();
+                    return Ok(false);
                 }
             }
+        }
 
-            false
-        };
+        // Fast path: Copy all blocks without binary checks
+        self.copy_extents_to_buf(&extents, size_to_read, kind);
 
-        let copy_block_to_buf = |this: &mut WorkerContext, block_num: u64| {
-            let _span = tracy::span!("WorkerContext::read_file_into_buf::copy_block_to_buf");
+        self.get_buf_mut(kind).truncate(size_to_read);
+        Ok(true)
+    }
 
-            let offset = this.get_buf(kind).len();
-            let remaining = size_to_read - offset;
+    #[inline]
+    fn read_direct_blocks_optimized(
+        &mut self,
+        inode: &Ext4Inode,
+        size_to_read: usize,
+        file_size: usize,
+        kind: BufKind,
+        check_binary: bool,
+    ) -> io::Result<bool> {
+        let mut blocks = SmallVec::<[_; EXT4_BLOCK_POINTERS_COUNT]>::new();
+        for &block in inode.blocks.iter().take(EXT4_BLOCK_POINTERS_COUNT) {
+            if block != 0 {
+                blocks.push(block as u64);
+            }
+        }
+        self.prefetch_blocks(Cow::Borrowed(&blocks));
 
-            let (src_ptr, to_copy) = {
-                let block_data = this.get_block(block_num);
-                let to_copy = block_data.len().min(remaining);
-                (block_data.as_ptr(), to_copy)
+        // Binary check: Only check FIRST block if enabled
+        if check_binary && let Some(&first_block_num) = blocks.first() {
+            let first_block = self.get_block(first_block_num);
+            let probe_size = file_size.min(BINARY_PROBE_BYTE_SIZE).min(first_block.len());
+
+            if is_binary_chunk(&first_block[..probe_size]) {
+                self.get_buf_mut(kind).clear();
+                return Ok(false);
+            }
+        }
+
+        let mut copied = 0;
+
+        for &block_num in &blocks {
+            if copied >= size_to_read { break; }
+
+            let (src_ptr, src_len) = {
+                let block_data = self.get_block(block_num);
+                (block_data.as_ptr(), block_data.len())
             };
 
-            let buf = this.get_buf_mut(kind);
+            let remaining = size_to_read - copied;
+            let to_copy = src_len.min(remaining);
+
+            let buf = self.get_buf_mut(kind);
             let old_len = buf.len();
             buf.resize(old_len + to_copy, 0);
 
-            // SAFETY: We obtain the source pointer from `block_data` while it's borrowed,
-            // then drop that borrow before getting a mutable borrow to the destination buffer.
-            // The source pointer remains valid because `get_block()` returns data from an mmap
-            // that won't be invalidated during this operation. We ensure no overlap between
-            // source and destination, and both pointers are valid for the copy length.
+            // SAFETY: Same as above
             unsafe {
-                std::ptr::copy_nonoverlapping(
+                core::ptr::copy_nonoverlapping(
                     src_ptr,
                     buf.as_mut_ptr().add(old_len),
                     to_copy
                 );
             }
-        };
 
-        if inode.flags & EXT4_EXTENTS_FL != 0 {
-            self.parse_extents(inode)?;
-
-            let extent_count = self.extent_buf.len();
-            // @StackLarge
-            let extents_copy: SmallVec::<[_; MAX_EXTENTS_UNTIL_SPILL]> = copy_data(
-                &self.extent_buf[..extent_count]
-            );
-
-            // ------- Prefetch the blooooooocks
-            {
-                let _span = tracy::span!("WorkerContext::read_file_into_buf::prefetch_blocks");
-
-                // @StackLarge
-                let mut blocks_to_prefetch = SmallVec::<[_; MAX_EXTENTS_UNTIL_SPILL]>::with_capacity(
-                    MAX_EXTENTS_UNTIL_SPILL
-                );
-                for extent in &extents_copy {
-                    for i in 0..extent.len.min((MAX_EXTENTS_UNTIL_SPILL / extents_copy.len().max(1)) as _) {
-                        blocks_to_prefetch.push(extent.start + i as u64);
-                        if blocks_to_prefetch.len() >= MAX_EXTENTS_UNTIL_SPILL {
-                            break;
-                        }
-                    }
-                    if blocks_to_prefetch.len() >= MAX_EXTENTS_UNTIL_SPILL {
-                        break;
-                    }
-                }
-                self.prefetch_blocks(&blocks_to_prefetch);
-            }
-
-            {
-                let _span = tracy::span!("WorkerContext::read_file_into_buf::copy_blocks_to_buf_loop");
-
-                for extent in &extents_copy {
-                    if self.get_buf(kind).len() >= size_to_read { break; }
-
-                    for j in 0..extent.len {
-                        let len = self.get_buf(kind).len();
-                        if len >= size_to_read { break }
-
-                        let phys_block = extent.start + j as u64;
-                        copy_block_to_buf(self, phys_block);
-
-                        if check_and_stop_if_binary && is_binary(self) {
-                            // It's binary!
-                            self.get_buf_mut(kind).clear();
-                            return Ok(false);
-                        }
-                    }
-                }
-            }
-        } else {
-            // ------- Prefetch the blooooooocks
-            {
-                let _span = tracy::span!("WorkerContext::read_file_into_buf::prefetch_blocks");
-
-                let mut blocks_to_prefetch = SmallVec::<[_; EXT4_BLOCK_POINTERS_COUNT]>::with_capacity(
-                    EXT4_BLOCK_POINTERS_COUNT
-                );
-                for &block in inode.blocks.iter().take(EXT4_BLOCK_POINTERS_COUNT) {
-                    if block != 0 {
-                        blocks_to_prefetch.push(block as _);
-                    }
-                }
-                self.prefetch_blocks(&blocks_to_prefetch);
-            }
-
-            {
-                let _span = tracy::span!("WorkerContext::read_file_into_buf::copy_blocks_to_buf_loop");
-                for &block in inode.blocks.iter().take(EXT4_BLOCK_POINTERS_COUNT) {
-                    if block == 0 || self.get_buf(kind).len() >= size_to_read {
-                        break;
-                    }
-
-                    copy_block_to_buf(self, block.into());
-
-                    if check_and_stop_if_binary && is_binary(self) {
-                        // It's binary!
-                        self.get_buf_mut(kind).clear();
-                        return Ok(false);
-                    }
-                }
-            }
+            copied += to_copy;
         }
 
         self.get_buf_mut(kind).truncate(size_to_read);
         Ok(true)
+    }
+
+    #[inline]
+    fn prefetch_extent_blocks(&self, extents: &[Ext4Extent], size_to_read: usize) {
+        let block_size = self.sb.block_size as usize;
+        let blocks_needed = (size_to_read + block_size - 1) / block_size;
+
+        let mut blocks = SmallVec::<[_; MAX_EXTENTS_UNTIL_SPILL]>::new();
+        let mut total = 0;
+
+        for extent in extents {
+            let extent_blocks = (extent.len as usize).min(blocks_needed - total);
+
+            for i in 0..extent_blocks {
+                blocks.push(extent.start + i as u64);
+            }
+
+            total += extent_blocks;
+            if total >= blocks_needed { break; }
+        }
+
+        self.prefetch_blocks(Cow::Owned(blocks));
+    }
+
+    #[inline]
+    fn copy_extents_to_buf(
+        &mut self,
+        extents: &[Ext4Extent],
+        size_to_read: usize,
+        kind: BufKind,
+    ) {
+        let mut copied = 0;
+
+        for extent in extents {
+            if copied >= size_to_read { break; }
+
+            for block_offset in 0..extent.len {
+                if copied >= size_to_read { break; }
+
+                let phys_block = extent.start + block_offset as u64;
+
+                let (src_ptr, src_len) = {
+                    let block_data = self.get_block(phys_block);
+                    (block_data.as_ptr(), block_data.len())
+                };
+
+                let remaining = size_to_read - copied;
+                let to_copy = src_len.min(remaining);
+
+                let buf = self.get_buf_mut(kind);
+                let old_len = buf.len();
+                buf.resize(old_len + to_copy, 0);
+
+                // SAFETY: src_ptr points to mmap'd data that remains valid.
+                // We've ensured no overlap and both pointers are valid.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        src_ptr,
+                        buf.as_mut_ptr().add(old_len),
+                        to_copy
+                    );
+                }
+
+                copied += to_copy;
+            }
+        }
     }
 
     /// Called when either checking if a path is gitignored or printing the matches
@@ -694,30 +735,57 @@ impl WorkerContext<'_> {
     }
 
     #[inline(always)]
-    fn prefetch_blocks(&self, blocks: &[u64]) {
+    fn prefetch_blocks<const N: usize>(&self, blocks: Cow<SmallVec<[u64; N]>>) {
         let _span = tracy::span!("WorkerContext::prefetch_blocks");
 
-        if blocks.is_empty() {
+        // Only prefetch if we have significant non-contiguous ranges
+        // @Constant
+        if blocks.len() < 3 {
             return;
         }
 
-        let mut sorted: SmallVec<[_; 16]> = copy_data(blocks);
+        let mut sorted = match blocks {
+            Cow::Borrowed(bw) => copy_data(bw),
+            Cow::Owned(ow) => ow,
+        };
         sorted.sort_unstable();
+
+        let mut gaps = 0;
+        for i in 1..sorted.len() {
+            if sorted[i] > sorted[i-1] + 1 {
+                gaps += 1;
+            }
+        }
+
+        // Only worth prefetching if significantly fragmented
+        // @Constant
+        if gaps < 2 { return; }
+
         sorted.dedup();
 
         let mut range_start = sorted[0];
         let mut range_end = sorted[0];
 
         for &block in &sorted[1..] {
-            if block == range_end + 1 {
+            // Merge adjacent or close blocks (within 32 blocks)
+            // @Constant
+            if block <= range_end + 32 {
                 range_end = block;
             } else {
-                self.advise_range(range_start, range_end);
+                // Only advise ranges >= 128KB
+                // @Constant
+                if (range_end - range_start) * self.sb.block_size as u64 >= 128 * 1024 {
+                    self.advise_range(range_start, range_end);
+                }
                 range_start = block;
                 range_end = block;
             }
         }
-        self.advise_range(range_start, range_end);
+
+        // @Constant
+        if (range_end - range_start) * self.sb.block_size as u64 >= 128 * 1024 {
+            self.advise_range(range_start, range_end);
+        }
     }
 
     #[inline(always)]
@@ -725,14 +793,14 @@ impl WorkerContext<'_> {
         let offset = start_block as usize * self.sb.block_size as usize;
         let length = (end_block - start_block + 1) as usize * self.sb.block_size as usize;
 
-        if offset + length <= self.device_mmap.len() {
-            unsafe {
-                libc::madvise(
-                    self.device_mmap.as_ptr().add(offset) as *mut _,
-                    length,
-                    libc::MADV_WILLNEED
-                );
-            }
+        debug_assert!(offset + length <= self.device_mmap.len());
+
+        unsafe {
+            libc::madvise(
+                self.device_mmap.as_ptr().add(offset) as *mut _,
+                length,
+                libc::MADV_WILLNEED
+            );
         }
     }
 }
@@ -990,7 +1058,7 @@ impl WorkerContext<'_> {
                 child_blocks.push(leaf_block);
             }
 
-            self.prefetch_blocks(&child_blocks);
+            self.prefetch_blocks(Cow::Borrowed(&child_blocks));
 
             for child_block in child_blocks {
                 // SAFETY:
@@ -1418,7 +1486,7 @@ impl WorkerContext<'_> {
                             EXT4_S_IFREG => {
                                 // @Speed
                                 let name_bytes = name_bytes.to_vec();
-                                self.process_file_not_batch(
+                                self.process_file(
                                     &child_inode,
                                     &name_bytes,
                                     &work.path_bytes,
@@ -1497,7 +1565,7 @@ impl WorkerContext<'_> {
                 continue;
             };
 
-            self.process_file_not_batch(
+            self.process_file(
                 &inode,
                 name_bytes,
                 &batch.parent_path,
@@ -1513,7 +1581,7 @@ impl WorkerContext<'_> {
         Ok(())
     }
 
-    fn process_file_not_batch(
+    fn process_file(
         &mut self,
         inode: &Ext4Inode,
         file_name: &[u8],
@@ -1521,6 +1589,8 @@ impl WorkerContext<'_> {
         gitignore: Option<&Gitignore>,
         path_display_buf: &mut String
     ) -> io::Result<()> {
+        let _span = tracy::span!("WorkerContext::process_file_not_batch");
+
         self.stats.files_encountered.fetch_add(1, Ordering::Relaxed);
 
         if !self.cli.should_ignore_all_filters() && inode.size > self.max_file_byte_size() as u64 {
@@ -1546,6 +1616,8 @@ impl WorkerContext<'_> {
         // Build full path
         // @Refactor @Cutnpaste from above
         {
+            let _span = tracy::span!("build full path");
+
             self.path_buf.clear();
             self.path_buf.extend_from_slice(parent_path);
             if !parent_path.is_empty() {
@@ -1564,7 +1636,7 @@ impl WorkerContext<'_> {
                 // Only build display path if we have matches
                 if self.matcher.is_match(&self.file_buf) {
                     self.display_path_into_buf(path_display_buf);
-                    self.find_and_print_matches_fast(path_display_buf)?;
+                    self.find_and_print_matches(path_display_buf)?;
                 }
             }
             false => {
@@ -1576,10 +1648,9 @@ impl WorkerContext<'_> {
     }
 
     #[inline]
-    fn find_and_print_matches_fast(
-        &mut self,
-        path_display_buf: &mut String
-    ) -> io::Result<()> {
+    fn find_and_print_matches(&mut self, path_display_buf: &mut String) -> io::Result<()> {
+        let _span = tracy::span!("find_and_print_matches_fast");
+
         let mut found_any = false;
         let buf = &self.file_buf;
         let buf_len = buf.len();
@@ -1757,6 +1828,26 @@ impl RawGrepper {
                 .len(size as _)
                 .map(&file)?
         };
+
+        unsafe {
+            // MADV_SEQUENTIAL: Tell kernel we're reading sequentially
+            // This makes kernel do aggressive readahead and drop pages behind us
+            libc::madvise(
+                device_mmap.as_ptr() as *mut _,
+                device_mmap.len(),
+                libc::MADV_SEQUENTIAL,
+            );
+
+            // MADV_WILLNEED on first chunk to start prefetching immediately
+            // Prefetch first 256MB to get started
+            // @Constant
+            let prefetch_size = (256 * 1024 * 1024).min(device_mmap.len());
+            libc::madvise(
+                device_mmap.as_ptr() as *mut _,
+                prefetch_size,
+                libc::MADV_WILLNEED,
+            );
+        }
 
         let sb_bytes = &device_mmap[
             EXT4_SUPERBLOCK_OFFSET as usize..

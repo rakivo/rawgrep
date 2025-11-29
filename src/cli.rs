@@ -1,7 +1,8 @@
 use crate::grep::BufferConfig;
 
-use clap::Parser;
 use std::sync::OnceLock;
+
+use clap::Parser;
 
 pub static SHOULD_ENABLE_ANSI_COLORING: OnceLock<bool> = OnceLock::new();
 
