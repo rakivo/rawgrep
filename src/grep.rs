@@ -1876,7 +1876,7 @@ impl RawGrepper {
 
                         let work = worker.find_work(
                             &local_worker,
-                            &injector,
+                            injector,
                             &stealers,
                             &mut consecutive_steals,
                         );
@@ -1891,7 +1891,7 @@ impl RawGrepper {
                                         _ = worker.process_directory_with_stealing(
                                             dir_work,
                                             &local_worker,
-                                            &injector,
+                                            injector,
                                             &mut path_display_buf
                                         );
                                     }
