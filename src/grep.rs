@@ -611,7 +611,7 @@ impl WorkerContext<'_> {
     #[inline]
     fn prefetch_extent_blocks(&self, extents: &[Ext4Extent], size_to_read: usize) {
         let block_size = self.sb.block_size as usize;
-        let blocks_needed = (size_to_read + block_size - 1) / block_size;
+        let blocks_needed = size_to_read.div_ceil(block_size);
 
         let mut blocks = SmallVec::<[_; MAX_EXTENTS_UNTIL_SPILL]>::new();
         let mut total = 0;
