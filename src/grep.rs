@@ -1,3 +1,6 @@
+// PINNED TODOs:
+//   TODO(#26): `ignore` allocates too much, maybe we're not using it the right way
+//
 // TODO(#1): Implement symlinks
 // TODO(#24): Support for searching in large file(s). (detect that)
 
@@ -1674,6 +1677,7 @@ impl WorkerContext<'_> {
 
             let line = &buf[line_start..line_end];
 
+            // TODO: Don't call is_match excessively
             if self.matcher.is_match(line) {
                 if !found_any {
                     //
@@ -2703,3 +2707,4 @@ impl RawGrepper {
         Ok(())
     }
 }
+     
