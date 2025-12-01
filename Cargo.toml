@@ -24,8 +24,14 @@ tracy = ["tracy-client/enable"]
 mimalloc = ["dep:mimalloc"]
 dhat = ["dep:dhat"]
 
-# binary size
+# Want a small binary? Do this:
+# RUSTFLAGS="-Zunstable-options -Cpanic=immediate-abort -Zlocation-detail=none -Zfmt-debug=none" \
+#     cargo +nightly b \
+#        -Z build-std=std,panic_abort \
+#        -Z build-std-features= \
+#         --profile=release-fast --target=x86_64-unknown-linux-gnu --no-default-features --features=use_nightly,full,mimalloc
 small = ["regex-tiny", "clap-tiny"]
+
 full  = ["regex-full", "clap-full"]
 
 [dependencies]
