@@ -39,7 +39,7 @@ pub const LARGE_DIR_THRESHOLD: usize = 256; // Split dirs with 1000+ entries
 pub const FILE_BATCH_SIZE: usize = 64; // Process files in batches of 500
 
 pub const WORKER_FLUSH_BATCH: usize = 16 * 1024;
-pub const OUTPUTTER_FLUSH_BATCH: usize = 64 * 1024;
+pub const OUTPUTTER_FLUSH_BATCH: usize = 16 * 1024;
 
 pub const BINARY_CONTROL_COUNT: usize = 51; // tuned
 pub const BINARY_PROBE_BYTE_SIZE: usize = 0x1000;
@@ -317,8 +317,7 @@ pub struct BufferConfig {
 }
 
 enum WorkItem {
-    Directory(DirWork),
-    FileBatch(FileBatchWork),
+    Directory(DirWork)
 }
 
 struct DirWork {
@@ -326,13 +325,6 @@ struct DirWork {
     path_bytes: Arc<[u8]>,
     gitignore_chain: GitignoreChain,
     depth: u16
-}
-
-struct FileBatchWork {
-    parent_path: Arc<[u8]>,
-    gitignore_chain: GitignoreChain,
-    // Raw directory entry data (multiple entries concatenated)
-    entries: Box<[u8]>,
 }
 
 struct Outputter {
@@ -354,6 +346,23 @@ impl Outputter {
         }
         _ = self.writer.flush();
     }
+}
+
+/// Result of scanning directory entries
+#[allow(dead_code, reason = "@Incomplete")]
+struct DirScanResult {
+    file_count: u32,
+    dir_count: u32,
+    /// Pre-parsed entries to avoid re-parsing
+    entries: SmallVec<[ParsedEntry; 64]>,
+}
+
+#[derive(Clone, Copy)]
+struct ParsedEntry {
+    inode: u32,
+    name_offset: u16, // Offset into dir_buf
+    name_len: u8,
+    file_type: u8,
 }
 
 struct WorkerContext<'a> {
@@ -415,75 +424,6 @@ impl<'a> WorkerContext<'a> {
             _MAX_DIR_BYTE_SIZE
         }
     }
-
-    #[allow(unused)]
-    fn resolve_path_from_root(&mut self, path: &[u8]) -> io::Result<INodeNum> {
-        let mut resolved_path = SmallPathBuf::new();
-        resolved_path.extend_from_slice(path);
-        self.resolve_path_to_inode(&resolved_path)
-    }
-
-    #[allow(unused)]
-    fn resolve_path_to_inode(&mut self, path: &SmallPathBuf) -> io::Result<INodeNum> {
-        let path_str = std::str::from_utf8(path.as_slice())
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid UTF-8"))?;
-
-        let mut inode_num = EXT4_ROOT_INODE;
-
-        for component in path_str.split('/').filter(|s| !s.is_empty()) {
-            let inode = self.parse_inode(inode_num)?;
-
-            if unlikely((inode.mode & EXT4_S_IFMT) != EXT4_S_IFDIR) {
-                return Err(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    "Not a directory",
-                ));
-            }
-
-            let dir_size = (inode.size as usize).min(self.max_dir_byte_size());
-            self.read_file_into_buf(&inode, dir_size, BufKind::Dir, false)?;
-
-            let mut found = None;
-            let mut offset = 0;
-
-            while offset + 8 <= self.dir_buf.len() {
-                let entry_inode = INodeNum::from_le_bytes([
-                    self.dir_buf[offset + 0],
-                    self.dir_buf[offset + 1],
-                    self.dir_buf[offset + 2],
-                    self.dir_buf[offset + 3],
-                ]);
-                let rec_len = u16::from_le_bytes([
-                    self.dir_buf[offset + 4],
-                    self.dir_buf[offset + 5],
-                ]);
-                let name_len = self.dir_buf[offset + 6];
-
-                if unlikely(rec_len == 0) {
-                    break;
-                }
-
-                if likely(entry_inode != 0 && name_len > 0) {
-                    let name_end = offset + 8 + name_len as usize;
-                    if name_end <= offset + rec_len as usize && name_end <= self.dir_buf.len() {
-                        let name_bytes = &self.dir_buf[offset + 8..name_end];
-                        if name_bytes == component.as_bytes() {
-                            found = Some(entry_inode);
-                            break;
-                        }
-                    }
-                }
-
-                offset += rec_len as usize;
-            }
-
-            inode_num = found.ok_or_else(|| {
-                io::Error::new(io::ErrorKind::NotFound, "Path component not found")
-            })?;
-        }
-
-        Ok(inode_num)
-    }
 }
 
 /// impl block of misc helper functions
@@ -512,7 +452,6 @@ impl WorkerContext<'_> {
         }
     }
 
-    #[inline]
     fn read_extents(
         &mut self,
         inode: &Ext4Inode,
@@ -533,8 +472,8 @@ impl WorkerContext<'_> {
 
         self.prefetch_extent_blocks(&extents, size_to_read);
 
-        // Binary check: Only check FIRST block if enabled
         if check_binary {
+            // Binary check: Only check FIRST block
             if let Some(first_extent) = extents.first() {
                 let first_block = self.get_block(first_extent.start);
                 let probe_size = file_size.min(BINARY_PROBE_BYTE_SIZE).min(first_block.len());
@@ -546,14 +485,12 @@ impl WorkerContext<'_> {
             }
         }
 
-        // Fast path: Copy all blocks without binary checks
         self.copy_extents_to_buf(&extents, size_to_read, kind);
 
         self.get_buf_mut(kind).truncate(size_to_read);
         Ok(true)
     }
 
-    #[inline]
     fn read_direct_blocks(
         &mut self,
         inode: &Ext4Inode,
@@ -564,16 +501,18 @@ impl WorkerContext<'_> {
     ) -> io::Result<bool> {
         let _span = tracy::span!("WorkerContext::read_direct_blocks");
 
-        let mut blocks = SmallVec::<[_; EXT4_BLOCK_POINTERS_COUNT]>::new();
-        for &block in inode.blocks.iter().take(EXT4_BLOCK_POINTERS_COUNT) {
-            if likely(block != 0) {
-                blocks.push(block as u64);
-            }
-        }
-        self.prefetch_blocks(Cow::Borrowed(&blocks));
+        let blocks: SmallVec<[u64; EXT4_BLOCK_POINTERS_COUNT]> = inode
+            .blocks
+            .iter()
+            .take(EXT4_BLOCK_POINTERS_COUNT)
+            .filter(|&&b| b != 0)
+            .map(|&b| b as u64)
+            .collect();
 
-        // Binary check: Only check FIRST block if enabled
+        self.prefetch_direct_blocks(&blocks);
+
         if check_binary && let Some(&first_block_num) = blocks.first() {
+            // Binary check: Only check FIRST block
             let first_block = self.get_block(first_block_num);
             let probe_size = file_size.min(BINARY_PROBE_BYTE_SIZE).min(first_block.len());
 
@@ -616,28 +555,62 @@ impl WorkerContext<'_> {
         Ok(true)
     }
 
+    /// Prefetch for extent-based files
     #[inline]
     fn prefetch_extent_blocks(&self, extents: &[Ext4Extent], size_to_read: usize) {
         let _span = tracy::span!("WorkerContext::prefetch_extent_blocks");
 
         let block_size = self.sb.block_size as usize;
-        let blocks_needed = size_to_read.div_ceil(block_size);
-
-        let mut blocks = SmallVec::<[_; MAX_EXTENTS_UNTIL_SPILL]>::new();
-        let mut total = 0;
+        let mut remaining = size_to_read;
 
         for extent in extents {
-            let extent_blocks = (extent.len as usize).min(blocks_needed - total);
+            if remaining == 0 { break }
 
-            for i in 0..extent_blocks {
-                blocks.push(extent.start + i as u64);
+            let extent_bytes = extent.len as usize * block_size;
+            let bytes_to_prefetch = extent_bytes.min(remaining);
+            let blocks_to_prefetch = bytes_to_prefetch.div_ceil(block_size);
+
+            let offset = extent.start as usize * block_size;
+            let length = blocks_to_prefetch * block_size;
+
+            if offset + length <= self.device_mmap.len() {
+                unsafe {
+                    libc::madvise(
+                        self.device_mmap.as_ptr().add(offset) as *mut _,
+                        length,
+                        libc::MADV_WILLNEED,
+                    );
+                }
             }
 
-            total += extent_blocks;
-            if total >= blocks_needed { break; }
+            remaining = remaining.saturating_sub(extent_bytes);
+        }
+    }
+
+    /// Prefetch blocks for direct-block files (small/old files)
+    #[inline]
+    fn prefetch_direct_blocks(&self, blocks: &[u64]) {
+        if blocks.is_empty() {
+            return;
         }
 
-        self.prefetch_blocks(Cow::Owned(blocks));
+        let block_size = self.sb.block_size as usize;
+        let mmap_len = self.device_mmap.len();
+
+        // Direct blocks are usually contiguous or close together
+        // Just prefetch each one - kernel will coalesce
+        for &block in blocks {
+            let offset = block as usize * block_size;
+            if offset + block_size > mmap_len { continue }
+
+            unsafe {
+                libc::madvise(
+                    self.device_mmap.as_ptr().add(offset) as *mut _,
+                    block_size,
+                    libc::MADV_WILLNEED,
+                );
+            }
+        }
     }
 
     #[inline]
@@ -789,6 +762,33 @@ impl WorkerContext<'_> {
         }
     }
 
+    /// Prefetch all blocks for an inode (call before reading file)
+    #[inline]
+    fn prefetch_inode_data(&mut self, inode: &Ext4Inode, size_to_read: usize) {
+        if inode.flags & EXT4_EXTENTS_FL != 0 {
+            // Parse extents and prefetch
+            if self.parse_extents(inode).is_ok() {
+                let extent_count = self.extent_buf.len();
+                // Borrow extent_buf data before calling prefetch
+                let extents: SmallVec<[Ext4Extent; MAX_EXTENTS_UNTIL_SPILL]> =
+                    self.extent_buf[..extent_count].iter().copied().collect();
+                self.prefetch_extent_blocks(&extents, size_to_read);
+            }
+        } else {
+            // Direct blocks
+            // @Constant
+            let blocks: SmallVec<[u64; 12]> = inode
+                .blocks
+                .iter()
+                .take(EXT4_BLOCK_POINTERS_COUNT)
+                .filter(|&&b| b != 0)
+                .map(|&b| b as u64)
+                .collect();
+
+            self.prefetch_direct_blocks(&blocks);
+        }
+    }
+
     #[inline(always)]
     fn advise_range(&self, start_block: u64, end_block: u64) {
         let offset = start_block as usize * self.sb.block_size as usize;
@@ -870,7 +870,6 @@ impl WorkerContext<'_> {
 
 /// impl block of ext4 parsing
 impl WorkerContext<'_> {
-    #[inline]
     fn parse_inode(&self, inode_num: INodeNum) -> io::Result<Ext4Inode> {
         let _span = tracy::span!("WorkerContext::parse_inode");
 
@@ -975,11 +974,9 @@ impl WorkerContext<'_> {
 
         let header = bytemuck::try_from_bytes::<raw::Ext4ExtentHeader>(
             &data[..mem::size_of::<raw::Ext4ExtentHeader>()]
-        ).map_err(|_|
-            io::Error::new(
-                io::ErrorKind::InvalidData, "Invalid extent header"
-            )
-        )?;
+        ).map_err(|_| io::Error::new(
+            io::ErrorKind::InvalidData, "Invalid extent header"
+        ))?;
 
         if likely(u16::from_le(header.eh_magic) != EXT4_EXTENT_MAGIC) {
             return Ok(());
@@ -1017,7 +1014,7 @@ impl WorkerContext<'_> {
                 let start_block = ((ee_start_hi as u64) << 32) | (ee_start_lo as u64);
 
                 // Validate extent length (max 32768 blocks = 128MB for 4K blocks)
-                if likely(ee_len > 0 && ee_len <= 32768) {
+                if likely(ee_len > 0 && ee_len <= 32768) { // @Constant
                     self.extent_buf.push(Ext4Extent {
                         start: start_block,
                         len: ee_len,
@@ -1135,7 +1132,7 @@ impl WorkerContext<'_> {
         None
     }
 
-    fn process_directory_with_stealing(
+    fn dispatch_directory(
         &mut self,
         mut work: DirWork,
         local: &DequeWorker<WorkItem>,
@@ -1186,33 +1183,25 @@ impl WorkerContext<'_> {
             work.gitignore_chain.clone()
         };
 
-        let (file_count, _) = self.count_directory_entries();
+        let scan = self.scan_directory_entries();
 
-        // If many files, split into batches
-        if file_count > LARGE_DIR_THRESHOLD {
-            self.process_large_directory(
-                work,
-                gitignore_chain,
-                local,
-                injector,
-            )?;
-        } else {
-            self.process_not_large_directory(
-                work,
-                gitignore_chain,
-                local,
-                injector,
-            )?;
-        }
+        self.process_directory(
+            work,
+            gitignore_chain,
+            &scan.entries,
+            local,
+            injector,
+        )?;
 
         Ok(())
     }
 
-    fn count_directory_entries(&self) -> (usize, usize) {
-        let _span = tracy::span!("count_directory_entries");
+    fn scan_directory_entries(&self) -> DirScanResult {
+        let _span = tracy::span!("scan_directory_entries");
 
         let mut file_count = 0;
         let mut dir_count = 0;
+        let mut entries = SmallVec::new();
         let mut offset = 0;
 
         let entry_size = mem::size_of::<raw::Ext4DirEntry2>();
@@ -1234,32 +1223,33 @@ impl WorkerContext<'_> {
                 break;
             }
 
-            // @Refactor @Cutnpaste from process_not_large_directory
             if likely(entry_inode != 0 && name_len > 0) {
-                let name_end = offset + entry_size + name_len as usize;
-                if likely(name_end <= offset + rec_len as usize && name_end <= self.dir_buf.len()) {
-                    // SAFETY: `self.dir_buf` contains valid Ext4DirEntry2 data
+                let name_start = offset + entry_size;
+                let name_end = name_start + name_len as usize;
+
+                if name_end <= offset + rec_len as usize && name_end <= self.dir_buf.len() {
+                    // SAFETY: bounds checked above
                     let name_bytes = unsafe {
-                        self.dir_buf.get_unchecked(offset + entry_size..name_end)
+                        self.dir_buf.get_unchecked(name_start..name_end)
                     };
 
-                    if is_dot_entry(name_bytes) {
-                        offset += rec_len as usize;
-                        continue;
-                    }
+                    if !is_dot_entry(name_bytes) {
+                        entries.push(ParsedEntry {
+                            inode: entry_inode,
+                            name_offset: name_start as u16,
+                            name_len,
+                            file_type,
+                        });
 
-                    match file_type {
-                        EXT4_FT_DIR => dir_count += 1,
-                        EXT4_FT_REG_FILE => file_count += 1,
-                        _ => {
-                            // Slow fallback for unknown types
-                            if let Ok(child_inode) = self.parse_inode(entry_inode) {
-                                match child_inode.mode & EXT4_S_IFMT {
-                                    EXT4_S_IFDIR => dir_count += 1,
-                                    EXT4_S_IFREG => file_count += 1,
-                                    _ => {}
-                                }
+                        match file_type {
+                            EXT4_FT_DIR => dir_count += 1,
+                            EXT4_FT_REG_FILE => file_count += 1,
+                            0 => {
+                                // Unknown type - will resolve later
+                                // Count as file for threshold purposes
+                                file_count += 1;
                             }
+                            _ => {}
                         }
                     }
                 }
@@ -1268,390 +1258,159 @@ impl WorkerContext<'_> {
             offset += rec_len as usize;
         }
 
-        (file_count, dir_count)
+        DirScanResult { file_count, dir_count, entries }
     }
 
-    fn process_large_directory(
+    fn process_directory(
         &mut self,
         work: DirWork,
         gitignore_chain: GitignoreChain,
+        entries: &[ParsedEntry],
         local: &DequeWorker<WorkItem>,
         injector: &Injector<WorkItem>,
     ) -> io::Result<()> {
-        let _span = tracy::span!("WorkerContext::process_large_directory");
-
-        let mut subdirs = SmallVec::<[_; 16]>::new();
-        // @Constant
-        let mut current_batch = SmallVec::<[_; 0x1000]>::new();
-        let mut files_in_batch = 0;
+        let _span = tracy::span!("process_small_directory_with_entries");
 
         // @Constant
-        let entry_size = mem::size_of::<raw::Ext4DirEntry2>();
-
-        let mut offset = 0;
-
-        // Pre-calculate path components that don't change
-        let needs_slash = !work.path_bytes.is_empty();
-        let parent_path_len = work.path_bytes.len();
-
-        let gitignore_chain_is_empty = gitignore_chain.is_empty();
-
-        while offset + entry_size <= self.dir_buf.len() {
-            let entry = match bytemuck::try_from_bytes::<raw::Ext4DirEntry2>(
-                &self.dir_buf[offset..offset + entry_size]
-            ) {
-                Ok(e) => e,
-                Err(_) => break,
-            };
-
-            let entry_inode = u32::from_le(entry.inode);
-            let rec_len = u16::from_le(entry.rec_len);
-            let name_len = entry.name_len;
-            let file_type = entry.file_type;
-
-            if rec_len == 0 {
-                break;
-            }
-
-            let rec_len_usize = rec_len as usize;
-
-            if likely(entry_inode != 0 && name_len > 0) {
-                let name_start = offset + entry_size;
-                let name_end = name_start + name_len as usize;
-
-                if likely(name_end <= offset + rec_len_usize && name_end <= self.dir_buf.len()) {
-                    // SAFETY: `self.dir_buf` contains valid Ext4DirEntry2 data
-                    let name_bytes = unsafe {
-                        self.dir_buf.get_unchecked(name_start..name_end)
-                    };
-
-                    if likely(!is_dot_entry(name_bytes)) {
-                        // Try to use file_type from directory entry first (fast path)
-                        // If file_type is 0 (unknown), fall back to inode parsing
-                        let ft = if file_type != 0 {
-                            match file_type {
-                                1 => Some(EXT4_S_IFREG), // Regular file
-                                2 => Some(EXT4_S_IFDIR), // Directory
-                                _ => None,
-                            }
-                        } else {
-                            None
-                        };
-
-                        let ft = if let Some(ft) = ft {
-                            ft
-                        } else {
-                            // Unknown type - must parse inode
-                            let Ok(child_inode) = self.parse_inode(entry_inode) else {
-                                offset += rec_len_usize;
-                                continue;
-                            };
-                            child_inode.mode & EXT4_S_IFMT
-                        };
-
-                        match ft {
-                            EXT4_S_IFDIR => {
-                                if !is_common_skip_dir(name_bytes) {
-                                    // Build child path once
-                                    let mut child_path: SmallVec<[u8; 512]> = SmallVec::new();
-                                    child_path.reserve_exact(
-                                        parent_path_len + needs_slash as usize + name_len as usize
-                                    );
-                                    child_path.extend_from_slice(&work.path_bytes);
-                                    if needs_slash {
-                                        child_path.push(b'/');
-                                    }
-                                    child_path.extend_from_slice(name_bytes);
-
-                                    // CHECK GITIGNORE FOR THE DIRECTORY
-                                    if !self.cli.should_ignore_gitignore() && !gitignore_chain_is_empty {
-                                        if gitignore_chain.is_ignored(&child_path, true) {
-                                            self.stats.dirs_skipped_gitignore += 1;
-                                            offset += rec_len_usize;
-                                            continue; // Skip this entire directory!
-                                        }
-                                    }
-
-                                    subdirs.push(DirWork {
-                                        inode_num: entry_inode,
-                                        path_bytes: crate::util::smallvec_into_arc_slice_noshrink(
-                                            child_path
-                                        ),
-                                        gitignore_chain: gitignore_chain.clone(),
-                                        depth: work.depth + 1,
-                                    });
-                                }
-                            }
-                            EXT4_S_IFREG => {
-                                current_batch.reserve(5 + name_len as usize);
-                                current_batch.extend_from_slice(&entry_inode.to_le_bytes());
-                                current_batch.push(name_len);
-                                current_batch.extend_from_slice(name_bytes);
-                                files_in_batch += 1;
-
-                                if files_in_batch >= FILE_BATCH_SIZE {
-                                    local.push(WorkItem::FileBatch(FileBatchWork {
-                                        parent_path: Arc::clone(&work.path_bytes),
-                                        gitignore_chain: gitignore_chain.clone(),
-                                        entries: crate::util::smallvec_into_boxed_slice_noshrink(
-                                            mem::take(&mut current_batch)
-                                        )
-                                    }));
-                                    files_in_batch = 0;
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-            }
-
-            offset += rec_len_usize;
-        }
-
-        if files_in_batch > 0 {
-            local.push(WorkItem::FileBatch(FileBatchWork {
-                parent_path: Arc::clone(&work.path_bytes),
-                gitignore_chain: gitignore_chain.clone(),
-                entries: crate::util::smallvec_into_boxed_slice_noshrink(current_batch),
-            }));
-        }
-
-        let keep_local = subdirs.len().min(2);
-        for subdir in subdirs.drain(keep_local..).rev() {
-            local.push(WorkItem::Directory(subdir));
-        }
-
-        for subdir in subdirs {
-            self.process_directory_with_stealing(subdir, local, injector)?;
-        }
-
-        Ok(())
-    }
-
-    fn process_not_large_directory(
-        &mut self,
-        work: DirWork,
-        gitignore_chain: GitignoreChain,
-        local: &DequeWorker<WorkItem>,
-        injector: &Injector<WorkItem>,
-    ) -> io::Result<()> {
-        let _span = tracy::span!("WorkerContext::process_not_large_directory");
-
         let mut subdirs = SmallVec::<[DirWork; 16]>::new();
-        let mut offset = 0;
-
-        // @Constant
-        let entry_size = mem::size_of::<raw::Ext4DirEntry2>();
-
-        // Pre-calculate path components that don't change
         let needs_slash = !work.path_bytes.is_empty();
         let parent_path_len = work.path_bytes.len();
 
-        while offset + entry_size <= self.dir_buf.len() {
-            let entry = match bytemuck::try_from_bytes::<raw::Ext4DirEntry2>(
-                &self.dir_buf[offset..offset + entry_size]
-            ) {
-                Ok(e) => e,
-                Err(_) => break,
+        // @Constant
+        let mut file_entries: SmallVec<[_; 64]> = SmallVec::new();
+
+        for entry in entries {
+            let name_bytes = unsafe {
+                let zelf: *mut Self = self;
+                (&*zelf).dir_buf.get_unchecked(
+                    entry.name_offset as usize..entry.name_offset as usize + entry.name_len as usize
+                )
             };
 
-            let entry_inode = u32::from_le(entry.inode);
-            let rec_len = u16::from_le(entry.rec_len);
-            let name_len = entry.name_len;
-            let file_type = entry.file_type;
-
-            if (rec_len == 0 || rec_len < entry_size as u16) ||
-                offset + rec_len as usize > self.dir_buf.len()
-            {
-                break; // Corrupted directory
-            }
-
-            let rec_len_usize = rec_len as usize;
-
-            if entry_inode != 0 && name_len > 0 {
-                let name_start = offset + entry_size;
-                let name_end = name_start + name_len as usize;
-
-                if name_end <= offset + rec_len_usize && name_end <= self.dir_buf.len() {
-                    // SAFETY: `self.dir_buf` contains valid Ext4DirEntry2 data
-                    let name_bytes = unsafe {
-                        self.dir_buf.get_unchecked(name_start..name_end)
+            let ft = match entry.file_type {
+                1 => EXT4_S_IFREG,
+                2 => EXT4_S_IFDIR,
+                0 => {
+                    // Unknown - parse inode..
+                    let Ok(child_inode) = self.parse_inode(entry.inode) else {
+                        continue;
                     };
+                    child_inode.mode & EXT4_S_IFMT
+                }
+                _ => continue,
+            };
 
-                    if !is_dot_entry(name_bytes) {
-                        // Try to use file_type from directory entry first (fast path)
-                        // file_type constants: 1=REG, 2=DIR, 7=LINK, etc.
-                        // If file_type is 0 (unknown), fall back to inode parsing
-                        let ft = if file_type != 0 {
-                            // Fast path: use file_type from directory entry
-                            match file_type {
-                                1 => Some(EXT4_S_IFREG), // Regular file
-                                2 => Some(EXT4_S_IFDIR), // Directory
-                                _ => None, // Symlink, socket, etc. - skip or handle if needed
-                            }
-                        } else {
-                            // Slow path: parse inode to get type
-                            None
-                        };
+            match ft {
+                EXT4_S_IFDIR => {
+                    if is_common_skip_dir(name_bytes) {
+                        continue;
+                    }
 
-                        let (child_inode, ft) = if let Some(ft) = ft {
-                            // We know the type, but still need inode for file processing
-                            if ft == EXT4_S_IFREG {
-                                // Parse inode only if we're going to process the file
-                                let Ok(child_inode) = self.parse_inode(entry_inode) else {
-                                    offset += rec_len_usize;
-                                    continue;
-                                };
-                                (Some(child_inode), ft)
-                            } else {
-                                // For directories, we don't need the inode yet
-                                (None, ft)
-                            }
-                        } else {
-                            // Unknown type - must parse inode
-                            let Ok(child_inode) = self.parse_inode(entry_inode) else {
-                                offset += rec_len_usize;
-                                continue;
-                            };
-                            let ft = child_inode.mode & EXT4_S_IFMT;
-                            (Some(child_inode), ft)
-                        };
+                    let mut child_path: SmallVec<[u8; 512]> = SmallVec::new();
+                    child_path.reserve_exact(
+                        parent_path_len + needs_slash as usize + entry.name_len as usize
+                    );
+                    child_path.extend_from_slice(&work.path_bytes);
+                    if needs_slash {
+                        child_path.push(b'/');
+                    }
+                    child_path.extend_from_slice(name_bytes);
 
-                        match ft {
-                            EXT4_S_IFDIR => {
-                                if !is_common_skip_dir(name_bytes) {
-                                    // Build child path once
-                                    let mut child_path: SmallVec<[u8; 512]> = SmallVec::new();
-                                    child_path.reserve_exact(
-                                        parent_path_len + needs_slash as usize + name_len as usize
-                                    );
-                                    child_path.extend_from_slice(&work.path_bytes);
-                                    if needs_slash {
-                                        child_path.push(b'/');
-                                    }
-                                    child_path.extend_from_slice(name_bytes);
-
-                                    // CHECK GITIGNORE FOR THE DIRECTORY
-                                    if !self.cli.should_ignore_gitignore() && !gitignore_chain.is_empty() {
-                                        if gitignore_chain.is_ignored(&child_path, true) {
-                                            self.stats.dirs_skipped_gitignore += 1;
-                                            offset += rec_len_usize;
-                                            continue; // Skip this entire directory!
-                                        }
-                                    }
-
-                                    subdirs.push(DirWork {
-                                        inode_num: entry_inode,
-                                        path_bytes: crate::util::smallvec_into_arc_slice_noshrink(
-                                            child_path
-                                        ),
-                                        gitignore_chain: gitignore_chain.clone(),
-                                        depth: work.depth + 1,
-                                    });
-                                }
-                            }
-                            EXT4_S_IFREG => {
-                                // We already parsed the inode above if file_type was known
-                                let child_inode = if let Some(inode) = child_inode {
-                                    inode
-                                } else {
-                                    // This shouldn't happen, but handle it just in case
-                                    let Ok(inode) = self.parse_inode(entry_inode) else {
-                                        offset += rec_len_usize;
-                                        continue;
-                                    };
-                                    inode
-                                };
-
-                                // @Hack
-                                let name_bytes = unsafe {
-                                    let zelf: *const Self = self;
-                                    (&*zelf).dir_buf.get_unchecked(name_start..name_end)
-                                };
-
-                                // @StackLarge @Constant
-                                // let name_bytes: SmallVec<[_; 512]> = copy_data(name_bytes);
-                                self.process_file(
-                                    &child_inode,
-                                    name_bytes,
-                                    &work.path_bytes,
-                                    &gitignore_chain,
-                                )?;
-
-                                if self.output_buf.len() > WORKER_FLUSH_BATCH {
-                                    self.flush_output();
-                                }
-                            }
-                            _ => {}
+                    if !self.cli.should_ignore_gitignore() && !gitignore_chain.is_empty() {
+                        if gitignore_chain.is_ignored(&child_path, true) {
+                            self.stats.dirs_skipped_gitignore += 1;
+                            continue;
                         }
                     }
-                }
-            }
 
-            offset += rec_len_usize;
+                    subdirs.push(DirWork {
+                        inode_num: entry.inode,
+                        path_bytes: crate::util::smallvec_into_arc_slice_noshrink(child_path),
+                        gitignore_chain: gitignore_chain.clone(),
+                        depth: work.depth + 1,
+                    });
+                }
+                EXT4_S_IFREG => {
+                    file_entries.push((entry.inode, name_bytes));
+                }
+                _ => {}
+            }
         }
 
-        let keep_local = subdirs.len().min(2);
+        // @BorrowHack
+        unsafe {
+            let file_entries: *const _ = &file_entries;
+            let file_entries = &*file_entries;
+            let zelf: *mut Self = self;
+            (&mut *zelf).process_files_pipelined(file_entries, &work.path_bytes, &gitignore_chain)?;
+        }
+
+        /// Decide how many subdirs to keep local vs push for stealing
+        /// At shallow depths: push more for parallelism
+        /// At deep depths: keep more for cache locality
+        #[inline]
+        fn work_distribution_strategy(depth: u32, subdir_count: usize) -> usize {
+            if subdir_count == 0 {
+                return 0;
+            }
+
+            // @Constant
+            match depth {
+                0..=1 => 1,                           // Root level: push almost everything
+                2..=3 => subdir_count.min(2),         // Shallow: keep 2
+                4..=6 => subdir_count.min(4),         // Medium: keep more
+                _ => subdir_count.min(8),             // Deep: keep most for locality
+            }
+        }
+
+        let keep_local = work_distribution_strategy(work.depth as _, subdirs.len());
         for subdir in subdirs.drain(keep_local..).rev() {
             local.push(WorkItem::Directory(subdir));
         }
 
         for subdir in subdirs {
-            self.process_directory_with_stealing(subdir, local, injector)?;
+            self.dispatch_directory(subdir, local, injector)?;
         }
 
         Ok(())
     }
 
-    fn process_file_batch(&mut self, batch: FileBatchWork) -> io::Result<()> {
-        let _span = tracy::span!("process_file_batch");
+    fn process_files_pipelined(
+        &mut self,
+        files: &[(INodeNum, &[u8])], // (inode_num, name_bytes)
+        parent_path: &[u8],
+        gitignore_chain: &GitignoreChain,
+    ) -> io::Result<()> {
+        if files.is_empty() {
+            return Ok(());
+        }
 
-        let parent_path_len = batch.parent_path.len();
-        let mut offset = 0;
+        let _span = tracy::span!("process_files_pipelined");
 
-        while offset < batch.entries.len() {
-            // Parse entry: [inode(4), name_len(1), name(name_len)]
-            if offset + 5 > batch.entries.len() {
-                break;
+        if let Some(&(first_inode_num, _)) = files.first() {
+            if let Ok(inode) = self.parse_inode(first_inode_num) {
+                let size = (inode.size as usize).min(self.max_file_byte_size());
+                self.prefetch_inode_data(&inode, size);
             }
+        }
 
-            let entry_inode = INodeNum::from_le_bytes([
-                batch.entries[offset],
-                batch.entries[offset + 1],
-                batch.entries[offset + 2],
-                batch.entries[offset + 3],
-            ]);
-            let name_len = batch.entries[offset + 4] as usize;
-            offset += 5;
+        for i in 0..files.len() {
+            let (inode_num, name_bytes) = files[i];
 
-            if offset + name_len > batch.entries.len() {
-                break;
-            }
-
-            let name_bytes = &batch.entries[offset..offset + name_len];
-            offset += name_len;
-
-            // Build full path
-            {
-                self.path_buf.clear();
-                self.path_buf.extend_from_slice(&batch.parent_path);
-                if parent_path_len > 0 && self.path_buf.as_slice()[parent_path_len - 1] != b'/' {
-                    self.path_buf.push(b'/');
+            // Prefetch NEXT file while we process current (SSD parallel requests)
+            if i + 1 < files.len() {
+                let (next_inode_num, _) = files[i + 1];
+                if let Ok(next_inode) = self.parse_inode(next_inode_num) {
+                    let size = (next_inode.size as usize).min(self.max_file_byte_size());
+                    self.prefetch_inode_data(&next_inode, size);
                 }
-                self.path_buf.extend_from_slice(name_bytes);
             }
 
-            let Ok(inode) = self.parse_inode(entry_inode) else {
+            let Ok(inode) = self.parse_inode(inode_num) else {
                 continue;
             };
 
-            self.process_file(
-                &inode,
-                name_bytes,
-                &batch.parent_path,
-                &batch.gitignore_chain,
-            )?;
+            self.process_file(&inode, name_bytes, parent_path, gitignore_chain)?;
 
             if self.output_buf.len() > WORKER_FLUSH_BATCH {
                 self.flush_output();
@@ -1689,7 +1448,7 @@ impl WorkerContext<'_> {
 
             self.path_buf.clear();
             self.path_buf.extend_from_slice(parent_path);
-            if !parent_path.is_empty() {
+            if likely(!parent_path.is_empty()) {
                 self.path_buf.push(b'/');
             }
             self.path_buf.extend_from_slice(file_name);
@@ -1704,16 +1463,12 @@ impl WorkerContext<'_> {
 
         let size = (inode.size as usize).min(self.max_file_byte_size());
 
-        match self.read_file_into_buf(inode, size, BufKind::File, !self.cli.should_search_binary())? {
-            true => {
-                self.stats.files_searched += 1;
-                self.stats.bytes_searched += self.file_buf.len();
-
-                self.find_and_print_matches()?;
-            }
-            false => {
-                self.stats.files_skipped_as_binary_due_to_probe += 1;
-            }
+        if self.read_file_into_buf(inode, size, BufKind::File, !self.cli.should_search_binary())? {
+            self.stats.files_searched += 1;
+            self.stats.bytes_searched += self.file_buf.len();
+            self.find_and_print_matches()?;
+        } else {
+            self.stats.files_skipped_as_binary_due_to_probe += 1;
         }
 
         Ok(())
@@ -1733,6 +1488,7 @@ impl WorkerContext<'_> {
 
         let should_print_color = should_enable_ansi_coloring();
 
+        // @Constant
         let newlines: SmallVec<[usize; 512]> = memchr::memchr_iter(b'\n', buf).collect();
 
         let mut line_start = 0;
@@ -1749,11 +1505,10 @@ impl WorkerContext<'_> {
 
             let line = &buf[line_start..line_end];
 
-            // TODO(#25): Don't call is_match excessively
             let mut iter = self.matcher.find_matches(line).peekable();
 
             if iter.peek().is_some() {
-                // FIRST MATCH IN FILE - do lazy initialization
+                // ------------ FIRST MATCH IN FILE - do lazy initialization
                 if !found_any {
                     found_any = true;
 
@@ -1787,6 +1542,7 @@ impl WorkerContext<'_> {
                     if should_print_color {
                         self.output_buf.extend_from_slice(COLOR_GREEN.as_bytes());
                     }
+
                     // @Cutnpaste from above
                     {
                         let root = self.cli.search_root_path.as_bytes();
@@ -1797,15 +1553,18 @@ impl WorkerContext<'_> {
                         }
                         self.output_buf.extend_from_slice(&self.path_buf);
                     }
+
                     if should_print_color {
                         self.output_buf.extend_from_slice(COLOR_RESET.as_bytes());
                     }
+
                     self.output_buf.extend_from_slice(b":");
                 }
 
                 if should_print_color {
                     self.output_buf.extend_from_slice(COLOR_CYAN.as_bytes());
                 }
+
                 let line_num = line_num_buf.format(line_num);
                 self.output_buf.extend_from_slice(line_num.as_bytes());
                 if should_print_color {
@@ -1836,9 +1595,7 @@ impl WorkerContext<'_> {
                 self.output_buf.push(b'\n');
             }
 
-            if line_end >= buf_len {
-                break;
-            }
+            if line_end >= buf_len { break }
             line_start = line_end + 1;
             line_num += 1;
             newline_idx += 1;
@@ -1919,26 +1676,6 @@ impl RawGrepper {
                 .len(size as _)
                 .map(&file)?
         };
-
-        unsafe {
-            // MADV_SEQUENTIAL: Tell kernel we're reading sequentially
-            // This makes kernel do aggressive readahead and drop pages behind us
-            libc::madvise(
-                device_mmap.as_ptr() as *mut _,
-                device_mmap.len(),
-                libc::MADV_SEQUENTIAL,
-            );
-
-            // MADV_WILLNEED on first chunk to start prefetching immediately
-            // Prefetch first 256MB to get started
-            // @Constant
-            let prefetch_size = (256 * 1024 * 1024).min(device_mmap.len());
-            libc::madvise(
-                device_mmap.as_ptr() as *mut _,
-                prefetch_size,
-                libc::MADV_WILLNEED,
-            );
-        }
 
         let sb_bytes = &device_mmap[
             EXT4_SUPERBLOCK_OFFSET as usize..
@@ -2064,14 +1801,11 @@ impl RawGrepper {
 
                                 match work_item {
                                     WorkItem::Directory(dir_work) => {
-                                        _ = worker.process_directory_with_stealing(
+                                        _ = worker.dispatch_directory(
                                             dir_work,
                                             &local_worker,
                                             injector,
                                         );
-                                    }
-                                    WorkItem::FileBatch(batch_work) => {
-                                        _ = worker.process_file_batch(batch_work);
                                     }
                                 }
 
@@ -2158,11 +1892,11 @@ impl RawGrepper {
                 ]);
                 let name_len = self.dir_buf[offset + 6];
 
-                if rec_len == 0 {
+                if likely(rec_len == 0) {
                     break;
                 }
 
-                if entry_inode != 0 && name_len > 0 {
+                if likely(entry_inode != 0 && name_len > 0) {
                     let name_end = offset + 8 + name_len as usize;
                     if name_end <= offset + rec_len as usize && name_end <= self.dir_buf.len() {
                         let name_bytes = &self.dir_buf[offset + 8..name_end];
@@ -2187,78 +1921,82 @@ impl RawGrepper {
         Ok(inode_num)
     }
 
+    /// Warm up filesystem metadata for faster traversal
     fn warmup_filesystem(&self) {
         let _span = tracy::span!("RawGrepper::warmup_filesystem");
 
-        unsafe {
-            libc::madvise(
-                self.device_mmap.as_ptr() as *mut _,
-                self.device_mmap.len(),
-                libc::MADV_WILLNEED | libc::MADV_SEQUENTIAL,
-            );
-        }
-
-        let block_size = self.sb.block_size as u64;
+        let total_size = self.device_mmap.len();
+        let block_size = self.sb.block_size as usize;
         let blocks_per_group = self.sb.blocks_per_group as u64;
-        let inodes_per_group = self.sb.inodes_per_group as u64;
-        let inode_size = self.sb.inode_size as u64;
-        let desc_size = self.sb.desc_size as u64;
+        let inodes_per_group = self.sb.inodes_per_group as usize;
+        let inode_size = self.sb.inode_size as usize;
+        let desc_size = self.sb.desc_size as usize;
 
-        // Estimate number of block groups from mmap size
-        let total_size = self.device_mmap.len() as u64;
-        let bytes_per_group = blocks_per_group * block_size;
-        let num_groups = total_size.div_ceil(bytes_per_group) as usize;
+        let bytes_per_group = blocks_per_group as usize * block_size;
+        let num_groups = total_size.div_ceil(bytes_per_group);
 
-        // Prefetch group descriptor table (starts after superblock)
+        // GDT offset (after superblock)
         // @Constant
         let gdt_offset = if block_size == 1024 { 2048 } else { block_size };
-        // @Constant
-        let gdt_size = (num_groups as u64 * desc_size).min(1024 * 1024); // Cap at 1MB
+        let gdt_size = num_groups * desc_size;
 
-        // Touch group descriptor table pages
-        // @Constant
-        for i in (0..gdt_size).step_by(4096) {
-            let offset = gdt_offset + i;
-            if offset < total_size {
-                _ = unsafe {
-                    std::ptr::read_volatile(
-                        self.device_mmap.as_ptr().add(offset as usize)
-                    )
-                };
-            }
-        }
+        //
+        // Prefetch group descriptor table
+        //
+        self.prefetch_region(gdt_offset, gdt_size.min(1024 * 1024));
 
-        // Prefetch first few inode tables (where most commonly accessed files are)
-        for group in 0..num_groups.min(64) {
-            let gd_offset = gdt_offset + (group as u64 * desc_size);
-            if gd_offset + 8 > total_size {
+        //
+        // Prefetch inode tables for first N groups,
+        // These contain the inodes we'll need for directory traversal
+        //
+        let groups_to_prefetch = num_groups.min(32); // @Constant
+        
+        for group in 0..groups_to_prefetch {
+            let gd_offset = gdt_offset + group * desc_size;
+            if gd_offset + 12 > total_size {
                 break;
             }
 
-            // Read inode table block number from group descriptor (offset 8 in GD)
             let inode_table_block = u32::from_le_bytes([
-                self.device_mmap[gd_offset as usize +  8],
-                self.device_mmap[gd_offset as usize +  9],
-                self.device_mmap[gd_offset as usize + 10],
-                self.device_mmap[gd_offset as usize + 11],
-            ]);
+                self.device_mmap[gd_offset +  8],
+                self.device_mmap[gd_offset +  9],
+                self.device_mmap[gd_offset + 10],
+                self.device_mmap[gd_offset + 11],
+            ]) as usize;
 
-            let inode_table_offset = inode_table_block as u64 * block_size;
-            // @Constant
-            let inode_table_size = (inodes_per_group * inode_size).min(1024 * 1024);
+            let inode_table_offset = inode_table_block * block_size;
+            let inode_table_size = inodes_per_group * inode_size;
 
-            // Touch inode table pages
             // @Constant
-            for i in (0..inode_table_size).step_by(4096) {
-                let offset = inode_table_offset + i;
-                if offset < total_size {
-                    _ = unsafe {
-                        std::ptr::read_volatile(
-                            self.device_mmap.as_ptr().add(offset as usize)
-                        )
-                    };
-                }
-            }
+            self.prefetch_region(inode_table_offset, inode_table_size.min(512 * 1024));
+        }
+
+        //
+        // Just in case wait for the async prefetch to start
+        //
+        std::thread::yield_now();
+    }
+
+    /// Asynchronously prefetch a memory region
+    #[inline]
+    fn prefetch_region(&self, offset: usize, length: usize) {
+        if offset + length > self.device_mmap.len() {
+            return;
+        }
+
+        //
+        // Align to page boundaries
+        //
+        let page_size = 4096; // @Refactor should we make page-size dynamic?
+        let aligned_offset = offset & !(page_size - 1);
+        let aligned_length = ((offset + length + page_size - 1) & !(page_size - 1)) - aligned_offset;
+
+        unsafe {
+            libc::madvise(
+                self.device_mmap.as_ptr().add(aligned_offset) as *mut _,
+                aligned_length,
+                libc::MADV_WILLNEED,
+            );
         }
     }
 }
@@ -2582,8 +2320,7 @@ impl RawGrepper {
 
         if unlikely(inode_num == 0) {
             return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Invalid inode number 0"
+                io::ErrorKind::InvalidInput, "Invalid inode number 0"
             ));
         }
 
