@@ -1,80 +1,106 @@
-name: Rust CI
+# CI for rawgrep
+# Tests/benchmarks TBD
+
+name: CI
 
 on:
   push:
-    branches: ["master"]
+    branches: [master]
   pull_request:
-    branches: ["master"]
+    branches: [master]
+  schedule:
+    # Catch upstream breakage weekly (nightly changes, dep updates)
+    - cron: "0 7 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # --------------------------
+  # BUILD + CLIPPY
+  # --------------------------
   build:
+    name: Build (${{ matrix.rust }})
+    runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
-        os: [ubuntu-latest]
-        rust: [stable, beta, nightly]
-        features: ["default", "tracy"]
-
-    runs-on: ${{ matrix.os }}
-
+        rust: [stable, beta]
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: actions-rs/toolchain@v1
+      - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ matrix.rust }}
-          profile: minimal
-          override: true
           components: clippy
-
-      - name: Cache Cargo registry
-        uses: actions/cache@v3
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: ${{ runner.os }}-cargo-reg-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Cache Cargo build
-        uses: actions/cache@v3
-        with:
-          path: target
-          key: ${{ runner.os }}-cargo-build-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-build-
-
-      # Build
+      - uses: Swatinem/rust-cache@v2
       - name: Build
-        run: |
-          if [ "${{ matrix.rust }}" = "nightly" ]; then
-            cargo build --no-default-features --features "${{ matrix.features }},use_nightly"
-          else
-            cargo build --no-default-features --features "${{ matrix.features }}"
-          fi
-
-      # Clippy
+        run: cargo build --release
       - name: Clippy
-        run: |
-          if [ "${{ matrix.rust }}" = "nightly" ]; then
-            cargo clippy --no-default-features --features "${{ matrix.features }},use_nightly" --all-targets -- -D warnings
-          else
-            cargo clippy --no-default-features --features "${{ matrix.features }}" --all-targets -- -D warnings
-          fi
-
+        run: cargo clippy --all-targets -- -D warnings
 
   # --------------------------
-  # SECURITY CHECKS
+  # NIGHTLY (with use_nightly feature)
   # --------------------------
-  dep-checks:
+  nightly:
+    name: Build (nightly + use_nightly)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release --features use_nightly
+      - name: Clippy
+        run: cargo clippy --all-targets --features use_nightly -- -D warnings
 
-      - name: Install tools
-        run: cargo install cargo-audit || true
+  # --------------------------
+  # FEATURE COMBINATIONS
+  # --------------------------
+  features:
+    name: Feature powerset
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@cargo-hack
+      - name: Check feature combinations
+        run: |
+          cargo hack check --feature-powerset \
+            --at-least-one-of=small,full \
+            --mutually-exclusive-features=small,full \
+            --mutually-exclusive-features=mimalloc,dhat \
+            --depth=3
 
-      - name: cargo audit
-        run: cargo audit
+  # --------------------------
+  # SECURITY & DEPENDENCY CHECKS
+  # --------------------------
+  security:
+    name: Security audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  deps:
+    name: Dependency check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Can't use --all-features because small/full are mutually exclusive
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check bans licenses sources
+          arguments: --features full

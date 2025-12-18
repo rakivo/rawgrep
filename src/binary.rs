@@ -40,6 +40,8 @@ pub fn is_binary_chunk(data: &[u8]) -> bool {
     }
 }
 
+/// # Safety
+/// Caller's machine supports SSE2
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse2")]
 pub unsafe fn is_binary_chunk_simd_sse2(data: &[u8]) -> bool {

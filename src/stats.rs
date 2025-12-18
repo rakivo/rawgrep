@@ -107,6 +107,12 @@ pub struct ParallelStats {
     pub symlinks_broken: AtomicU64,
 }
 
+impl Default for ParallelStats {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ParallelStats {
     pub fn new() -> Self {
         Self {

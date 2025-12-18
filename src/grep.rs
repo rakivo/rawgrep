@@ -1317,17 +1317,14 @@ impl WorkerContext<'_> {
 
                     if likely(!is_dot_entry(name_bytes)) {
                         // Try to use file_type from directory entry first (fast path)
-                        // file_type constants: 1=REG, 2=DIR, 7=LINK, etc.
                         // If file_type is 0 (unknown), fall back to inode parsing
                         let ft = if file_type != 0 {
-                            // Fast path: use file_type from directory entry
                             match file_type {
                                 1 => Some(EXT4_S_IFREG), // Regular file
                                 2 => Some(EXT4_S_IFDIR), // Directory
-                                _ => None, // Symlink, socket, etc. - skip or handle if needed
+                                _ => None,
                             }
                         } else {
-                            // Slow path: parse inode to get type
                             None
                         };
 
@@ -1339,8 +1336,7 @@ impl WorkerContext<'_> {
                                 offset += rec_len_usize;
                                 continue;
                             };
-                            let ft = child_inode.mode & EXT4_S_IFMT;
-                            ft
+                            child_inode.mode & EXT4_S_IFMT
                         };
 
                         match ft {

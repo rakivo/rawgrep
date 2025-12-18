@@ -6,6 +6,12 @@ pub struct SmallPathBuf<const N: usize = 0x400> {
     buf: SmallVec<[u8; N]>,
 }
 
+impl<const N: usize> Default for SmallPathBuf<N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<const N: usize> Deref for SmallPathBuf<N> {
     type Target = SmallVec<[u8; N]>;
     #[inline(always)]

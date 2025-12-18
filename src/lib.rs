@@ -7,10 +7,14 @@
     clippy::only_used_in_recursion
 )]
 
-use smallvec::SmallVec;
+#[cfg(all(feature = "small", feature = "full"))]
+compile_error!("Cannot enable both `small` and `full` features - choose one!");
+
+#[cfg(not(any(feature = "small", feature = "full")))]
+compile_error!("Must enable either `small` or `full` feature!");
 
 #[cfg(all(feature = "mimalloc", feature = "dhat"))]
-compile_error!("compiling `rawgrep` with both `mimalloc` and `dhat` allocators enabled, choose just one!");
+compile_error!("Cannot enable both `mimalloc` and `dhat` allocators - choose one!");
 
 #[cfg(all(feature = "mimalloc", not(feature = "dhat")))]
 #[global_allocator]
@@ -39,6 +43,8 @@ pub extern crate clap_tiny as clap;
 pub(crate) extern crate regex_full as regex;
 #[cfg(not(feature = "small"))]
 pub(crate) extern crate clap_full as clap;
+
+use smallvec::SmallVec;
 
 pub const COLOR_RED: &str = "\x1b[1;31m";
 pub const COLOR_GREEN: &str = "\x1b[1;32m";
