@@ -8,7 +8,7 @@ use crate::cli::{should_enable_ansi_coloring, Cli};
 use crate::ignore::{Gitignore, GitignoreChain};
 use crate::matcher::Matcher;
 use crate::path_buf::SmallPathBuf;
-use crate::stats::{ParallelStats, Stats};
+use crate::stats::{AtomicStats, Stats};
 use crate::{copy_data, eprintln_red, tracy, COLOR_CYAN, COLOR_GREEN, COLOR_RED, COLOR_RESET};
 use crate::binary::{is_binary_chunk, is_binary_ext};
 use crate::util::{
@@ -35,11 +35,11 @@ use crossbeam_deque::{Injector, Steal, Stealer, Worker as DequeWorker};
 
 pub type INodeNum = u32;
 
-pub const LARGE_DIR_THRESHOLD: usize = 1024; // Split dirs with 1000+ entries
-pub const FILE_BATCH_SIZE: usize = 512; // Process files in batches of 500
+pub const LARGE_DIR_THRESHOLD: usize = 256; // Split dirs with 1000+ entries
+pub const FILE_BATCH_SIZE: usize = 64; // Process files in batches of 500
 
 pub const WORKER_FLUSH_BATCH: usize = 16 * 1024;
-pub const OUTPUTTER_FLUSH_BATCH: usize = 32 * 1024;
+pub const OUTPUTTER_FLUSH_BATCH: usize = 64 * 1024;
 
 pub const BINARY_CONTROL_COUNT: usize = 51; // tuned
 pub const BINARY_PROBE_BYTE_SIZE: usize = 0x1000;
@@ -363,7 +363,7 @@ struct WorkerContext<'a> {
     sb: &'a Ext4SuperBlock,
     cli: &'a Cli,
     matcher: &'a Matcher,
-    stats: &'a ParallelStats,
+    stats: Stats,
 
     output_tx: Sender<Vec<u8>>,
 
@@ -496,6 +496,8 @@ impl WorkerContext<'_> {
         kind: BufKind,
         check_and_stop_if_binary: bool,
     ) -> io::Result<bool> {
+        let _span = tracy::span!("WorkerContext::read_file_into_buf");
+
         let buf = self.get_buf_mut(kind);
         buf.clear();
 
@@ -519,6 +521,8 @@ impl WorkerContext<'_> {
         kind: BufKind,
         check_binary: bool,
     ) -> io::Result<bool> {
+        let _span = tracy::span!("WorkerContext::read_extents");
+
         self.parse_extents(inode)?;
 
         let extent_count = self.extent_buf.len();
@@ -558,6 +562,8 @@ impl WorkerContext<'_> {
         kind: BufKind,
         check_binary: bool,
     ) -> io::Result<bool> {
+        let _span = tracy::span!("WorkerContext::read_direct_blocks");
+
         let mut blocks = SmallVec::<[_; EXT4_BLOCK_POINTERS_COUNT]>::new();
         for &block in inode.blocks.iter().take(EXT4_BLOCK_POINTERS_COUNT) {
             if likely(block != 0) {
@@ -612,6 +618,8 @@ impl WorkerContext<'_> {
 
     #[inline]
     fn prefetch_extent_blocks(&self, extents: &[Ext4Extent], size_to_read: usize) {
+        let _span = tracy::span!("WorkerContext::prefetch_extent_blocks");
+
         let block_size = self.sb.block_size as usize;
         let blocks_needed = size_to_read.div_ceil(block_size);
 
@@ -639,6 +647,8 @@ impl WorkerContext<'_> {
         size_to_read: usize,
         kind: BufKind,
     ) {
+        let _span = tracy::span!("WorkerContext::copy_extents_to_buf");
+
         let mut copied = 0;
 
         for extent in extents {
@@ -1152,14 +1162,14 @@ impl WorkerContext<'_> {
                 .unwrap_or(&work.path_bytes);
 
             if is_common_skip_dir(last_segment) {
-                self.stats.dirs_skipped_common.fetch_add(1, Ordering::Relaxed);
+                self.stats.dirs_skipped_common += 1;
                 return Ok(());
             }
         }
 
         let dir_size = (inode.size as usize).min(self.max_dir_byte_size());
         self.read_file_into_buf(&inode, dir_size, BufKind::Dir, false)?;
-        self.stats.dirs_encountered.fetch_add(1, Ordering::Relaxed);
+        self.stats.dirs_encountered += 1;
 
         let gitignore_chain = if !self.cli.should_ignore_gitignore() {
             if let Some(gi_inode) = self.find_gitignore_inode_in_buf(BufKind::Dir) {
@@ -1356,7 +1366,7 @@ impl WorkerContext<'_> {
                                     // CHECK GITIGNORE FOR THE DIRECTORY
                                     if !self.cli.should_ignore_gitignore() && !gitignore_chain_is_empty {
                                         if gitignore_chain.is_ignored(&child_path, true) {
-                                            self.stats.dirs_skipped_gitignore.fetch_add(1, Ordering::Relaxed);
+                                            self.stats.dirs_skipped_gitignore += 1;
                                             offset += rec_len_usize;
                                             continue; // Skip this entire directory!
                                         }
@@ -1525,7 +1535,7 @@ impl WorkerContext<'_> {
                                     // CHECK GITIGNORE FOR THE DIRECTORY
                                     if !self.cli.should_ignore_gitignore() && !gitignore_chain.is_empty() {
                                         if gitignore_chain.is_ignored(&child_path, true) {
-                                            self.stats.dirs_skipped_gitignore.fetch_add(1, Ordering::Relaxed);
+                                            self.stats.dirs_skipped_gitignore += 1;
                                             offset += rec_len_usize;
                                             continue; // Skip this entire directory!
                                         }
@@ -1554,11 +1564,17 @@ impl WorkerContext<'_> {
                                     inode
                                 };
 
+                                // @Hack
+                                let name_bytes = unsafe {
+                                    let zelf: *const Self = self;
+                                    (&*zelf).dir_buf.get_unchecked(name_start..name_end)
+                                };
+
                                 // @StackLarge @Constant
-                                let name_bytes: SmallVec<[_; 512]> = copy_data(name_bytes);
+                                // let name_bytes: SmallVec<[_; 512]> = copy_data(name_bytes);
                                 self.process_file(
                                     &child_inode,
-                                    &name_bytes,
+                                    name_bytes,
                                     &work.path_bytes,
                                     &gitignore_chain,
                                 )?;
@@ -1654,23 +1670,16 @@ impl WorkerContext<'_> {
     ) -> io::Result<()> {
         let _span = tracy::span!("WorkerContext::process_file_not_batch");
 
-        self.stats.files_encountered.fetch_add(1, Ordering::Relaxed);
+        self.stats.files_encountered += 1;
 
         if !self.cli.should_ignore_all_filters() && inode.size > self.max_file_byte_size() as u64 {
-            self.stats.files_skipped_large.fetch_add(1, Ordering::Relaxed);
+            self.stats.files_skipped_large += 1;
             return Ok(());
         }
 
         if !self.cli.should_search_binary() && is_binary_ext(file_name) {
-            self.stats.files_skipped_as_binary_due_to_ext.fetch_add(1, Ordering::Relaxed);
+            self.stats.files_skipped_as_binary_due_to_ext += 1;
             return Ok(());
-        }
-
-        if !self.cli.should_ignore_gitignore() && !gitignore_chain.is_empty() {
-            if gitignore_chain.is_ignored(self.path_buf.as_ref(), false) {
-                self.stats.files_skipped_gitignore.fetch_add(1, Ordering::Relaxed);
-                return Ok(());
-            }
         }
 
         // Build full path
@@ -1686,20 +1695,24 @@ impl WorkerContext<'_> {
             self.path_buf.extend_from_slice(file_name);
         }
 
+        if !self.cli.should_ignore_gitignore() && !gitignore_chain.is_empty() {
+            if gitignore_chain.is_ignored(self.path_buf.as_ref(), false) {
+                self.stats.files_skipped_gitignore += 1;
+                return Ok(());
+            }
+        }
+
         let size = (inode.size as usize).min(self.max_file_byte_size());
 
         match self.read_file_into_buf(inode, size, BufKind::File, !self.cli.should_search_binary())? {
             true => {
-                self.stats.files_searched.fetch_add(1, Ordering::Relaxed);
-                self.stats.bytes_searched.fetch_add(self.file_buf.len() as u64, Ordering::Relaxed);
+                self.stats.files_searched += 1;
+                self.stats.bytes_searched += self.file_buf.len();
 
-                // Only build display path if we have matches
-                if self.matcher.is_match(&self.file_buf) {
-                    self.find_and_print_matches()?;
-                }
+                self.find_and_print_matches()?;
             }
             false => {
-                self.stats.files_skipped_as_binary_due_to_probe.fetch_add(1, Ordering::Relaxed);
+                self.stats.files_skipped_as_binary_due_to_probe += 1;
             }
         }
 
@@ -1714,22 +1727,25 @@ impl WorkerContext<'_> {
         let buf = &self.file_buf;
         let buf_len = buf.len();
 
-        // @Constant
-        let needed = 4096 + buf_len.min(32 * 1024);
-        if self.output_buf.capacity() - self.output_buf.len() < needed {
-            self.output_buf.reserve(needed);
+        if buf_len == 0 {
+            return Ok(());
         }
-
-        let mut line_num = 1;
-        let mut line_start = 0;
-        let mut line_num_buf = itoa::Buffer::new();
 
         let should_print_color = should_enable_ansi_coloring();
 
-        while line_start < buf_len {
-            let line_end = memchr::memchr(b'\n', &buf[line_start..])
-                .map(|p| line_start + p)
-                .unwrap_or(buf_len);
+        let newlines: SmallVec<[usize; 512]> = memchr::memchr_iter(b'\n', buf).collect();
+
+        let mut line_start = 0;
+        let mut line_num: usize = 1;
+        let mut line_num_buf = itoa::Buffer::new();
+
+        let mut newline_idx = 0;
+        loop {
+            let line_end = if newline_idx < newlines.len() {
+                newlines[newline_idx]
+            } else {
+                buf_len
+            };
 
             let line = &buf[line_start..line_end];
 
@@ -1737,7 +1753,16 @@ impl WorkerContext<'_> {
             let mut iter = self.matcher.find_matches(line).peekable();
 
             if iter.peek().is_some() {
+                // FIRST MATCH IN FILE - do lazy initialization
                 if !found_any {
+                    found_any = true;
+
+                    // @Constant
+                    let needed = 4096 + buf_len.min(32 * 1024);
+                    if self.output_buf.capacity() - self.output_buf.len() < needed {
+                        self.output_buf.reserve(needed);
+                    }
+
                     if !self.cli.jump {
                         if should_print_color {
                             self.output_buf.extend_from_slice(COLOR_GREEN.as_bytes());
@@ -1756,8 +1781,6 @@ impl WorkerContext<'_> {
                         }
                         self.output_buf.extend_from_slice(b":\n");
                     }
-
-                    found_any = true;
                 }
 
                 if self.cli.jump {
@@ -1813,12 +1836,16 @@ impl WorkerContext<'_> {
                 self.output_buf.push(b'\n');
             }
 
-            line_start = if line_end < buf_len { line_end + 1 } else { buf_len };
+            if line_end >= buf_len {
+                break;
+            }
+            line_start = line_end + 1;
             line_num += 1;
+            newline_idx += 1;
         }
 
         if found_any {
-            self.stats.files_contained_matches.fetch_add(1, Ordering::Relaxed);
+            self.stats.files_contained_matches += 1;
         }
 
         Ok(())
@@ -1952,7 +1979,7 @@ impl RawGrepper {
     ) -> io::Result<(Cli, Stats)> {
         let device_mmap = &self.device_mmap;
         let matcher = &self.matcher;
-        let stats = &ParallelStats::new();
+        let stats = &AtomicStats::new();
 
         let active_workers = &AtomicUsize::new(0);
         let quit_now = &AtomicBool::new(false);
@@ -2002,7 +2029,7 @@ impl RawGrepper {
                         sb,
                         cli,
                         matcher,
-                        stats,
+                        stats: Stats::default(),
                         output_tx,
 
                         file_buf: Vec::new(),
@@ -2076,6 +2103,7 @@ impl RawGrepper {
                     }
 
                     worker.flush_output();
+                    worker.stats.merge_into(stats);
                 })
             }).collect::<Vec<_>>();
 

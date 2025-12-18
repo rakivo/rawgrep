@@ -5,14 +5,15 @@ use crate::{writeln_blue, writeln_green};
 
 #[derive(Default)]
 pub struct Stats {
+    pub files_searched: usize,
+    pub files_encountered: usize,
+    pub files_contained_matches: usize,
+
     pub bytes_searched: usize,
 
     pub symlinks_followed: usize,
     pub symlinks_broken: usize,
 
-    pub files_encountered: usize,
-    pub files_searched: usize,
-    pub files_contained_matches: usize,
     pub files_skipped_large: usize,
     pub files_skipped_unreadable: usize,
     pub files_skipped_as_binary_due_to_ext: usize,
@@ -91,7 +92,26 @@ impl Display for Stats {
     }
 }
 
-pub struct ParallelStats {
+impl Stats {
+    #[inline]
+    pub fn merge_into(&self, shared: &AtomicStats) {
+        shared.files_encountered.fetch_add(self.files_encountered as _, Ordering::Relaxed);
+        shared.files_searched.fetch_add(self.files_searched as _, Ordering::Relaxed);
+        shared.bytes_searched.fetch_add(self.bytes_searched as _, Ordering::Relaxed);
+        shared.files_skipped_large.fetch_add(self.files_skipped_large as _, Ordering::Relaxed);
+        shared.files_skipped_as_binary_due_to_ext.fetch_add(self.files_skipped_as_binary_due_to_ext as _, Ordering::Relaxed);
+        shared.files_skipped_as_binary_due_to_probe.fetch_add(self.files_skipped_as_binary_due_to_probe as _, Ordering::Relaxed);
+        shared.files_skipped_gitignore.fetch_add(self.files_skipped_gitignore as _, Ordering::Relaxed);
+        shared.files_contained_matches.fetch_add(self.files_contained_matches as _, Ordering::Relaxed);
+        shared.dirs_encountered.fetch_add(self.dirs_encountered as _, Ordering::Relaxed);
+        shared.dirs_skipped_common.fetch_add(self.dirs_skipped_common as _, Ordering::Relaxed);
+        shared.dirs_skipped_gitignore.fetch_add(self.dirs_skipped_gitignore as _, Ordering::Relaxed);
+        shared.symlinks_followed.fetch_add(self.symlinks_followed as _, Ordering::Relaxed);
+        shared.symlinks_broken.fetch_add(self.symlinks_broken as _, Ordering::Relaxed);
+    }
+}
+
+pub struct AtomicStats {
     pub files_encountered: AtomicU64,
     pub files_searched: AtomicU64,
     pub files_contained_matches: AtomicU64,
@@ -107,13 +127,13 @@ pub struct ParallelStats {
     pub symlinks_broken: AtomicU64,
 }
 
-impl Default for ParallelStats {
+impl Default for AtomicStats {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl ParallelStats {
+impl AtomicStats {
     pub fn new() -> Self {
         Self {
             files_encountered: AtomicU64::new(0),

@@ -124,15 +124,6 @@ impl Matcher {
     }
 
     #[inline(always)]
-    pub fn is_match(&self, haystack: &[u8]) -> bool {
-        match self {
-            Matcher::Literal(finder) => finder.find(haystack).is_some(),
-            Matcher::MultiLiteral(ac) => ac.is_match(haystack),
-            Matcher::Regex(re) => re.is_match(haystack),
-        }
-    }
-
-    #[inline(always)]
     pub fn find_matches<'a>(&'a self, haystack: &'a [u8]) -> MatchIterator<'a> {
         match self {
             Matcher::Literal(finder) => {
