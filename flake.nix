@@ -11,20 +11,18 @@
     crane,
     ...
   }: let
-    supportedSystems = [ "x86_64-linux" "aarch64-linux" ];
-    forAllSystems = nixpkgs.lib.genAttrs supportedSystems;
-    pkgsFor = system: nixpkgs.legacyPackages.${system};
-
     mkRawgrep = system: let
-      pkgs = pkgsFor system;
+      pkgs = nixpkgs.legacyPackages.${system};
       craneLib = crane.mkLib pkgs;
       src = craneLib.cleanCargoSource ./.;
+      
       commonArgs = {
         inherit src;
         strictDeps = true;
         nativeBuildInputs = [ pkgs.capnproto ];
         buildInputs = [];
       };
+      
       cargoArtifacts = craneLib.buildDepsOnly commonArgs;
     in craneLib.buildPackage (commonArgs // {
       inherit cargoArtifacts;
@@ -36,31 +34,43 @@
       };
     });
   in {
-    packages = forAllSystems (system: {
-      default = mkRawgrep system;
-    });
+    packages.x86_64-linux.default = mkRawgrep "x86_64-linux";
+    packages.aarch64-linux.default = mkRawgrep "aarch64-linux";
 
-    apps = forAllSystems (system: {
-      default = {
-        type = "app";
-        program = "${mkRawgrep system}/bin/rawgrep";
-        meta.description = "Run rawgrep";
-      };
-    });
+    apps.x86_64-linux.default = {
+      type = "app";
+      program = "${mkRawgrep "x86_64-linux"}/bin/rawgrep";
+      meta.description = "Run rawgrep";
+    };
+    apps.aarch64-linux.default = {
+      type = "app";
+      program = "${mkRawgrep "aarch64-linux"}/bin/rawgrep";
+      meta.description = "Run rawgrep";
+    };
 
-    devShells = forAllSystems (system: let
-      pkgs = pkgsFor system;
-    in {
-      default = pkgs.mkShell {
-        inputsFrom = [ (mkRawgrep system) ];
-        buildInputs = with pkgs; [
-          rustc
-          cargo
-          rust-analyzer
-          rustfmt
-          clippy
-        ];
-      };
-    });
+    devShells.x86_64-linux.default = let
+      pkgs = nixpkgs.legacyPackages.x86_64-linux;
+    in pkgs.mkShell {
+      inputsFrom = [ (mkRawgrep "x86_64-linux") ];
+      buildInputs = with pkgs; [
+        rustc
+        cargo
+        rust-analyzer
+        rustfmt
+        clippy
+      ];
+    };
+    devShells.aarch64-linux.default = let
+      pkgs = nixpkgs.legacyPackages.aarch64-linux;
+    in pkgs.mkShell {
+      inputsFrom = [ (mkRawgrep "aarch64-linux") ];
+      buildInputs = with pkgs; [
+        rustc
+        cargo
+        rust-analyzer
+        rustfmt
+        clippy
+      ];
+    };
   };
 }
