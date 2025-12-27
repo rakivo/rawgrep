@@ -5,7 +5,8 @@
 ## How is `rawgrep` so fast?
 
 - `rawgrep` reads files DIRECTLY from your partition, completely bypassing the filesystem.
-- `rawgrep` is cache-friendly and insanely memory efficient, simply streaming through your device and outputting the matches.
+- `rawgrep` is cache-friendly and INSANELY memory efficient, simply streaming through your device and outputting the matches.
+- `rawgrep` uses a sophisticated fragment-based caching system (inspired by [nowgrep](https://github.com/asbott/nowgrep)) that learns which files can be skipped for repeated searches.
 
 ## Installation
 
@@ -185,4 +186,4 @@ A: Specify the device manually with `--device=/dev/sdXY`. Use `df -Th` to find y
 
 ## Acknowledgments
 
-Inspired by [ripgrep](https://github.com/BurntSushi/ripgrep) and the need for high-quality software in the big 25.
+Inspired by [ripgrep](https://github.com/BurntSushi/ripgrep) and [nowgrep](https://github.com/asbott/nowgrep), and the need for high-quality software in the big 25.
