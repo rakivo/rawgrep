@@ -238,7 +238,7 @@ mod tests {
         let frags = extract_file_fragments_no_simd(buf, 1000);
 
         // should extract all 4-byte windows (stride=1 for small files)
-        assert!(frags.len() > 0);
+        assert!(frags.is_empty());
         assert!(frags.len() <= buf.len() - 3);
     }
 

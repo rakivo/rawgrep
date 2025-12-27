@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::num::NonZeroUsize;
 
@@ -123,7 +124,7 @@ pub struct Cli {
 
     /// Cache directory (default: ~/.cache/rawgrep/)
     #[arg(long = "cache-dir", value_name = "DIR")]
-    pub cache_dir: Option<std::path::PathBuf>,
+    pub cache_dir: Option<PathBuf>,
 
     /// Ignore existing cache and rebuild from scratch
     #[arg(long = "rebuild-cache")]

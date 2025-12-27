@@ -9,7 +9,7 @@ use memmap2::{Mmap, MmapOptions};
 use crossbeam_channel::unbounded;
 use crossbeam_deque::{Injector, Worker as DequeWorker};
 
-use crate::cache::FragmentCache;
+use crate::cache::{CacheConfig, FragmentCache};
 use crate::cli::Cli;
 use crate::matcher::Matcher;
 use crate::{eprintln_red, tracy};
@@ -127,8 +127,8 @@ impl<'a> RawGrepper<'a> {
         let fragment_hashes = matcher.extract_fragment_hashes();
 
         let cache = if !cli.no_cache && !fragment_hashes.is_empty() {
-            let mut config = crate::cache::CacheConfig::from_memory_mb(cli.cache_size_mb);
-            config.cache_dir = cli.cache_dir.clone();
+            let mut config = CacheConfig::from_memory_mb(cli.cache_size_mb);
+            config.cache_dir = cli.cache_dir.clone(); // @Clone
             config.ignore_cache = cli.rebuild_cache;
 
             match FragmentCache::new(&config) {
