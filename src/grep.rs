@@ -9,6 +9,7 @@ use memmap2::{Mmap, MmapOptions};
 use crossbeam_channel::unbounded;
 use crossbeam_deque::{Injector, Worker as DequeWorker};
 
+use crate::cache::FragmentCache;
 use crate::cli::Cli;
 use crate::matcher::Matcher;
 use crate::{eprintln_red, tracy};
@@ -34,9 +35,13 @@ pub struct RawGrepper<'a> {
     cli: &'a Cli,
 
     device_mmap: Mmap,
+    device_id: u64,
     sb: Ext4SuperBlock,
 
-    matcher: Matcher
+    matcher: Matcher,
+
+    cache: Option<FragmentCache>,
+    fragment_hashes: Vec<u32>,
 }
 
 /// impl block of public API
@@ -84,6 +89,15 @@ impl<'a> RawGrepper<'a> {
             .open(device_path)?;
 
         let size = device_size(&file)?;
+
+        let device_id = unsafe {
+            let mut stat: libc::stat = std::mem::zeroed();
+            if libc::fstat(file.as_raw_fd(), &mut stat) < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            stat.st_dev
+        };
+
         let device_mmap = unsafe {
             MmapOptions::new()
                 .offset(0)
@@ -110,16 +124,43 @@ impl<'a> RawGrepper<'a> {
 
         let sb = Parser::parse_superblock(sb_bytes)?;
 
+        let fragment_hashes = matcher.extract_fragment_hashes();
+
+        let cache = if !cli.no_cache && !fragment_hashes.is_empty() {
+            let mut config = crate::cache::CacheConfig::from_memory_mb(cli.cache_size_mb);
+            config.cache_dir = cli.cache_dir.clone();
+            config.ignore_cache = cli.rebuild_cache;
+
+            match FragmentCache::new(&config) {
+                Ok(mut cache) => {
+                    for &frag_hash in &fragment_hashes {
+                        cache.add_pattern_fragment(frag_hash);
+                    }
+
+                    Some(cache)
+                }
+                Err(e) => {
+                    eprintln!("Warning: Failed to initialize cache: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         Ok(RawGrepper {
             sb,
             cli,
             matcher,
-            device_mmap
+            device_mmap,
+            device_id,
+            cache,
+            fragment_hashes,
         })
     }
 
     pub fn search_parallel(
-        self,
+        mut self,
         root_inode: INodeNum,
         running: &AtomicBool,
         root_gi: Option<Gitignore>,
@@ -154,8 +195,24 @@ impl<'a> RawGrepper<'a> {
 
         self.warmup_filesystem();
 
-        std::thread::scope(|s| {
-            let output_handle = s.spawn(|| {
+        #[cfg(target_os = "linux")]
+        let topology = Arc::new(crate::core_topology::CoreTopology::detect());
+
+        let (all_file_keys, all_file_metas, all_had_matches) = std::thread::scope(|s| {
+            #[cfg(target_os = "linux")]
+            let topology_output = topology.clone();
+
+            let output_handle = s.spawn(move || {
+                // --------- Pin output worker to E-core if available
+                #[cfg(target_os = "linux")]
+                if let Some(core_id) = topology_output.output_core() {
+                    unsafe {
+                        let mut cpuset: libc::cpu_set_t = std::mem::zeroed();
+                        libc::CPU_SET(core_id, &mut cpuset);
+                        libc::sched_setaffinity(0, std::mem::size_of_val(&cpuset), &cpuset);
+                    }
+                }
+
                 OutputWorker {
                     rx: output_rx,
                     writer: BufWriter::with_capacity(128 * 1024, io::stdout()), // @Constant @Tune
@@ -166,21 +223,44 @@ impl<'a> RawGrepper<'a> {
                 let stealers = stealers.clone();
                 let output_tx = output_tx.clone();
                 let sb = &self.sb;
+                let device_id = self.device_id;
                 let cli = &self.cli;
 
+                let cache = self.cache.as_ref();
+                let fragment_hashes = &self.fragment_hashes;
+
+                #[cfg(target_os = "linux")]
+                let topology_worker = topology.clone();
+
                 s.spawn(move || {
+                    // -------- Pin worker to P-core
+                    #[cfg(target_os = "linux")]
+                    {
+                        let core_id = topology_worker.worker_core(worker_id);
+                        unsafe {
+                            let mut cpuset: libc::cpu_set_t = std::mem::zeroed();
+                            libc::CPU_SET(core_id, &mut cpuset);
+                            libc::sched_setaffinity(0, std::mem::size_of_val(&cpuset), &cpuset);
+                        }
+                    }
+
                     let mut worker = WorkerContext {
-                        worker_id: worker_id as _,
-
-                        ext4: Ext4Context { device_mmap, sb },
-
-                        cli,
+                        cache,
+                        fragment_hashes,
+                        ext4: Ext4Context { device_mmap, sb, device_id },
                         matcher,
+                        cli,
+
                         stats: Stats::default(),
-                        output_tx,
+                        buffers: Parser::default(),
 
                         path: SmallPathBuf::default(),
-                        buffers: Parser::default(),
+                        output_tx,
+                        worker_id: worker_id as _,
+
+                        pending_file_keys: Vec::new(),
+                        pending_file_metas: Vec::new(),
+                        pending_had_matches: Vec::new(),
                     };
 
                     worker.init();
@@ -231,7 +311,7 @@ impl<'a> RawGrepper<'a> {
                                     }
                                 }
 
-                                // @Constant
+                                // @Constant @Tune
                                 if idle_iterations < 10 {
                                     std::hint::spin_loop();
                                 } else if idle_iterations < 20 {
@@ -243,24 +323,53 @@ impl<'a> RawGrepper<'a> {
                         }
                     }
 
-                    worker.finish().merge_into(stats);
+                    let (worker_stats, file_keys, file_metas, had_matches) = worker.finish();
+                    worker_stats.merge_into(stats);
+                    (file_keys, file_metas, had_matches)
                 })
             }).collect::<Vec<_>>();
 
+            let mut all_file_keys   = Vec::new();
+            let mut all_file_metas  = Vec::new();
+            let mut all_had_matches = Vec::new();
+
             for handle in handles {
-                _ = handle.join();
+                if let Ok((file_keys, file_metas, had_matches)) = handle.join() {
+                    all_file_keys.extend(file_keys);
+                    all_file_metas.extend(file_metas);
+                    all_had_matches.extend(had_matches);
+                }
             }
 
             drop(output_tx);
             _ = output_handle.join();
+
+            (all_file_keys, all_file_metas, all_had_matches)
         });
+
+        if let Some(cache) = &mut self.cache {
+            if !all_file_keys.is_empty() && let Err(e) = cache.merge_updates(
+                all_file_keys,
+                all_file_metas,
+                &self.fragment_hashes,
+                all_had_matches
+            ) {
+                eprintln!("Error: Failed to merge cache updates: {e}");
+            }
+        }
+
+        if let Some(cache) = &self.cache {
+            if let Err(e) = cache.save_to_disk() {
+                eprintln!("Error: Failed to save cache: {e}");
+            }
+        }
 
         Ok(stats.to_stats())
     }
 
     #[inline(always)]
     const fn ext4_context(&'a self) -> Ext4Context<'a> {
-        Ext4Context { device_mmap: &self.device_mmap, sb: &self.sb }
+        Ext4Context { device_mmap: &self.device_mmap, sb: &self.sb, device_id: self.device_id }
     }
 
     /// Resolve a path like "/usr/bin" or "etc" into an inode number.
@@ -325,13 +434,13 @@ impl<'a> RawGrepper<'a> {
         //
         // Prefetch group descriptor table
         //
-        Parser::prefetch_region(gdt_offset, gdt_size.min(1024 * 1024), &ext4);
+        Parser::prefetch_region(gdt_offset, gdt_size.min(4 * 1024 * 1024), &ext4); // @Constant @Tune
 
         //
         // Prefetch inode tables for first N groups,
         // These contain the inodes we'll need for directory traversal
         //
-        let groups_to_prefetch = num_groups.min(32); // @Constant
+        let groups_to_prefetch = num_groups.min(128); // @Constant @Tune
 
         for group in 0..groups_to_prefetch {
             let gd_offset = gdt_offset + group * desc_size;
@@ -350,7 +459,7 @@ impl<'a> RawGrepper<'a> {
             let inode_table_size = inodes_per_group * inode_size;
 
             // @Constant
-            Parser::prefetch_region(inode_table_offset, inode_table_size.min(512 * 1024), &ext4);
+            Parser::prefetch_region(inode_table_offset, inode_table_size.min(2 * 1024 * 1024), &ext4);
         }
 
         //

@@ -6,20 +6,21 @@ use aho_corasick::AhoCorasick;
 
 use crate::{cli::Cli, tracy};
 
+const REGEX_METACHARS: &str = ".*+?[]{}()|\\^$";
+
 #[inline]
-fn extract_literal(pattern: &str) -> Option<Vec<u8>> {
+fn extract_literal(pattern: &str) -> Option<Box<[u8]>> {
     let trimmed = pattern.trim_start_matches('^').trim_end_matches('$');
 
-    // Check for regex metacharacters
-    if trimmed.chars().any(|c| ".*+?[]{}()|\\^$".contains(c)) {
+    if trimmed.chars().any(|c| REGEX_METACHARS.contains(c)) {
         return None;
     }
 
-    Some(trimmed.as_bytes().to_vec())
+    Some(trimmed.as_bytes().into())
 }
 
 #[inline]
-fn extract_alternation_literals(pattern: &str) -> Option<Vec<Vec<u8>>> {
+fn extract_alternation_literals(pattern: &str) -> Option<Box<[Box<[u8]>]>> {
     if !pattern.contains('|') {
         return None;
     }
@@ -28,14 +29,14 @@ fn extract_alternation_literals(pattern: &str) -> Option<Vec<Vec<u8>>> {
     let mut literals = Vec::new();
 
     for part in parts {
-        let trimmed = part.trim_start_matches('^').trim_end_matches('$');
-        if trimmed.chars().any(|c| ".*+?[]{}()\\^$".contains(c)) {
-            return None; // Contains regex metacharacters
-        }
-        literals.push(trimmed.as_bytes().to_vec());
+        let Some(literal) = extract_literal(part) else {
+            continue;
+        };
+
+        literals.push(literal);
     }
 
-    Some(literals)
+    Some(literals.into())
 }
 
 // NOTE:
@@ -78,9 +79,15 @@ impl<'a> Iterator for MatchIterator<'a> {
 // NOTE: Read the `NOTE` above
 #[allow(clippy::large_enum_variant)]
 pub enum Matcher {
-    Literal(Finder<'static>),  // Single literal: "error"
-    MultiLiteral(AhoCorasick), // Multiple: "error|warning|fatal"
-    Regex(Regex),              // Complex patterns
+    Literal(Finder<'static>),
+    MultiLiteral {
+        ac: AhoCorasick,
+        patterns: Box<[Box<[u8]>]>,  // Keep original patterns for fragment extraction
+    },
+    Regex {
+        re: Regex,
+        pattern: Box<str>,  // Keep original pattern for literal extraction
+    },
 }
 
 impl Matcher {
@@ -100,27 +107,31 @@ impl Matcher {
 
         // Try alternation extraction: "foo|bar|baz"
         if let Some(literals) = extract_alternation_literals(pattern) {
-            return AhoCorasick::builder()
+            let ac = AhoCorasick::builder()
                 .match_kind(aho_corasick::MatchKind::LeftmostFirst)
                 .build(&literals)
-                .map(Matcher::MultiLiteral)
                 .map_err(|e| {
                     io::Error::new(
                         io::ErrorKind::InvalidInput,
                         format!("invalid alternation pattern '{pattern}': {e}")
                     )
-                });
+                })?;
+
+            return Ok(Matcher::MultiLiteral {
+                ac,
+                patterns: literals,
+            });
         }
 
-        // Fallback to regex
-        Regex::new(pattern)
-            .map(Matcher::Regex)
-            .map_err(|e| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("invalid regex '{pattern}': {e}")
-                )
-            })
+        // fallback to regex
+        let re = Regex::new(pattern).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid regex '{pattern}': {e}")
+            )
+        })?;
+
+        Ok(Matcher::Regex { re, pattern: pattern.to_owned().into() })
     }
 
     #[inline(always)]
@@ -132,12 +143,61 @@ impl Matcher {
                     needle_len: finder.needle().len(),
                 }
             }
-            Matcher::MultiLiteral(ac) => {
+            Matcher::MultiLiteral { ac, .. } => {
                 MatchIterator::MultiLiteral(ac.find_iter(haystack))
             }
-            Matcher::Regex(re) => {
+            Matcher::Regex { re, .. } => {
                 MatchIterator::Regex(re.find_iter(haystack))
             }
         }
     }
+
+    /// Extract 4-byte fragment hashes from pattern for cache
+    pub fn extract_fragment_hashes(&self) -> Vec<u32> {
+        use nohash_hasher::IntSet;
+
+        match self {
+            Matcher::Literal(finder) => {
+                crate::fragments::extract_pattern_fragments(finder.needle())
+            }
+            Matcher::MultiLiteral { patterns, .. } => {
+                // Extract fragments from all alternation patterns
+                let mut all_fragments = IntSet::default();
+                for pattern in patterns {
+                    let frags = crate::fragments::extract_pattern_fragments(pattern);
+                    all_fragments.extend(frags);
+                }
+                all_fragments.into_iter().collect()
+            }
+            Matcher::Regex { pattern, .. } => {
+                // Extract literal substrings from regex
+                extract_regex_literals(pattern)
+            }
+        }
+    }
+}
+
+/// Extract literal substrings from regex pattern for cache
+fn extract_regex_literals(pattern: &str) -> Vec<u32> {
+    use nohash_hasher::IntSet;
+
+    // Split on common regex operators to find literal parts
+    let parts = pattern
+        .split(|c| ".*+?{[(".contains(c))
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>();
+
+    let mut all_fragments = IntSet::default();
+
+    for part in parts {
+        // Skip if part has more regex chars
+        if part.chars().any(|c| "\\^$|)]}>".contains(c)) {
+            continue;
+        }
+
+        let frags = crate::fragments::extract_pattern_fragments(part.as_bytes());
+        all_fragments.extend(frags);
+    }
+
+    all_fragments.into_iter().collect()
 }

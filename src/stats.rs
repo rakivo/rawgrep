@@ -19,6 +19,7 @@ pub struct Stats {
     pub files_skipped_as_binary_due_to_ext: usize,
     pub files_skipped_as_binary_due_to_probe: usize,
     pub files_skipped_gitignore: usize,
+    pub files_skipped_by_cache: usize,
 
     pub dirs_skipped_common: usize,
     pub dirs_skipped_gitignore: usize,
@@ -53,6 +54,7 @@ impl Display for Stats {
         file_row!("Skipped (binary probe)", self.files_skipped_as_binary_due_to_probe);
         file_row!("Skipped (unreadable)", self.files_skipped_unreadable);
         file_row!("Skipped (gitignore)", self.files_skipped_gitignore);
+        file_row!("Skipped (cache)", self.files_skipped_by_cache);
 
         if total_symlinks > 0 {
             writeln_blue!(f, "\nSymlinks Summary:")?;
@@ -102,6 +104,7 @@ impl Stats {
         shared.files_skipped_as_binary_due_to_ext.fetch_add(self.files_skipped_as_binary_due_to_ext as _, Ordering::Relaxed);
         shared.files_skipped_as_binary_due_to_probe.fetch_add(self.files_skipped_as_binary_due_to_probe as _, Ordering::Relaxed);
         shared.files_skipped_gitignore.fetch_add(self.files_skipped_gitignore as _, Ordering::Relaxed);
+        shared.files_skipped_by_cache.fetch_add(self.files_skipped_by_cache as _, Ordering::Relaxed);
         shared.files_contained_matches.fetch_add(self.files_contained_matches as _, Ordering::Relaxed);
         shared.dirs_encountered.fetch_add(self.dirs_encountered as _, Ordering::Relaxed);
         shared.dirs_skipped_common.fetch_add(self.dirs_skipped_common as _, Ordering::Relaxed);
@@ -123,6 +126,7 @@ pub struct AtomicStats {
     pub files_skipped_as_binary_due_to_ext: AtomicU64,
     pub files_skipped_as_binary_due_to_probe: AtomicU64,
     pub files_skipped_gitignore: AtomicU64,
+    pub files_skipped_by_cache: AtomicU64,
     pub symlinks_followed: AtomicU64,
     pub symlinks_broken: AtomicU64,
 }
@@ -147,6 +151,7 @@ impl AtomicStats {
             files_skipped_as_binary_due_to_ext: AtomicU64::new(0),
             files_skipped_as_binary_due_to_probe: AtomicU64::new(0),
             files_skipped_gitignore: AtomicU64::new(0),
+            files_skipped_by_cache: AtomicU64::new(0),
             symlinks_followed: AtomicU64::new(0),
             symlinks_broken: AtomicU64::new(0),
         }
@@ -166,6 +171,7 @@ impl AtomicStats {
             files_skipped_as_binary_due_to_ext: self.files_skipped_as_binary_due_to_ext.load(Ordering::Relaxed) as _,
             files_skipped_as_binary_due_to_probe: self.files_skipped_as_binary_due_to_probe.load(Ordering::Relaxed) as _,
             files_skipped_gitignore: self.files_skipped_gitignore.load(Ordering::Relaxed) as _,
+            files_skipped_by_cache: self.files_skipped_by_cache.load(Ordering::Relaxed) as _,
             symlinks_followed: self.symlinks_followed.load(Ordering::Relaxed) as _,
             symlinks_broken: self.symlinks_broken.load(Ordering::Relaxed) as _,
         }

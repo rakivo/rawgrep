@@ -55,7 +55,9 @@ itoa = { version = "1.0.15", default-features = false }
 fastrand = { version = "2.3.0", default-features = false, features = ["std"] }
 bytemuck = { version = "1.24", features = ["derive"] }
 dhat = { version = "0.3.3", default-features = false, optional = true }
-phf = { version = "0.13.1", features = ["macros"] }
+serde = { version = "1.0", features = ["derive"] }
+nohash-hasher = "0.2.0"
+rkyv = { version = "0.8.12", features = [] }
 
 [build-dependencies]
 rustc_version = "0.2"

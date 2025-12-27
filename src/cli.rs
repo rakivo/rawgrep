@@ -112,6 +112,22 @@ pub struct Cli {
             .unwrap_or(unsafe { NonZeroUsize::new_unchecked(1) })
     )]
     pub threads: NonZeroUsize,
+
+    /// Disable fragment cache
+    #[arg(long = "no-cache")]
+    pub no_cache: bool,
+
+    /// Fragment cache memory budget in MB (default: 100)
+    #[arg(long = "cache-size", default_value = "100", value_name = "MB")]
+    pub cache_size_mb: usize,
+
+    /// Cache directory (default: ~/.cache/rawgrep/)
+    #[arg(long = "cache-dir", value_name = "DIR")]
+    pub cache_dir: Option<std::path::PathBuf>,
+
+    /// Ignore existing cache and rebuild from scratch
+    #[arg(long = "rebuild-cache")]
+    pub rebuild_cache: bool,
 }
 
 impl Cli {

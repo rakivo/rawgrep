@@ -4,6 +4,7 @@
 // TODO(#1): Implement symlinks
 // TODO(#24): Support for searching in large file(s). (detect that)
 
+use crate::cache::{FileKey, FileMeta, FragmentCache};
 use crate::cli::{should_enable_ansi_coloring, Cli};
 use crate::ignore::{Gitignore, GitignoreChain};
 use crate::matcher::Matcher;
@@ -84,11 +85,12 @@ impl OutputWorker {
 
         while let Ok(buf) = self.rx.recv() {
             _ = self.writer.write_all(&buf);
-            // Flush periodically, not every time
+
             if self.writer.buffer().len() > OUTPUTTER_FLUSH_BATCH {
                 _ = self.writer.flush();
             }
         }
+
         _ = self.writer.flush();
     }
 }
@@ -111,16 +113,23 @@ struct ParsedEntry {
 }
 
 pub struct WorkerContext<'a> {
-    pub worker_id: u16,
+    pub cache: Option<&'a FragmentCache>,     // 8 bytes
+    pub fragment_hashes: &'a [u32],           // 16 bytes
+    pub ext4: Ext4Context<'a>,                // 16 bytes
+    pub matcher: &'a Matcher,                 // 8 bytes
+    pub cli: &'a Cli,                         // 8 bytes
+    // ----------- 56 bytes
+
     pub stats: Stats,
-
-    pub ext4: Ext4Context<'a>,
-    pub cli: &'a Cli,
-    pub matcher: &'a Matcher,
-
     pub buffers: Parser,
+
     pub path: SmallPathBuf,
     pub output_tx: Sender<Vec<u8>>,
+    pub worker_id: u16,
+
+    pub pending_file_keys: Vec<FileKey>,
+    pub pending_file_metas: Vec<FileMeta>,
+    pub pending_had_matches: Vec<bool>,
 }
 
 impl<'a> WorkerContext<'a> {
@@ -131,9 +140,14 @@ impl<'a> WorkerContext<'a> {
     }
 
     #[inline(always)]
-    pub fn finish(mut self) -> Stats {
+    pub fn finish(mut self) -> (Stats, Vec<FileKey>, Vec<FileMeta>, Vec<bool>) {
         self.flush_output();
-        self.stats
+        (
+            self.stats,
+            self.pending_file_keys,
+            self.pending_file_metas,
+            self.pending_had_matches
+        )
     }
 
     #[inline(always)]
@@ -490,12 +504,36 @@ impl WorkerContext<'_> {
             }
         }
 
+        let cache_key = if self.cache.is_some() {
+            Some((
+                FileKey::new(self.ext4.device_id, inode.inode_num),
+                FileMeta::new(inode.mtime_sec, inode.size),
+            ))
+        } else {
+            None
+        };
+
+        if let Some(cache) = self.cache {
+            let (file_key, file_meta) = unsafe { cache_key.unwrap_unchecked() };
+            if cache.can_skip_file(file_key, file_meta, self.fragment_hashes) {
+                self.stats.files_skipped_by_cache += 1;
+                return Ok(());
+            }
+        }
+
         let size = (inode.size as usize).min(self.max_file_byte_size());
 
         if self.buffers.read_file_into_buf(inode, size, BufKind::File, !self.cli.should_search_binary(), &self.ext4)? {
             self.stats.files_searched += 1;
             self.stats.bytes_searched += self.buffers.file.len();
-            self.find_and_print_matches()?;
+
+            let had_matches = self.find_and_print_matches()?;
+
+            if let Some((file_key, file_meta)) = cache_key {
+                self.pending_file_keys.push(file_key);
+                self.pending_file_metas.push(file_meta);
+                self.pending_had_matches.push(had_matches);
+            }
         } else {
             self.stats.files_skipped_as_binary_due_to_probe += 1;
         }
@@ -504,7 +542,7 @@ impl WorkerContext<'_> {
     }
 
     #[inline]
-    fn find_and_print_matches(&mut self) -> io::Result<()> {
+    fn find_and_print_matches(&mut self) -> io::Result<bool> {
         let _span = tracy::span!("find_and_print_matches_fast");
 
         let mut found_any = false;
@@ -512,7 +550,7 @@ impl WorkerContext<'_> {
         let buf_len = buf.len();
 
         if buf_len == 0 {
-            return Ok(());
+            return Ok(false);
         }
 
         let should_print_color = should_enable_ansi_coloring();
@@ -635,7 +673,7 @@ impl WorkerContext<'_> {
             self.stats.files_contained_matches += 1;
         }
 
-        Ok(())
+        Ok(found_any)
     }
 }
 

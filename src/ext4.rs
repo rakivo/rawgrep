@@ -67,9 +67,11 @@ impl Display for Ext4SuperBlock {
 
 #[derive(Clone)]
 pub struct Ext4Inode {
+    pub inode_num: u64,
     pub mode: u16,
     pub size: u64,
     pub flags: u32,
+    pub mtime_sec: i64,
     pub blocks: [u32; 15],
 }
 

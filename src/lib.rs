@@ -36,6 +36,9 @@ pub mod worker;
 pub mod binary;
 pub mod matcher;
 pub mod path_buf;
+pub mod cache;
+pub mod fragments;
+pub mod core_topology;
 
 #[cfg(feature = "small")]
 pub extern crate regex_tiny as regex;

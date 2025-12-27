@@ -29,6 +29,7 @@ use crate::util::{likely, unlikely};
 pub struct Ext4Context<'a> {
     pub device_mmap: &'a Mmap,
     pub sb: &'a Ext4SuperBlock,
+    pub device_id: u64,
 }
 
 #[derive(Copy, Clone)]
@@ -292,6 +293,7 @@ impl Parser {
         let mode = u16::from_le(raw.mode);
         let size_low = u32::from_le(raw.size_lo);
         let flags = u32::from_le(raw.flags);
+        let mtime_sec = u32::from_le(raw.mtime) as i64;
 
         let size_high = if ext4.sb.inode_size > 128 {
             u32::from_le(raw.size_high)
@@ -324,7 +326,14 @@ impl Parser {
             u32::from_le_bytes([block_bytes[56], block_bytes[57], block_bytes[58], block_bytes[59]]),
         ];
 
-        Ok(Ext4Inode { mode, size, flags, blocks })
+        Ok(Ext4Inode {
+            inode_num: inode_num as u64,
+            mode,
+            size,
+            flags,
+            mtime_sec,
+            blocks,
+        })
     }
 
     #[inline]
