@@ -691,6 +691,10 @@ impl FragmentCache {
         Ok(dir.join("fragment_cache.bin"))
     }
 
+    /// Ownership of the cache directory/file may fuck up and error out
+    /// when we try to write/read from it.
+    ///
+    /// So this function is for preventing that.
     #[cfg(unix)]
     fn fix_ownership(path: &Path) -> io::Result<()> {
         use std::{ffi::CString, os::unix::ffi::OsStrExt};
