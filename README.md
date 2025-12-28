@@ -170,7 +170,7 @@ Works exactly like `'grep-find` but better.
 A: Yes. The tool only reads data and never writes. The `CAP_DAC_READ_SEARCH` capability is narrowly scoped.
 
 **Q: Is rawgrep faster than [ripgrep](https://github.com/BurntSushi/ripgrep)?**
-A: Cold cache: yes. Hot cache: rawgrep wins on large datasets, ripgrep may edge ahead on small ones. eBPF daemon mode is planned to address this.
+A: Yeah.
 
 **Q: Why am I missing some matches?**
 A: By default, rawgrep respects `.gitignore` and skips binary/large files. Use `-u` to ignore `.gitignore`, `-uu` to also search binaries, or `-uuu` to search everything. This matches ripgrep's behavior.
