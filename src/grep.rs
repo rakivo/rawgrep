@@ -11,100 +11,33 @@ use crossbeam_deque::{Injector, Worker as DequeWorker};
 use crate::cache::{CacheConfig, FragmentCache};
 use crate::cli::Cli;
 use crate::matcher::Matcher;
+use crate::parser::{BufKind, FileId, FileNode, Parser, RawFs};
 use crate::{eprintln_red, tracy};
 use crate::path_buf::SmallPathBuf;
 use crate::stats::{AtomicStats, Stats};
 use crate::ignore::{Gitignore, GitignoreChain};
-use crate::parser::{BufKind, Ext4Context, Parser};
 use crate::worker::{DirWork, OutputWorker, WorkItem, WorkerContext};
 use crate::ext4::{
-    Ext4SuperBlock,
-    INodeNum,
+    Ext4Fs,
     BLKGETSIZE64,
     EXT4_MAGIC_OFFSET,
-    EXT4_ROOT_INODE,
     EXT4_SUPERBLOCK_OFFSET,
     EXT4_SUPERBLOCK_SIZE,
     EXT4_SUPER_MAGIC,
-    EXT4_S_IFDIR,
-    EXT4_S_IFMT
 };
 
-pub struct RawGrepper<'a> {
+pub struct RawGrepper<'a, F: RawFs> {
     cli: &'a Cli,
-
-    device_mmap: Mmap,
-    device_id: u64,
-    sb: Ext4SuperBlock,
-
+    fs: F,
     matcher: Matcher,
-
     cache: Option<FragmentCache>,
     fragment_hashes: Vec<u32>,
 }
 
-/// impl block of public API
-impl<'a> RawGrepper<'a> {
-    pub fn new(device_path: &str, cli: &'a Cli) -> io::Result<Self> {
-        #[inline]
-        fn device_size(fd: &File) -> io::Result<u64> {
-            let mut size = 0u64;
-            let res = unsafe {
-                libc::ioctl(fd.as_raw_fd(), BLKGETSIZE64, &mut size)
-            };
-
-            if res < 0 {
-                return Err(io::Error::last_os_error());
-            }
-
-            Ok(size)
-        }
-
-        let matcher = match Matcher::new(cli) {
-            Ok(m) => m,
-            Err(e) => {
-                match e.kind() {
-                    io::ErrorKind::InvalidInput => {
-                        eprintln_red!("error: invalid pattern '{pattern}'", pattern = cli.pattern);
-                        eprintln_red!("tip: test your regex with `grep -E` or a regex tester before running");
-                        eprintln_red!("patterns must be valid regex or a literal/alternation extractable form");
-                    }
-                    io::ErrorKind::NotFound => {
-                        // unlikely for this constructor, but here for completeness
-                        eprintln_red!("error: referenced something that wasn't found: {e}");
-                    }
-                    _ => {
-                        eprintln_red!("error: failed to build matcher: {e}");
-                    }
-                }
-
-                std::process::exit(1);
-            }
-        };
-
-        let file = OpenOptions::new()
-            .read(true)
-            .write(false)
-            .open(device_path)?;
-
-        let size = device_size(&file)?;
-
-        let device_id = unsafe {
-            let mut stat: libc::stat = std::mem::zeroed();
-            if libc::fstat(file.as_raw_fd(), &mut stat) < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            stat.st_dev
-        };
-
-        let device_mmap = unsafe {
-            MmapOptions::new()
-                .offset(0)
-                .len(size as _)
-                .map(&file)?
-        };
-
-        let sb_bytes = &device_mmap[
+/// impl block for ext4-specific construction
+impl<'a> RawGrepper<'a, Ext4Fs<'a>> {
+    pub fn new_ext4(device_path: &str, cli: &'a Cli, mmap: &'a Mmap) -> io::Result<Self> {
+        let sb_bytes = &mmap[
             EXT4_SUPERBLOCK_OFFSET as usize..
             EXT4_SUPERBLOCK_OFFSET as usize + EXT4_SUPERBLOCK_SIZE
         ];
@@ -121,13 +54,57 @@ impl<'a> RawGrepper<'a> {
             ));
         }
 
-        let sb = Parser::parse_superblock(sb_bytes)?;
+        let sb = Ext4Fs::parse_superblock(sb_bytes)?;
+
+        let file = OpenOptions::new()
+            .read(true)
+            .write(false)
+            .open(device_path)?;
+
+        let device_id = unsafe {
+            let mut stat: libc::stat = std::mem::zeroed();
+            if libc::fstat(file.as_raw_fd(), &mut stat) < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            stat.st_dev
+        };
+
+        let max_block = (mmap.len() / sb.block_size as usize) as u64;
+        let fs = Ext4Fs { mmap, sb, device_id, max_block };
+
+        Self::new_with_fs(cli, fs)
+    }
+}
+
+/// impl block for generic RawFs
+impl<'a, F: RawFs> RawGrepper<'a, F> {
+    pub fn new_with_fs(cli: &'a Cli, fs: F) -> io::Result<Self> {
+        let matcher = match Matcher::new(cli) {
+            Ok(m) => m,
+            Err(e) => {
+                match e.kind() {
+                    io::ErrorKind::InvalidInput => {
+                        eprintln_red!("error: invalid pattern '{pattern}'", pattern = cli.pattern);
+                        eprintln_red!("tip: test your regex with `grep -E` or a regex tester before running");
+                        eprintln_red!("patterns must be valid regex or a literal/alternation extractable form");
+                    }
+                    io::ErrorKind::NotFound => {
+                        eprintln_red!("error: referenced something that wasn't found: {e}");
+                    }
+                    _ => {
+                        eprintln_red!("error: failed to build matcher: {e}");
+                    }
+                }
+
+                std::process::exit(1);
+            }
+        };
 
         let fragment_hashes = matcher.extract_fragment_hashes();
 
         let cache = if !cli.no_cache && !fragment_hashes.is_empty() {
             let mut config = CacheConfig::from_memory_mb(cli.cache_size_mb);
-            config.cache_dir = cli.cache_dir.clone(); // @Clone
+            config.cache_dir = cli.cache_dir.clone();
             config.ignore_cache = cli.rebuild_cache;
 
             match FragmentCache::new(&config) {
@@ -147,24 +124,16 @@ impl<'a> RawGrepper<'a> {
             None
         };
 
-        Ok(RawGrepper {
-            sb,
-            cli,
-            matcher,
-            device_mmap,
-            device_id,
-            cache,
-            fragment_hashes,
-        })
+        Ok(RawGrepper { cli, fs, matcher, cache, fragment_hashes })
     }
 
-    pub fn search_parallel(
+    pub fn search(
         mut self,
-        root_inode: INodeNum,
+        root_file_id: FileId,
         running: &AtomicBool,
         root_gi: Option<Gitignore>,
     ) -> io::Result<Stats> {
-        let device_mmap = &self.device_mmap;
+        let fs = &self.fs;
         let matcher = &self.matcher;
         let stats = &AtomicStats::new();
 
@@ -174,13 +143,13 @@ impl<'a> RawGrepper<'a> {
 
         let injector = &Injector::new();
         injector.push(WorkItem::Directory(DirWork {
-            inode_num: root_inode,
+            file_id: root_file_id,
             path_bytes: Arc::default(),
             gitignore_chain: root_gi.map(GitignoreChain::from_root).unwrap_or_default(),
             depth: 0,
         }));
 
-        let threads = self.cli.threads.get(); // @Constant @Tune
+        let threads = self.cli.threads.get();
 
         let workers = (0..threads)
             .map(|_| DequeWorker::new_lifo())
@@ -201,7 +170,6 @@ impl<'a> RawGrepper<'a> {
             let topology_output = &topology;
 
             let output_handle = s.spawn(move || {
-                // --------- Pin output worker to E-core if available
                 #[cfg(target_os = "linux")]
                 if let Some(core_id) = topology_output.output_core() {
                     unsafe {
@@ -213,15 +181,13 @@ impl<'a> RawGrepper<'a> {
 
                 OutputWorker {
                     rx: output_rx,
-                    writer: BufWriter::with_capacity(128 * 1024, io::stdout()), // @Constant @Tune
+                    writer: BufWriter::with_capacity(128 * 1024, io::stdout()),
                 }.run();
             });
 
             let handles = workers.into_iter().enumerate().map(|(worker_id, local_worker)| {
                 let stealers = &stealers;
                 let output_tx = output_tx.clone();
-                let sb = &self.sb;
-                let device_id = self.device_id;
                 let cli = &self.cli;
 
                 let cache = self.cache.as_ref();
@@ -231,7 +197,6 @@ impl<'a> RawGrepper<'a> {
                 let topology_worker = &topology;
 
                 s.spawn(move || {
-                    // -------- Pin worker to P-core
                     #[cfg(target_os = "linux")]
                     {
                         let core_id = topology_worker.worker_core(worker_id);
@@ -245,12 +210,12 @@ impl<'a> RawGrepper<'a> {
                     let worker = WorkerContext {
                         cache,
                         fragment_hashes,
-                        ext4: Ext4Context { device_mmap, sb, device_id },
+                        fs,
                         matcher,
                         cli,
 
                         stats: Stats::default(),
-                        buffers: Parser::default(),
+                        parser: Parser::default(),
 
                         path: SmallPathBuf::default(),
                         output_tx,
@@ -313,104 +278,86 @@ impl<'a> RawGrepper<'a> {
         Ok(stats.to_stats())
     }
 
-    #[inline(always)]
-    const fn ext4_context(&'a self) -> Ext4Context<'a> {
-        Ext4Context { device_mmap: &self.device_mmap, sb: &self.sb, device_id: self.device_id }
-    }
-
-    /// Resolve a path like "/usr/bin" or "etc" into an inode number.
-    /// Uses a temporary WorkerContext to reuse existing ext4 parsing logic.
-    pub fn try_resolve_path_to_inode(&self, path: &str) -> io::Result<INodeNum> {
-        let _span = tracy::span!("RawGrepper::try_resolve_path_to_inode");
+    /// Resolve a path like "/usr/bin" or "etc" into a file ID.
+    #[inline]
+    pub fn try_resolve_path_to_file_id(&self, path: &str) -> io::Result<FileId> {
+        let _span = tracy::span!("RawGrepper::try_resolve_path_to_file_id");
 
         if path == "/" || path.is_empty() {
-            return Ok(EXT4_ROOT_INODE);
+            return Ok(self.fs.root_id());
         }
 
-        let ext4 = self.ext4_context();
-        let mut buffers = Parser::default();
-
-        let mut inode_num = EXT4_ROOT_INODE;
+        let mut parser = Parser::default();
+        let mut file_id = self.fs.root_id();
 
         for part in path.split('/').filter(|p| !p.is_empty()) {
-            let inode = Parser::parse_inode(inode_num, &ext4)?;
+            let node = self.fs.parse_node(file_id)?;
 
-            if inode.mode & EXT4_S_IFMT != EXT4_S_IFDIR {
+            if !node.is_dir() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     format!("{path} is not a directory"),
                 ));
             }
 
-            let dir_size = inode.size as usize;
-            buffers.read_file_into_buf(&inode, dir_size, BufKind::Dir, false, &ext4)?;
+            let dir_size = node.size() as usize;
+            self.fs.read_file_content(&mut parser, &node, dir_size, BufKind::Dir, false)?;
 
-            inode_num = buffers.find_entry_inode(
-                part.as_bytes()
+            file_id = parser.find_file_id_in_buf(
+                &self.fs,
+                part.as_bytes(),
+                BufKind::Dir,
             ).ok_or_else(|| io::Error::new(
                 io::ErrorKind::NotFound,
                 format!("Component '{part}' not found"),
             ))?;
         }
 
-        Ok(inode_num)
+        Ok(file_id)
     }
 
     /// Warm up filesystem metadata for faster traversal
+    #[inline]
     fn warmup_filesystem(&self) {
         let _span = tracy::span!("RawGrepper::warmup_filesystem");
 
-        let total_size = self.device_mmap.len();
-        let block_size = self.sb.block_size as usize;
-        let blocks_per_group = self.sb.blocks_per_group as u64;
-        let inodes_per_group = self.sb.inodes_per_group as usize;
-        let inode_size = self.sb.inode_size as usize;
-        let desc_size = self.sb.desc_size as usize;
+        // Prefetch first few megabytes which typically contain metadata
+        self.fs.prefetch_region(0, 4 * 1024 * 1024);
 
-        let bytes_per_group = blocks_per_group as usize * block_size;
-        let num_groups = total_size.div_ceil(bytes_per_group);
-
-        // GDT offset (after superblock)
-        // @Constant
-        let gdt_offset = if block_size == 1024 { 2048 } else { block_size };
-        let gdt_size = num_groups * desc_size;
-
-        let ext4 = self.ext4_context();
-
-        //
-        // Prefetch group descriptor table
-        //
-        Parser::prefetch_region(gdt_offset, gdt_size.min(4 * 1024 * 1024), &ext4); // @Constant @Tune
-
-        //
-        // Prefetch inode tables for first N groups,
-        // These contain the inodes we'll need for directory traversal
-        //
-        let groups_to_prefetch = num_groups.min(128); // @Constant @Tune
-
-        for group in 0..groups_to_prefetch {
-            let gd_offset = gdt_offset + group * desc_size;
-            if gd_offset + 12 > total_size {
-                break;
-            }
-
-            let inode_table_block = u32::from_le_bytes([
-                self.device_mmap[gd_offset +  8],
-                self.device_mmap[gd_offset +  9],
-                self.device_mmap[gd_offset + 10],
-                self.device_mmap[gd_offset + 11],
-            ]) as usize;
-
-            let inode_table_offset = inode_table_block * block_size;
-            let inode_table_size = inodes_per_group * inode_size;
-
-            // @Constant
-            Parser::prefetch_region(inode_table_offset, inode_table_size.min(2 * 1024 * 1024), &ext4);
-        }
-
-        //
-        // Just in case wait for the async prefetch to start
-        //
+        // Give the async prefetch time to start
         std::thread::yield_now();
     }
+}
+
+#[inline]
+pub fn open_device(device_path: &str) -> io::Result<(File, Mmap)> {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(false)
+        .open(device_path)?;
+
+    let size = device_size(&file)?;
+
+    let mmap = unsafe {
+        MmapOptions::new()
+            .offset(0)
+            .len(size as _)
+            .map(&file)?
+    };
+
+    Ok((file, mmap))
+}
+
+#[inline]
+pub fn device_size(fd: &File) -> io::Result<u64> {
+    let mut size = 0u64;
+    let res = unsafe {
+        libc::ioctl(fd.as_raw_fd(), BLKGETSIZE64, &mut size)
+    };
+
+    if res < 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    Ok(size)
 }

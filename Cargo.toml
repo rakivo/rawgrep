@@ -61,6 +61,15 @@ nohash-hasher = "0.2.0"
 [build-dependencies]
 rustc_version = "0.2"
 
+[profile.release-debug]
+inherits = "release"
+opt-level = 3
+codegen-units = 1
+debug = true
+strip = false
+overflow-checks = false
+debug-assertions = false
+
 [profile.release-fast]
 inherits = "release"
 opt-level = 3

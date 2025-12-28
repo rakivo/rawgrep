@@ -1,5 +1,5 @@
 use rawgrep::cli::Cli;
-use rawgrep::grep::RawGrepper;
+use rawgrep::grep::{open_device, RawGrepper};
 use rawgrep::{eprint_blue, eprint_green, eprintln_red, CURSOR_HIDE, CURSOR_UNHIDE};
 
 use std::fs;
@@ -72,7 +72,7 @@ fn main() -> io::Result<()> {
     let search_root_path = search_root_path_buf.to_string_lossy();
     let search_root_path = search_root_path.as_ref();
 
-    let grep = match RawGrepper::new(&device, &cli) {
+    let (_file, mmap) = match open_device(&device) {
         Ok(ok) => ok,
         Err(e) => {
             match e.kind() {
@@ -82,6 +82,18 @@ fn main() -> io::Result<()> {
                 io::ErrorKind::PermissionDenied => {
                     eprintln_red!("error: permission denied. Try running with sudo/root to read raw devices.");
                 }
+                _ => {
+                    eprintln_red!("error: failed to open device: {e}");
+                }
+            }
+            std::process::exit(1);
+        }
+    };
+
+    let grep = match RawGrepper::new_ext4(&device, &cli, &mmap) {
+        Ok(ok) => ok,
+        Err(e) => {
+            match e.kind() {
                 io::ErrorKind::InvalidData => {
                     eprintln_red!("error: invalid ext4 filesystem on this path: {e}");
                     eprintln_red!("help: make sure the path points to a partition (e.g., /dev/sda1) and not a whole disk (e.g., /dev/sda)");
@@ -96,7 +108,7 @@ fn main() -> io::Result<()> {
         }
     };
 
-    let start_inode = match grep.try_resolve_path_to_inode(search_root_path) {
+    let start_inode = match grep.try_resolve_path_to_file_id(search_root_path) {
         Ok(ok) => ok,
         Err(e) => {
             eprintln_red!("error: couldn't find {search_root_path} in {device}: {e}");
@@ -115,7 +127,7 @@ fn main() -> io::Result<()> {
     let potential_root_gitignore_path = potential_root_gitignore_path_buf.to_string_lossy();
     let potential_root_gitignore_path = potential_root_gitignore_path.as_ref();
 
-    let stats = grep.search_parallel(
+    let stats = grep.search(
         start_inode,
         &setup_signal_handler(),
         rawgrep::ignore::build_gitignore_from_file(potential_root_gitignore_path)

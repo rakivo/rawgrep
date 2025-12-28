@@ -41,6 +41,7 @@ pub const EXT4_S_IFREG: u16 = 0x8000;
 pub const EXT4_S_IFDIR: u16 = 0x4000;
 
 pub const EXT4_EXTENTS_FL: u32 = 0x80000;
+pub const EXT4_INLINE_DATA_FL: u32 = 0x10000000;
 
 pub const EXT4_EXTENT_MAGIC: u16 = 0xF30A;
 pub const EXT4_EXTENT_HEADER_SIZE: usize = 12;
@@ -65,7 +66,7 @@ impl Display for Ext4SuperBlock {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 pub struct Ext4Inode {
     pub inode_num: u64,
     pub mode: u16,
@@ -75,10 +76,12 @@ pub struct Ext4Inode {
     pub blocks: [u32; 15],
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+#[repr(C)]
 pub struct Ext4Extent {
     pub start: u64,
     pub len: u16,
+    pub _pad: [u8; 6], // Align to 16 bytes for Pod
 }
 
 pub mod raw {

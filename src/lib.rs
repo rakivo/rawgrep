@@ -4,6 +4,7 @@
 #![allow(
     clippy::identity_op,
     clippy::collapsible_if,
+    clippy::module_inception,
     clippy::only_used_in_recursion
 )]
 
