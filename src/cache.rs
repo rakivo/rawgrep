@@ -407,6 +407,7 @@ impl FragmentCache {
         //
         // Grow file_metas
         //
+        // @Refactor @Cutnpaste from above
         let old_file_metas = self.owned_file_metas.take().unwrap();
         let mut new_file_metas = Box::<[FileMeta]>::new_uninit_slice(new_capacity);
         unsafe {
@@ -421,6 +422,7 @@ impl FragmentCache {
         //
         // Grow file_bitsets
         //
+        // @Refactor @Cutnpaste from above
         let old_file_bitsets = self.owned_file_bitsets.take().unwrap();
         let old_u64s = num_files * bits_per_file_u64;
         let new_total_u64s = new_capacity * bits_per_file_u64;
