@@ -43,7 +43,9 @@ use crate::ext4::{
 use std::mem;
 use std::ops::Not;
 use std::sync::Arc;
+use std::time::Duration;
 use std::io::{self, BufWriter, Write};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use smallvec::SmallVec;
 use crossbeam_channel::{Receiver, Sender};
@@ -112,6 +114,8 @@ struct ParsedEntry {
     file_type: u8,
 }
 
+pub type WorkerResult = (Stats, Vec<FileKey>, Vec<FileMeta>, Vec<bool>);
+
 pub struct WorkerContext<'a> {
     pub cache: Option<&'a FragmentCache>,     // 8 bytes
     pub fragment_hashes: &'a [u32],           // 16 bytes
@@ -134,13 +138,13 @@ pub struct WorkerContext<'a> {
 
 impl<'a> WorkerContext<'a> {
     #[inline(always)]
-    pub fn init(&mut self) {
+    fn init(&mut self) {
         let config = self.cli.get_buffer_config();
         self.buffers.init(&config)
     }
 
     #[inline(always)]
-    pub fn finish(mut self) -> (Stats, Vec<FileKey>, Vec<FileMeta>, Vec<bool>) {
+    fn finish(mut self) -> WorkerResult {
         self.flush_output();
         (
             self.stats,
@@ -740,8 +744,81 @@ impl WorkerContext<'_> {
 }
 
 impl WorkerContext<'_> {
-    pub fn find_work(
-        worker_id: u16,
+    pub fn start_worker_loop(
+        mut self,
+
+        running: &AtomicBool,
+        active_workers: &AtomicUsize,
+
+        injector: &Injector<WorkItem>,
+        stealers: &[Stealer<WorkItem>],
+        local_worker: &DequeWorker<WorkItem>,
+    ) -> WorkerResult {
+        self.init();
+
+        let mut consecutive_steals = 0;
+        let mut idle_iterations = 0;
+
+        loop {
+            if !running.load(Ordering::Relaxed) {
+                break;
+            }
+
+            let work = self.find_work(
+                &local_worker,
+                injector,
+                &stealers,
+                &mut consecutive_steals,
+            );
+
+            match work {
+                Some(work_item) => {
+                    idle_iterations = 0;
+                    active_workers.fetch_add(1, Ordering::Release);
+
+                    match work_item {
+                        WorkItem::Directory(dir_work) => {
+                            _ = self.dispatch_directory(
+                                dir_work,
+                                &local_worker,
+                                injector,
+                            );
+                        }
+                    }
+
+                    active_workers.fetch_sub(1, Ordering::Release);
+                }
+
+                None => {
+                    idle_iterations += 1;
+
+                    self.flush_output();
+
+                    if active_workers.load(Ordering::Acquire) == 0 {
+                        // Double-check
+                        if injector.is_empty() && local_worker.is_empty() {
+                            running.store(false, Ordering::Release);
+                            break;
+                        }
+                    }
+
+                    // @Constant @Tune
+                    if idle_iterations < 10 {
+                        std::hint::spin_loop();
+                    } else if idle_iterations < 20 {
+                        std::thread::yield_now();
+                    } else {
+                        std::thread::sleep(Duration::from_micros(10));
+                    }
+                }
+            }
+        }
+
+        self.finish()
+    }
+
+    fn find_work(
+        &self,
         local: &DequeWorker<WorkItem>,
         injector: &Injector<WorkItem>,
         stealers: &[Stealer<WorkItem>],
@@ -767,14 +844,14 @@ impl WorkerContext<'_> {
 
         // Steal from others
         let start = if *consecutive_steals < 3 { // @Constant @Tune
-            (worker_id as usize + 1) % stealers.len()
+            (self.worker_id as usize + 1) % stealers.len()
         } else {
             fastrand::usize(..stealers.len())
         };
 
         for i in 0..stealers.len() {
             let victim_id = (start + i) % stealers.len();
-            if victim_id == worker_id as usize {
+            if victim_id == self.worker_id as usize {
                 continue;
             }
 

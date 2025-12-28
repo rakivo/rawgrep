@@ -1,9 +1,8 @@
 use std::sync::Arc;
-use std::time::Duration;
 use std::os::fd::AsRawFd;
 use std::io::{self, BufWriter};
 use std::fs::{File, OpenOptions};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize};
 
 use memmap2::{Mmap, MmapOptions};
 use crossbeam_channel::unbounded;
@@ -170,7 +169,6 @@ impl<'a> RawGrepper<'a> {
         let stats = &AtomicStats::new();
 
         let active_workers = &AtomicUsize::new(0);
-        let quit_now = &AtomicBool::new(false);
 
         let (output_tx, output_rx) = unbounded();
 
@@ -200,7 +198,7 @@ impl<'a> RawGrepper<'a> {
 
         let (all_file_keys, all_file_metas, all_had_matches) = std::thread::scope(|s| {
             #[cfg(target_os = "linux")]
-            let topology_output = topology.clone();
+            let topology_output = &topology;
 
             let output_handle = s.spawn(move || {
                 // --------- Pin output worker to E-core if available
@@ -220,7 +218,7 @@ impl<'a> RawGrepper<'a> {
             });
 
             let handles = workers.into_iter().enumerate().map(|(worker_id, local_worker)| {
-                let stealers = stealers.clone();
+                let stealers = &stealers;
                 let output_tx = output_tx.clone();
                 let sb = &self.sb;
                 let device_id = self.device_id;
@@ -230,7 +228,7 @@ impl<'a> RawGrepper<'a> {
                 let fragment_hashes = &self.fragment_hashes;
 
                 #[cfg(target_os = "linux")]
-                let topology_worker = topology.clone();
+                let topology_worker = &topology;
 
                 s.spawn(move || {
                     // -------- Pin worker to P-core
@@ -244,7 +242,7 @@ impl<'a> RawGrepper<'a> {
                         }
                     }
 
-                    let mut worker = WorkerContext {
+                    let worker = WorkerContext {
                         cache,
                         fragment_hashes,
                         ext4: Ext4Context { device_mmap, sb, device_id },
@@ -263,68 +261,16 @@ impl<'a> RawGrepper<'a> {
                         pending_had_matches: Vec::new(),
                     };
 
-                    worker.init();
+                    let (worker_stats, file_keys, file_metas, had_matches) = worker.start_worker_loop(
+                        running,
+                        active_workers,
+                        injector,
+                        stealers,
+                        &local_worker
+                    );
 
-                    let mut consecutive_steals = 0;
-                    let mut idle_iterations = 0;
-
-                    loop {
-                        if quit_now.load(Ordering::Relaxed) || !running.load(Ordering::Relaxed) {
-                            break;
-                        }
-
-                        let work = WorkerContext::find_work(
-                            worker.worker_id,
-                            &local_worker,
-                            injector,
-                            &stealers,
-                            &mut consecutive_steals,
-                        );
-
-                        match work {
-                            Some(work_item) => {
-                                idle_iterations = 0;
-                                active_workers.fetch_add(1, Ordering::Release);
-
-                                match work_item {
-                                    WorkItem::Directory(dir_work) => {
-                                        _ = worker.dispatch_directory(
-                                            dir_work,
-                                            &local_worker,
-                                            injector,
-                                        );
-                                    }
-                                }
-
-                                active_workers.fetch_sub(1, Ordering::Release);
-                            }
-                            None => {
-                                idle_iterations += 1;
-
-                                worker.flush_output();
-
-                                if active_workers.load(Ordering::Acquire) == 0 {
-                                    // Double-check
-                                    if injector.is_empty() && local_worker.is_empty() {
-                                        quit_now.store(true, Ordering::Release);
-                                        break;
-                                    }
-                                }
-
-                                // @Constant @Tune
-                                if idle_iterations < 10 {
-                                    std::hint::spin_loop();
-                                } else if idle_iterations < 20 {
-                                    std::thread::yield_now();
-                                } else {
-                                    std::thread::sleep(Duration::from_micros(10));
-                                }
-                            }
-                        }
-                    }
-
-                    let (worker_stats, file_keys, file_metas, had_matches) = worker.finish();
                     worker_stats.merge_into(stats);
+
                     (file_keys, file_metas, had_matches)
                 })
             }).collect::<Vec<_>>();
@@ -348,19 +294,19 @@ impl<'a> RawGrepper<'a> {
         });
 
         if let Some(cache) = &mut self.cache {
-            if !all_file_keys.is_empty() && let Err(e) = cache.merge_updates(
+            if let Err(e) = cache.merge_updates(
                 all_file_keys,
                 all_file_metas,
                 &self.fragment_hashes,
                 all_had_matches
             ) {
-                eprintln!("Error: Failed to merge cache updates: {e}");
+                eprintln_red!("error: failed to merge cache updates: {e}");
             }
         }
 
         if let Some(cache) = &self.cache {
             if let Err(e) = cache.save_to_disk() {
-                eprintln!("Error: Failed to save cache: {e}");
+                eprintln_red!("error: failed to save cache: {e}");
             }
         }
 
