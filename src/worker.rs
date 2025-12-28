@@ -765,9 +765,9 @@ impl WorkerContext<'_> {
             }
 
             let work = self.find_work(
-                &local_worker,
+                local_worker,
                 injector,
-                &stealers,
+                stealers,
                 &mut consecutive_steals,
             );
 
@@ -780,7 +780,7 @@ impl WorkerContext<'_> {
                         WorkItem::Directory(dir_work) => {
                             _ = self.dispatch_directory(
                                 dir_work,
-                                &local_worker,
+                                local_worker,
                                 injector,
                             );
                         }
