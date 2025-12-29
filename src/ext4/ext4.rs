@@ -5,8 +5,6 @@ pub type INodeNum = u32;
 // pub const MAX_SYMLINK_TARGET_SIZE: usize = 4096;
 // pub const FAST_SYMLINK_SIZE: usize = 60; // Symlinks < 60 bytes stored in inode
 
-pub const BLKGETSIZE64: libc::c_ulong = 0x80081272;
-
 pub const EXT4_SUPERBLOCK_OFFSET: u64 = 1024;
 pub const EXT4_SUPERBLOCK_SIZE: usize = 1024;
 pub const EXT4_SUPER_MAGIC: u16 = 0xEF53;

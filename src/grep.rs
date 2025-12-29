@@ -1,5 +1,4 @@
 use std::sync::Arc;
-use std::os::fd::AsRawFd;
 use std::io::{self, BufWriter};
 use std::fs::{File, OpenOptions};
 use std::sync::atomic::{AtomicBool, AtomicUsize};
@@ -8,18 +7,18 @@ use memmap2::{Mmap, MmapOptions};
 use crossbeam_channel::unbounded;
 use crossbeam_deque::{Injector, Worker as DequeWorker};
 
-use crate::cache::{CacheConfig, FragmentCache};
 use crate::cli::Cli;
 use crate::matcher::Matcher;
-use crate::parser::{BufKind, FileId, FileNode, Parser, RawFs};
 use crate::{eprintln_red, tracy};
 use crate::path_buf::SmallPathBuf;
 use crate::stats::{AtomicStats, Stats};
+use crate::platform::{device_id, device_size};
 use crate::ignore::{Gitignore, GitignoreChain};
+use crate::cache::{CacheConfig, FragmentCache};
+use crate::parser::{BufKind, FileId, FileNode, Parser, RawFs};
 use crate::worker::{DirWork, OutputWorker, WorkItem, WorkerContext};
 use crate::ext4::{
     Ext4Fs,
-    BLKGETSIZE64,
     EXT4_MAGIC_OFFSET,
     EXT4_SUPERBLOCK_OFFSET,
     EXT4_SUPERBLOCK_SIZE,
@@ -61,13 +60,7 @@ impl<'a> RawGrepper<'a, Ext4Fs<'a>> {
             .write(false)
             .open(device_path)?;
 
-        let device_id = unsafe {
-            let mut stat: libc::stat = std::mem::zeroed();
-            if libc::fstat(file.as_raw_fd(), &mut stat) < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            stat.st_dev
-        };
+        let device_id = device_id(&file)?;
 
         let max_block = (mmap.len() / sb.block_size as usize) as u64;
         let fs = Ext4Fs { mmap, sb, device_id, max_block };
@@ -79,27 +72,7 @@ impl<'a> RawGrepper<'a, Ext4Fs<'a>> {
 /// impl block for generic RawFs
 impl<'a, F: RawFs> RawGrepper<'a, F> {
     pub fn new_with_fs(cli: &'a Cli, fs: F) -> io::Result<Self> {
-        let matcher = match Matcher::new(cli) {
-            Ok(m) => m,
-            Err(e) => {
-                match e.kind() {
-                    io::ErrorKind::InvalidInput => {
-                        eprintln_red!("error: invalid pattern '{pattern}'", pattern = cli.pattern);
-                        eprintln_red!("tip: test your regex with `grep -E` or a regex tester before running");
-                        eprintln_red!("patterns must be valid regex or a literal/alternation extractable form");
-                    }
-                    io::ErrorKind::NotFound => {
-                        eprintln_red!("error: referenced something that wasn't found: {e}");
-                    }
-                    _ => {
-                        eprintln_red!("error: failed to build matcher: {e}");
-                    }
-                }
-
-                std::process::exit(1);
-            }
-        };
-
+        let matcher = create_matcher_or_exit(cli);
         let fragment_hashes = matcher.extract_fragment_hashes();
 
         let cache = if !cli.no_cache && !fragment_hashes.is_empty() {
@@ -162,22 +135,14 @@ impl<'a, F: RawFs> RawGrepper<'a, F> {
 
         self.warmup_filesystem();
 
-        #[cfg(target_os = "linux")]
-        let topology = Arc::new(crate::core_topology::CoreTopology::detect());
+        let num_cores = num_physical_cores_or(threads);
 
         let (all_file_keys, all_file_metas, all_had_matches) = std::thread::scope(|s| {
-            #[cfg(target_os = "linux")]
-            let topology_output = &topology;
-
             let output_handle = s.spawn(move || {
-                #[cfg(target_os = "linux")]
-                if let Some(core_id) = topology_output.output_core() {
-                    unsafe {
-                        let mut cpuset: libc::cpu_set_t = std::mem::zeroed();
-                        libc::CPU_SET(core_id, &mut cpuset);
-                        libc::sched_setaffinity(0, std::mem::size_of_val(&cpuset), &cpuset);
-                    }
-                }
+                //
+                // Pin output thread to last core (often an E-core on hybrid CPUs)
+                //
+                pin_thread_to_core(num_cores.saturating_sub(1));
 
                 OutputWorker {
                     rx: output_rx,
@@ -193,19 +158,8 @@ impl<'a, F: RawFs> RawGrepper<'a, F> {
                 let cache = self.cache.as_ref();
                 let fragment_hashes = &self.fragment_hashes;
 
-                #[cfg(target_os = "linux")]
-                let topology_worker = &topology;
-
                 s.spawn(move || {
-                    #[cfg(target_os = "linux")]
-                    {
-                        let core_id = topology_worker.worker_core(worker_id);
-                        unsafe {
-                            let mut cpuset: libc::cpu_set_t = std::mem::zeroed();
-                            libc::CPU_SET(core_id, &mut cpuset);
-                            libc::sched_setaffinity(0, std::mem::size_of_val(&cpuset), &cpuset);
-                        }
-                    }
+                    pin_thread_to_core(worker_id % num_cores);
 
                     let worker = WorkerContext {
                         cache,
@@ -349,15 +303,82 @@ pub fn open_device(device_path: &str) -> io::Result<(File, Mmap)> {
 }
 
 #[inline]
-pub fn device_size(fd: &File) -> io::Result<u64> {
-    let mut size = 0u64;
-    let res = unsafe {
-        libc::ioctl(fd.as_raw_fd(), BLKGETSIZE64, &mut size)
-    };
+pub fn create_matcher_or_exit(cli: &Cli) -> Matcher {
+    match Matcher::new(cli) {
+        Ok(m) => m,
+        Err(e) => {
+            match e.kind() {
+                io::ErrorKind::InvalidInput => {
+                    eprintln_red!("error: invalid pattern '{pattern}'", pattern = cli.pattern);
+                    eprintln_red!("tip: test your regex with `grep -E` or a regex tester before running");
+                    eprintln_red!("patterns must be valid regex or a literal/alternation extractable form");
+                }
+                io::ErrorKind::NotFound => {
+                    eprintln_red!("error: referenced something that wasn't found: {e}");
+                }
+                _ => {
+                    eprintln_red!("error: failed to build matcher: {e}");
+                }
+            }
 
-    if res < 0 {
-        return Err(io::Error::last_os_error());
+            std::process::exit(1);
+        }
+    }
+}
+
+// ==========================================================
+// CPU affinity helpers - gdt-cpus has bugs on macOS, so we provide fallbacks
+// ==========================================================
+
+/// Get number of physical cores, falling back to provided default
+#[inline]
+fn num_physical_cores_or(fallback: usize) -> usize {
+    #[cfg(not(target_os = "macos"))]
+    {
+        gdt_cpus::num_physical_cores().unwrap_or(fallback)
     }
 
-    Ok(size)
+    #[cfg(target_os = "macos")]
+    {
+        // macOS: use sysctl to get physical core count
+        macos_num_physical_cores().unwrap_or(fallback)
+    }
+}
+
+/// Pin current thread to a specific core (best-effort, ignores failures)
+#[inline]
+fn pin_thread_to_core(core_id: usize) {
+    #[cfg(not(target_os = "macos"))]
+    {
+        _ = gdt_cpus::pin_thread_to_core(core_id);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // macOS doesn't support thread-to-core pinning via public APIs
+        // Thread affinity hints are handled by the kernel
+        _ = core_id;
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_num_physical_cores() -> Option<usize> {
+    // sysctl hw.physicalcpu
+    let mut count: libc::c_int = 0;
+    let mut size = std::mem::size_of::<libc::c_int>();
+
+    let ret = unsafe {
+        libc::sysctlbyname(
+            c"hw.physicalcpu".as_ptr(),
+            &mut count as *mut _ as *mut libc::c_void,
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+
+    if ret == 0 && count > 0 {
+        Some(count as usize)
+    } else {
+        None
+    }
 }

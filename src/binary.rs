@@ -33,11 +33,14 @@ pub fn is_binary_chunk(data: &[u8]) -> bool {
         return true;
     }
 
-    if cfg!(target_arch = "x86_64") && is_x86_feature_detected!("sse2") {
-        unsafe { is_binary_chunk_simd_sse2(data) }
-    } else {
-        is_binary_chunk_(data)
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("sse2") {
+            return unsafe { is_binary_chunk_simd_sse2(data) };
+        }
     }
+
+    is_binary_chunk_(data)
 }
 
 /// # Safety

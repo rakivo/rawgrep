@@ -382,6 +382,7 @@ impl FragmentCache {
             return;
         }
 
+        // @Constant
         let new_capacity = (needed * 4).min(self.max_files as usize);
         if new_capacity <= self.file_capacity {
             return; // at max capacity already

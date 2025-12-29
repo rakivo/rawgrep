@@ -299,13 +299,8 @@ impl<'a> RawFs for Ext4Fs<'a> {
         let aligned_offset = offset & !(page_size - 1);
         let aligned_length = ((offset + length + page_size - 1) & !(page_size - 1)) - aligned_offset;
 
-        unsafe {
-            libc::madvise(
-                self.mmap.as_ptr().add(aligned_offset) as *mut _,
-                aligned_length,
-                libc::MADV_WILLNEED,
-            );
-        }
+        let ptr = unsafe { self.mmap.as_ptr().add(aligned_offset) as *mut _ };
+        _ = memadvise::advise(ptr, aligned_length, memadvise::Advice::WillNeed);
     }
 }
 
@@ -663,13 +658,8 @@ impl Ext4Fs<'_> {
 
         debug_assert!(offset + length <= self.mmap.len());
 
-        unsafe {
-            libc::madvise(
-                self.mmap.as_ptr().add(offset) as *mut _,
-                length,
-                libc::MADV_WILLNEED
-            );
-        }
+        let ptr = unsafe { self.mmap.as_ptr().add(offset) as *mut _ };
+        _ = memadvise::advise(ptr, length, memadvise::Advice::WillNeed);
     }
 
     #[inline]
@@ -690,13 +680,8 @@ impl Ext4Fs<'_> {
             let length = blocks_to_prefetch * block_size;
 
             if offset + length <= self.mmap.len() {
-                unsafe {
-                    libc::madvise(
-                        self.mmap.as_ptr().add(offset) as *mut _,
-                        length,
-                        libc::MADV_WILLNEED,
-                    );
-                }
+                let ptr = unsafe { self.mmap.as_ptr().add(offset) as *mut _ };
+                _ = memadvise::advise(ptr, length, memadvise::Advice::WillNeed);
             }
 
             remaining = remaining.saturating_sub(extent_bytes);
@@ -716,13 +701,8 @@ impl Ext4Fs<'_> {
             let offset = block as usize * block_size;
             if offset + block_size > mmap_len { continue }
 
-            unsafe {
-                libc::madvise(
-                    self.mmap.as_ptr().add(offset) as *mut _,
-                    block_size,
-                    libc::MADV_WILLNEED,
-                );
-            }
+            let ptr = unsafe { self.mmap.as_ptr().add(offset) as *mut _ };
+            _ = memadvise::advise(ptr, block_size, memadvise::Advice::WillNeed);
         }
     }
 
@@ -743,13 +723,8 @@ impl Ext4Fs<'_> {
             let length = blocks_to_release * block_size;
 
             if offset + length <= mmap_len {
-                unsafe {
-                    libc::madvise(
-                        self.mmap.as_ptr().add(offset) as *mut _,
-                        length,
-                        libc::MADV_FREE,
-                    );
-                }
+                let ptr = unsafe { self.mmap.as_ptr().add(offset) as *mut _ };
+                _ = memadvise::advise(ptr, length, memadvise::Advice::DontNeed);
             }
 
             remaining = remaining.saturating_sub(extent_bytes);

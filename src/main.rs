@@ -60,7 +60,7 @@ fn main() -> io::Result<()> {
     };
 
     let device = cli.device.as_ref().cloned().unwrap_or_else(|| {
-        match rawgrep::util::detect_partition_for_path(search_root_path_buf.as_ref()) {
+        match rawgrep::platform::detect_partition_for_path(search_root_path_buf.as_ref()) {
             Ok(ok) => ok,
             Err(e) => {
                 eprintln_red!("error: couldn't find auto-detect partition: {e}");

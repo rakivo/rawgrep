@@ -49,7 +49,7 @@ pub trait FileNode: Copy {
     fn is_dir(&self) -> bool;
 }
 
-/// Raw filesystem abstraction - zero-cost with static dispatch
+/// Raw filesystem abstraction
 pub trait RawFs: Sync + Send {
     /// Filesystem-specific file node type (e.g., Ext4Inode)
     type Node: FileNode;
