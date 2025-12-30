@@ -377,3 +377,11 @@ macro_rules! write_cyan {
         }
     }};
 }
+
+#[macro_export]
+macro_rules! exit_err {
+    ($($arg:tt)*) => {{
+        eprintln_red!($($arg)*);
+        std::process::exit(1);
+    }};
+}

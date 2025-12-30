@@ -1,23 +1,20 @@
-use rawgrep::cli::Cli;
-use rawgrep::grep::{open_device, RawGrepper};
-use rawgrep::{eprint_blue, eprint_green, eprintln_red, CURSOR_HIDE, CURSOR_UNHIDE};
-
 use std::fs;
-use std::sync::Arc;
 use std::io::{self, Write};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-#[inline]
+use rawgrep::cli::Cli;
+use rawgrep::fs::FsType;
+use rawgrep::grep::{open_device, RawGrepper};
+use rawgrep::{eprint_blue, eprint_green, eprintln_red, exit_err, CURSOR_HIDE, CURSOR_UNHIDE};
+
 fn setup_signal_handler() -> Arc<AtomicBool> {
     let running = Arc::new(AtomicBool::new(true));
     let r = running.clone();
 
     ctrlc::set_handler(move || {
         r.store(false, Ordering::Relaxed);
-        {
-            let mut handle = io::stdout().lock();
-            _ = handle.write_all(CURSOR_UNHIDE.as_bytes());
-        }
+        _ = io::stdout().lock().write_all(CURSOR_UNHIDE.as_bytes());
         _ = io::stdout().flush();
         std::process::exit(0);
     }).expect("Error setting Ctrl-C handler");
@@ -25,19 +22,17 @@ fn setup_signal_handler() -> Arc<AtomicBool> {
     running
 }
 
-pub struct CursorHide;
+struct CursorHide;
 
 impl CursorHide {
-    #[inline]
-    pub fn new() -> io::Result<Self> {
+    fn new() -> io::Result<Self> {
         io::stdout().lock().write_all(CURSOR_HIDE.as_bytes())?;
         io::stdout().flush()?;
-        Ok(CursorHide)
+        Ok(Self)
     }
 }
 
 impl Drop for CursorHide {
-    #[inline]
     fn drop(&mut self) {
         _ = io::stdout().lock().write_all(CURSOR_UNHIDE.as_bytes());
         _ = io::stdout().flush();
@@ -50,88 +45,70 @@ fn main() -> io::Result<()> {
 
     let cli = Cli::parse();
 
-    let search_root_path_buf = match fs::canonicalize(&cli.search_root_path) {
-        Ok(path) => path,
-        Err(e) => {
-            let search_root_path = &cli.search_root_path;
-            eprintln_red!("error: couldn't canonicalize '{search_root_path}': {e}");
-            std::process::exit(1);
-        }
-    };
+    let search_root_path_buf = fs::canonicalize(&cli.search_root_path).unwrap_or_else(|e| {
+        exit_err!("error: couldn't canonicalize '{}': {e}", cli.search_root_path);
+    });
 
-    let device = cli.device.as_ref().cloned().unwrap_or_else(|| {
-        match rawgrep::platform::detect_partition_for_path(search_root_path_buf.as_ref()) {
-            Ok(ok) => ok,
-            Err(e) => {
-                eprintln_red!("error: couldn't find auto-detect partition: {e}");
-                std::process::exit(1);
-            }
-        }
+    let device = cli.device.clone().unwrap_or_else(|| {
+        rawgrep::platform::detect_partition_for_path(&search_root_path_buf).unwrap_or_else(|e| {
+            exit_err!("error: couldn't auto-detect partition: {e}");
+        })
     });
 
     let search_root_path = search_root_path_buf.to_string_lossy();
-    let search_root_path = search_root_path.as_ref();
 
-    let (_file, mmap) = match open_device(&device) {
-        Ok(ok) => ok,
-        Err(e) => {
-            match e.kind() {
-                io::ErrorKind::NotFound => {
-                    eprintln_red!("error: device or partition not found: '{device}'");
-                }
-                io::ErrorKind::PermissionDenied => {
-                    eprintln_red!("error: permission denied. Try running with sudo/root to read raw devices.");
-                }
-                _ => {
-                    eprintln_red!("error: failed to open device: {e}");
-                }
-            }
-            std::process::exit(1);
+    let (_file, mmap) = open_device(&device).unwrap_or_else(|e| {
+        match e.kind() {
+            io::ErrorKind::NotFound => exit_err!("error: device not found: '{device}'"),
+            io::ErrorKind::PermissionDenied => exit_err!("error: permission denied (try sudo)"),
+            _ => exit_err!("error: failed to open device: {e}"),
         }
-    };
+    });
 
-    let grep = match RawGrepper::new_ext4(&device, &cli, &mmap) {
-        Ok(ok) => ok,
-        Err(e) => {
-            match e.kind() {
-                io::ErrorKind::InvalidData => {
-                    eprintln_red!("error: invalid ext4 filesystem on this path: {e}");
-                    eprintln_red!("help: make sure the path points to a partition (e.g., /dev/sda1) and not a whole disk (e.g., /dev/sda)");
-                    eprintln_red!("tip: try running `df -Th /` to find your root partition");
-                }
-                _ => {
-                    eprintln_red!("error: failed to initialize ext4 reader: {e}");
-                }
-            }
-
-            std::process::exit(1);
-        }
-    };
-
-    let start_inode = match grep.try_resolve_path_to_file_id(search_root_path) {
-        Ok(ok) => ok,
-        Err(e) => {
-            eprintln_red!("error: couldn't find {search_root_path} in {device}: {e}");
-            std::process::exit(1);
-        }
-    };
+    let fs_type = FsType::detect(&mmap);
 
     eprint_blue!("Searching ");
     eprint_green!("'{device}' ");
-    eprint_blue!("for pattern: ");
-    eprintln_red!("'{pattern}'", pattern = cli.pattern);
+    eprint_blue!("({fs_type}) for pattern: ");
+    eprintln_red!("'{}'", cli.pattern);
 
-    let _cur = CursorHide::new();
+    let _cursor = CursorHide::new();
+    let running = setup_signal_handler();
 
-    let potential_root_gitignore_path_buf = search_root_path_buf.join(".gitignore");
-    let potential_root_gitignore_path = potential_root_gitignore_path_buf.to_string_lossy();
-    let potential_root_gitignore_path = potential_root_gitignore_path.as_ref();
+    let gitignore_path = search_root_path_buf.join(".gitignore");
+    let root_gitignore = rawgrep::ignore::build_gitignore_from_file(
+        gitignore_path.to_string_lossy().as_ref()
+    );
 
-    let stats = grep.search(
-        start_inode,
-        &setup_signal_handler(),
-        rawgrep::ignore::build_gitignore_from_file(potential_root_gitignore_path)
-    )?;
+    let stats = match fs_type {
+        FsType::Ext4 => {
+            let grep = RawGrepper::new_ext4(&device, &cli, &mmap).unwrap_or_else(|e| {
+                exit_err!("error: failed to initialize ext4 reader: {e}");
+            });
+
+            let start = grep.try_resolve_path_to_file_id(&search_root_path).unwrap_or_else(|e| {
+                exit_err!("error: path not found in {device}: {e}");
+            });
+
+            grep.search(start, &running, root_gitignore)?
+        }
+
+        FsType::Apfs => {
+            let grep = RawGrepper::new_apfs(&device, &cli, &mmap).unwrap_or_else(|e| {
+                exit_err!("error: failed to initialize APFS reader: {e}");
+            });
+
+            let start = grep.try_resolve_path_to_file_id(&search_root_path).unwrap_or_else(|e| {
+                exit_err!("error: path not found in {device}: {e}");
+            });
+
+            grep.search(start, &running, root_gitignore)?
+        }
+
+        FsType::Unknown => {
+            exit_err!("error: unsupported filesystem on {device} (supports: ext4, apfs)");
+        }
+    };
 
     if cli.stats {
         eprintln!("{stats}");

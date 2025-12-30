@@ -24,6 +24,7 @@ use crate::ext4::{
     EXT4_SUPERBLOCK_SIZE,
     EXT4_SUPER_MAGIC,
 };
+use crate::apfs::ApfsFs;
 
 pub struct RawGrepper<'a, F: RawFs> {
     cli: &'a Cli,
@@ -64,6 +65,21 @@ impl<'a> RawGrepper<'a, Ext4Fs<'a>> {
 
         let max_block = (mmap.len() / sb.block_size as usize) as u64;
         let fs = Ext4Fs { mmap, sb, device_id, max_block };
+
+        Self::new_with_fs(cli, fs)
+    }
+}
+
+/// impl block for APFS-specific construction
+impl<'a> RawGrepper<'a, ApfsFs<'a>> {
+    pub fn new_apfs(device_path: &str, cli: &'a Cli, mmap: &'a Mmap) -> io::Result<Self> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(false)
+            .open(device_path)?;
+
+        let device_id = device_id(&file)?;
+        let fs = ApfsFs::new(mmap, device_id)?;
 
         Self::new_with_fs(cli, fs)
     }
