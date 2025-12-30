@@ -34,7 +34,7 @@ use std::time::Duration;
 use std::io::{self, BufWriter, Write};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use smallvec::SmallVec;
+use smallvec::{smallvec, SmallVec};
 use crossbeam_channel::{Receiver, Sender};
 use crossbeam_deque::{Injector, Steal, Stealer, Worker as DequeWorker};
 
@@ -84,7 +84,14 @@ impl OutputWorker {
     }
 }
 
-pub type WorkerResult = (Stats, Vec<FileKey>, Vec<FileMeta>, Vec<bool>);
+pub struct WorkerResult {
+    pub stats: Stats,
+    pub file_keys: Vec<FileKey>,
+    pub file_metas: Vec<FileMeta>,
+
+    /// Per-fragment presence: fragment_presence[file_idx][frag_idx] = true if fragment is in file
+    pub fragment_presence: Vec<SmallVec<[bool; 32]>>
+}
 
 pub struct WorkerContext<'a, F: RawFs> {
     pub cache: Option<&'a FragmentCache>,
@@ -102,7 +109,7 @@ pub struct WorkerContext<'a, F: RawFs> {
 
     pub pending_file_keys: Vec<FileKey>,
     pub pending_file_metas: Vec<FileMeta>,
-    pub pending_had_matches: Vec<bool>,
+    pub pending_fragment_presence: Vec<SmallVec<[bool; 32]>>,
 }
 
 impl<F: RawFs> WorkerContext<'_, F> {
@@ -115,12 +122,12 @@ impl<F: RawFs> WorkerContext<'_, F> {
     #[inline(always)]
     fn finish(mut self) -> WorkerResult {
         self.flush_output();
-        (
-            self.stats,
-            self.pending_file_keys,
-            self.pending_file_metas,
-            self.pending_had_matches
-        )
+        WorkerResult {
+            stats: self.stats,
+            file_keys: self.pending_file_keys,
+            file_metas: self.pending_file_metas,
+            fragment_presence: self.pending_fragment_presence
+        }
     }
 
     #[inline(always)]
@@ -428,7 +435,8 @@ impl<F: RawFs> WorkerContext<'_, F> {
             if let Some((file_key, file_meta)) = cache_key {
                 self.pending_file_keys.push(file_key);
                 self.pending_file_metas.push(file_meta);
-                self.pending_had_matches.push(had_matches);
+                let fragment_presence = self.check_fragment_presence(had_matches);
+                self.pending_fragment_presence.push(fragment_presence);
             }
         } else {
             self.stats.files_skipped_as_binary_due_to_probe += 1;
@@ -437,6 +445,21 @@ impl<F: RawFs> WorkerContext<'_, F> {
         Ok(())
     }
 
+    #[inline]
+    fn check_fragment_presence(&self, had_matches: bool) -> SmallVec<[bool; 32]> {
+        let _span = tracy::span!("check_fragment_presence");
+
+        // ----- Fast path: if pattern matched, all pattern fragments must be present
+        if had_matches {
+            return smallvec![true; self.fragment_hashes.len()];
+        }
+
+        crate::fragments::check_fragment_presence(&self.parser.file, self.fragment_hashes)
+    }
+}
+
+// impl block for find_and_print_matches
+impl<F: RawFs> WorkerContext<'_, F> {
     #[inline]
     fn find_and_print_matches(&mut self) -> io::Result<bool> {
         let _span = tracy::span!("find_and_print_matches_fast");

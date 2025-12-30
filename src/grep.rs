@@ -16,7 +16,7 @@ use crate::platform::{device_id, device_size};
 use crate::ignore::{Gitignore, GitignoreChain};
 use crate::cache::{CacheConfig, FragmentCache};
 use crate::parser::{BufKind, FileId, FileNode, Parser, RawFs};
-use crate::worker::{DirWork, OutputWorker, WorkItem, WorkerContext};
+use crate::worker::{DirWork, OutputWorker, WorkItem, WorkerContext, WorkerResult};
 use crate::ext4::{
     Ext4Fs,
     EXT4_MAGIC_OFFSET,
@@ -137,7 +137,7 @@ impl<'a, F: RawFs> RawGrepper<'a, F> {
 
         let num_cores = num_physical_cores_or(threads);
 
-        let (all_file_keys, all_file_metas, all_had_matches) = std::thread::scope(|s| {
+        let (all_file_keys, all_file_metas, all_fragment_presence) = std::thread::scope(|s| {
             let output_handle = s.spawn(move || {
                 //
                 // Pin output thread to last core (often an E-core on hybrid CPUs)
@@ -177,10 +177,15 @@ impl<'a, F: RawFs> RawGrepper<'a, F> {
 
                         pending_file_keys: Vec::new(),
                         pending_file_metas: Vec::new(),
-                        pending_had_matches: Vec::new(),
+                        pending_fragment_presence: Vec::new(),
                     };
 
-                    let (worker_stats, file_keys, file_metas, had_matches) = worker.start_worker_loop(
+                    let WorkerResult {
+                        stats: worker_stats,
+                        file_keys,
+                        file_metas,
+                        fragment_presence
+                    } = worker.start_worker_loop(
                         running,
                         active_workers,
                         injector,
@@ -190,26 +195,26 @@ impl<'a, F: RawFs> RawGrepper<'a, F> {
 
                     worker_stats.merge_into(stats);
 
-                    (file_keys, file_metas, had_matches)
+                    (file_keys, file_metas, fragment_presence)
                 })
             }).collect::<Vec<_>>();
 
             let mut all_file_keys   = Vec::new();
             let mut all_file_metas  = Vec::new();
-            let mut all_had_matches = Vec::new();
+            let mut all_fragment_presence = Vec::new();
 
             for handle in handles {
-                if let Ok((file_keys, file_metas, had_matches)) = handle.join() {
+                if let Ok((file_keys, file_metas, fragment_presence)) = handle.join() {
                     all_file_keys.extend(file_keys);
                     all_file_metas.extend(file_metas);
-                    all_had_matches.extend(had_matches);
+                    all_fragment_presence.extend(fragment_presence);
                 }
             }
 
             drop(output_tx);
             _ = output_handle.join();
 
-            (all_file_keys, all_file_metas, all_had_matches)
+            (all_file_keys, all_file_metas, all_fragment_presence)
         });
 
         if let Some(cache) = &mut self.cache {
@@ -217,7 +222,7 @@ impl<'a, F: RawFs> RawGrepper<'a, F> {
                 all_file_keys,
                 all_file_metas,
                 &self.fragment_hashes,
-                all_had_matches
+                all_fragment_presence
             ) {
                 eprintln_red!("error: failed to merge cache updates: {e}");
             }

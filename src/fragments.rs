@@ -34,6 +34,7 @@
 //! - Similar to Bloom filters but with explicit tracking
 
 use nohash_hasher::IntSet;
+use smallvec::{smallvec, SmallVec};
 
 /// Hash a 4-byte fragment to u32.
 #[inline(always)]
@@ -93,114 +94,213 @@ pub fn extract_pattern_fragments(pattern: &[u8]) -> Vec<u32> {
     fragments
 }
 
+/// Returns a SmallVec where `result[i]` is true if `fragment_hashes[i]` was found in the buffer.
 #[inline]
-fn extract_file_fragments_no_simd(buf: &[u8], max_fragments: usize) -> Vec<u32> {
-    if buf.len() < 4 {
-        return Vec::new();
+pub fn check_fragment_presence(buf: &[u8], fragment_hashes: &[u32]) -> SmallVec<[bool; 32]> {
+    let num_frags = fragment_hashes.len();
+
+    if num_frags == 0 {
+        return SmallVec::new();
     }
 
+    if buf.len() < 4 {
+        return smallvec![false; num_frags];
+    }
+
+    #[cfg(target_arch = "x86_64")] {
+        if is_x86_feature_detected!("avx2") && buf.len() >= 32 {
+            return unsafe { check_fragment_presence_avx2(buf, fragment_hashes) };
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")] {
+        if std::arch::is_aarch64_feature_detected!("neon") && buf.len() >= 16 {
+            return unsafe { check_fragment_presence_neon(buf, fragment_hashes) };
+        }
+    }
+
+    check_fragment_presence_scalar(buf, fragment_hashes)
+}
+
+/// Scalar fallback for fragment presence checking
+#[inline]
+fn check_fragment_presence_scalar(buf: &[u8], fragment_hashes: &[u32]) -> SmallVec<[bool; 32]> {
+    let num_frags = fragment_hashes.len();
     let stride = stride_heuristic(buf.len());
 
-    let mut seen = IntSet::default();
-    let mut fragments = Vec::with_capacity(max_fragments.min(buf.len() / stride));
+    // Build a set of pattern fragment hashes for O(1) lookup
+    let pattern_frag_set = fragment_hashes.iter().copied().collect::<IntSet<_>>();
+
+    let mut found: SmallVec<[bool; 32]> = smallvec![false; num_frags];
+    let mut found_count = 0;
 
     let mut i = 0;
-    while i + 4 <= buf.len() && fragments.len() < max_fragments {
-        let mut frag = [0u8; 4];
-        frag.copy_from_slice(&buf[i..i + 4]);
-        let hash = hash_fragment(frag);
+    while i + 4 <= buf.len() {
+        let hash = hash_fragment([buf[i], buf[i + 1], buf[i + 2], buf[i + 3]]);
 
-        if seen.insert(hash) {
-            fragments.push(hash);
+        if pattern_frag_set.contains(&hash) {
+            for (idx, &frag_hash) in fragment_hashes.iter().enumerate() {
+                if frag_hash == hash && !found[idx] {
+                    found[idx] = true;
+                    found_count += 1;
+
+                    if found_count == num_frags {
+                        return found;
+                    }
+
+                    break;
+                }
+            }
         }
 
         i += stride;
     }
 
-    fragments
+    found
 }
 
+/// AVX2-optimized fragment presence checking (x86_64).
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn extract_file_fragments_simd(
-    buf: &[u8],
-    stride: usize,
-    max_fragments: usize,
-) -> Vec<u32> {
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn check_fragment_presence_avx2(buf: &[u8], fragment_hashes: &[u32]) -> SmallVec<[bool; 32]> {
     use std::arch::x86_64::*;
 
-    if buf.len() < 32 {
-        return extract_file_fragments_no_simd(buf, max_fragments);
-    }
+    let num_frags = fragment_hashes.len();
+    let stride = stride_heuristic(buf.len()).max(8); // at least 8 for AVX2
+    let mut found = smallvec![false; num_frags];
+    let mut found_mask: u32 = 0;
+    let all_found_mask: u32 = (1u32 << num_frags) - 1;
 
-    let mut seen = IntSet::default();
-    let mut fragments = Vec::with_capacity(max_fragments);
+    //
+    // Hash multiplier constant: 0x9e3779b9 (golden ratio)
+    //
+    let hash_mult = _mm256_set1_epi32(0x9e3779b9_u32 as i32);
 
+    let buf_len = buf.len();
     let mut offset = 0;
-    while offset + 32 <= buf.len() && fragments.len() < max_fragments {
-        let data = unsafe { _mm256_loadu_si256(buf.as_ptr().add(offset) as *const __m256i) };
 
-        // Extract 8 overlapping 4-byte fragments at once
-        // We can use shuffle/permute to get different 4-byte windows
+    //
+    // Process 8 overlapping windows at a time
+    //
+    while offset + (12 - 1) <= buf_len {
+        let data_ptr = buf.as_ptr().add(offset);
+        let w0 = (data_ptr.add(0) as *const u32).read_unaligned();
+        let w1 = (data_ptr.add(1) as *const u32).read_unaligned();
+        let w2 = (data_ptr.add(2) as *const u32).read_unaligned();
+        let w3 = (data_ptr.add(3) as *const u32).read_unaligned();
+        let w4 = (data_ptr.add(4) as *const u32).read_unaligned();
+        let w5 = (data_ptr.add(5) as *const u32).read_unaligned();
+        let w6 = (data_ptr.add(6) as *const u32).read_unaligned();
+        let w7 = (data_ptr.add(7) as *const u32).read_unaligned();
 
-        // For positions 0, 4, 8, 12, 16, 20, 24, 28 (non-overlapping)
-        // Extract as 32-bit integers directly
-        let lane0 = _mm256_extract_epi32::<0>(data) as u32;
-        let lane1 = _mm256_extract_epi32::<1>(data) as u32;
-        let lane2 = _mm256_extract_epi32::<2>(data) as u32;
-        let lane3 = _mm256_extract_epi32::<3>(data) as u32;
-        let lane4 = _mm256_extract_epi32::<4>(data) as u32;
-        let lane5 = _mm256_extract_epi32::<5>(data) as u32;
-        let lane6 = _mm256_extract_epi32::<6>(data) as u32;
-        let lane7 = _mm256_extract_epi32::<7>(data) as u32;
+        let windows = _mm256_set_epi32(
+            w7 as i32, w6 as i32, w5 as i32, w4 as i32,
+            w3 as i32, w2 as i32, w1 as i32, w0 as i32
+        );
 
-        for &frag in &[lane0, lane1, lane2, lane3, lane4, lane5, lane6, lane7] {
-            if fragments.len() >= max_fragments {
-                break;
+        let hashes = _mm256_mullo_epi32(windows, hash_mult);
+
+        //
+        // Compare against each pattern hash
+        //
+        for (frag_idx, &frag_hash) in fragment_hashes.iter().enumerate() {
+            if found_mask & (1 << frag_idx) != 0 {
+                continue;
             }
-            let hash = hash_fragment_u32(frag);
-            if seen.insert(hash) {
-                fragments.push(hash);
+
+            let pattern_hash = _mm256_set1_epi32(frag_hash as i32);
+            let cmp = _mm256_cmpeq_epi32(hashes, pattern_hash);
+            let mask = _mm256_movemask_epi8(cmp);
+
+            if mask != 0 {
+                found[frag_idx] = true;
+                found_mask |= 1 << frag_idx;
+
+                if found_mask == all_found_mask {
+                    return found;
+                }
             }
         }
 
-        offset += stride.max(32);
-    }
-
-    while offset + 4 <= buf.len() && fragments.len() < max_fragments {
-        let frag = u32::from_le_bytes(buf[offset..offset + 4].try_into().unwrap());
-        let hash = hash_fragment_u32(frag);
-        if seen.insert(hash) {
-            fragments.push(hash);
-        }
         offset += stride;
     }
 
-    fragments
+    found
 }
 
-/// Extract fragments with SIMD if available, fall back to scalar
-#[inline]
-pub fn extract_file_fragments(buf: &[u8], max_fragments: usize) -> Vec<u32> {
-    if buf.len() < 4 {
-        return Vec::new();
-    }
+/// NEON-optimized fragment presence checking (ARM64).
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn check_fragment_presence_neon(buf: &[u8], fragment_hashes: &[u32]) -> SmallVec<[bool; 32]> {
+    use std::arch::aarch64::*;
 
-    let stride = stride_heuristic(buf.len());
+    let num_frags = fragment_hashes.len();
+    let stride = stride_heuristic(buf.len()).max(4); // At least 4 for NEON
+    let mut found: SmallVec<[bool; 32]> = smallvec![false; num_frags];
+    let mut found_mask: u32 = 0;
+    let all_found_mask: u32 = (1u32 << num_frags) - 1;
 
-    #[cfg(target_arch = "x86_64")]
-    {
-        if is_x86_feature_detected!("avx2") && buf.len() >= 32 && stride >= 32 {
-            unsafe { extract_file_fragments_simd(buf, stride, max_fragments) }
-        } else {
-            extract_file_fragments_no_simd(buf, max_fragments)
+    //
+    // Hash multiplier constant: 0x9e3779b9 (golden ratio)
+    //
+    let hash_mult = vdupq_n_u32(0x9e3779b9);
+
+    let buf_len = buf.len();
+    let mut offset = 0;
+
+    //
+    // Process 4 overlapping windows at a time
+    //
+    while offset + 7 <= buf_len {
+        let data_ptr = buf.as_ptr().add(offset);
+
+        //
+        // Load 4 overlapping 4-byte windows
+        //
+        let w0 = (data_ptr.add(0) as *const u32).read_unaligned();
+        let w1 = (data_ptr.add(1) as *const u32).read_unaligned();
+        let w2 = (data_ptr.add(2) as *const u32).read_unaligned();
+        let w3 = (data_ptr.add(3) as *const u32).read_unaligned();
+
+        //
+        // Pack into NEON register
+        let windows = vld1q_u32([w0, w1, w2, w3].as_ptr());
+
+        //
+        // Compute hashes: hash = window * 0x9e3779b9
+        //
+        let hashes = vmulq_u32(windows, hash_mult);
+
+        //
+        // Compare against each pattern hash
+        //
+        for (frag_idx, &frag_hash) in fragment_hashes.iter().enumerate() {
+            if found_mask & (1 << frag_idx) != 0 {
+                continue;
+            }
+
+            let pattern_hash = vdupq_n_u32(frag_hash);
+            let cmp = vceqq_u32(hashes, pattern_hash);
+
+            //
+            // Check if any lane matched (vmaxvq_u32 returns max of all lanes)
+            //
+            if vmaxvq_u32(cmp) != 0 {
+                found[frag_idx] = true;
+                found_mask |= 1 << frag_idx;
+
+                if found_mask == all_found_mask {
+                    return found;
+                }
+            }
         }
+
+        offset += stride;
     }
 
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        extract_file_fragments_no_simd(buf, max_fragments)
-    }
+    found
 }
 
 #[cfg(test)]
@@ -233,22 +333,23 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_file_fragments_small() {
-        let buf = b"test data here";
-        let frags = extract_file_fragments_no_simd(buf, 1000);
+    fn test_check_fragment_presence_found() {
+        let buf = b"hello world test";
+        let pattern_frags = extract_pattern_fragments(b"hello");
+        let found = check_fragment_presence(buf, &pattern_frags);
 
-        // should extract all 4-byte windows (stride=1 for small files)
-        assert!(frags.is_empty());
-        assert!(frags.len() <= buf.len() - 3);
+        // "hello" fragments should be found in "hello world test"
+        assert!(found.iter().all(|&x| x));
     }
 
     #[test]
-    fn test_extract_file_fragments_max_limit() {
-        let buf = vec![0u8; 100000];
-        let frags = extract_file_fragments_no_simd(&buf, 100);
+    fn test_check_fragment_presence_not_found() {
+        let buf = b"hello world test";
+        let pattern_frags = extract_pattern_fragments(b"xyzzy");
+        let found = check_fragment_presence(buf, &pattern_frags);
 
-        // should respect max_fragments limit
-        assert!(frags.len() <= 100);
+        // "xyzzy" fragments should NOT be found
+        assert!(found.iter().all(|&x| !x));
     }
 
     #[test]

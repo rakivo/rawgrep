@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use memmap2::Mmap;
+use smallvec::SmallVec;
 use serde::{Serialize, Deserialize};
 
 const FILE_LOOKUP_EMPTY: u32 = u32::MAX;
@@ -795,12 +796,15 @@ impl FragmentCache {
     }
 
     /// Merge thread-local cache buffers into cache (called once after all workers finish)
+    ///
+    /// `fragment_presence` contains per-fragment presence info for each file:
+    /// `fragment_presence[file_idx][frag_idx]` = true if that fragment is present in the file
     pub fn merge_updates(
         &mut self,
         file_keys: Vec<FileKey>,
         file_metas: Vec<FileMeta>,
         fragment_hashes: &[u32],
-        had_matches: Vec<bool>,
+        fragment_presence: Vec<SmallVec<[bool; 32]>>,
     ) -> io::Result<()> {
         if file_keys.is_empty() {
             return Ok(());
@@ -830,7 +834,7 @@ impl FragmentCache {
         for i in 0..file_keys.len() {
             let file_key = file_keys[i];
             let file_meta = file_metas[i];
-            let matched = had_matches[i];
+            let presence = &fragment_presence[i];
             let num_files = self.num_files.load(Ordering::Relaxed) as usize;
             if num_files >= self.file_capacity {
                 break; // at capacity (will grow on next merge if more files)
@@ -857,20 +861,21 @@ impl FragmentCache {
             // --------- Update metadata
             self.owned_file_metas.as_mut().unwrap()[file_id] = file_meta;
 
-            // --------- Add fragments and collect indices
+            // --------- Add fragments and collect indices with their presence status
             //
             // Limit to 100 fragments per file
             //
             // @Constant @Tune
-            let mut fragment_indices = Vec::with_capacity(fragment_hashes.len().min(100));
-            for &frag_hash in fragment_hashes.iter().take(100) {
+            let mut fragment_data = Vec::with_capacity(fragment_hashes.len().min(100));
+            for (frag_i, &frag_hash) in fragment_hashes.iter().take(100).enumerate() {
                 let frag_idx = self.add_fragment(frag_hash);
-                fragment_indices.push(frag_idx);
+                let is_present = presence.get(frag_i).copied().unwrap_or(false);
+                fragment_data.push((frag_idx, is_present));
             }
 
             // Track if this is a new file (needs bitset initialization)
             let is_new = file_id >= original_num_files;
-            file_updates.push((file_id, fragment_indices, matched, is_new));
+            file_updates.push((file_id, fragment_data, is_new));
         }
 
         //
@@ -883,7 +888,7 @@ impl FragmentCache {
         let bits_per_file_u64 = num_fragments.div_ceil(64);
         let owned_file_bitsets = self.owned_file_bitsets.as_mut().unwrap();
 
-        for (file_id, fragment_indices, matched, is_new) in file_updates {
+        for (file_id, fragment_data, is_new) in file_updates {
             let offset = file_id * bits_per_file_u64;
 
             // ----- Initialize new file's bitset to all !0 (all fragments absent)
@@ -896,11 +901,11 @@ impl FragmentCache {
                 }
             }
 
-            for frag_idx in fragment_indices {
+            for (frag_idx, is_present) in fragment_data {
                 let u64_idx = offset + (frag_idx / 64);
                 let bit_idx = frag_idx % 64;
                 if u64_idx < owned_file_bitsets.len() {
-                    if matched {
+                    if is_present {
                         // ----- Fragment PRESENT - clear bit (bit=0)
                         owned_file_bitsets[u64_idx] &= !(1u64 << bit_idx);
                     } else {
