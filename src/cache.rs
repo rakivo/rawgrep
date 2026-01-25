@@ -1,6 +1,7 @@
 use crate::util::{likely, unlikely};
 
 use std::fs::File;
+use std::mem::MaybeUninit;
 use std::time::Instant;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -327,12 +328,22 @@ impl FragmentCache {
                 new_file_metas.as_mut_ptr() as *mut FileMeta,
                 num_files,
             );
-            // copy used bitsets from mmap
-            std::ptr::copy_nonoverlapping(
-                self.file_bitsets.ptr,
-                new_file_bitsets.as_mut_ptr() as *mut u64,
-                self.file_bitsets.len().min(used_u64s),
-            );
+
+            let old_bits_per_file = num_fragments.div_ceil(64);
+            let new_bits_per_file = bits_per_file_u64; // (self.max_fragments as usize).div_ceil(64)
+
+            for file_id in 0..num_files {
+                std::ptr::copy_nonoverlapping(
+                    self.file_bitsets.ptr.add(file_id * old_bits_per_file),
+                    new_file_bitsets.as_mut_ptr().add(file_id * new_bits_per_file) as *mut u64,
+                    old_bits_per_file,
+                );
+
+                // Zero remaining u64s in this file's new bitset (for fragments num_fragments..max_fragments)
+                for i in old_bits_per_file..new_bits_per_file {
+                    new_file_bitsets.as_mut_ptr().add(file_id * new_bits_per_file + i).write(MaybeUninit::new(0u64));
+                }
+            }
 
             //
             // We leave the rest uninitialized - `merge_updates` will
@@ -955,7 +966,7 @@ impl FragmentCache {
             //
 
             let num_files = self.num_files.load(Ordering::Relaxed) as usize;
-            let bits_per_file_u64 = (num_fragments + 64) / 64;
+            let bits_per_file_u64 = (self.max_fragments as usize + 63) / 64;
             let u64_offset = idx / 64;
             let bit_idx = idx % 64;
 
@@ -979,6 +990,22 @@ impl FragmentCache {
 
             let next_pos = (ring_pos + 1) % (self.max_fragments as usize);
             self.ring_pos.store(next_pos as u32, Ordering::Relaxed);
+
+            //
+            // Clear this fragment position for all files (unknown state)
+            //
+            let num_files = self.num_files.load(Ordering::Relaxed) as usize;
+            let bits_per_file_u64 = (self.max_fragments as usize + 63) / 64;
+            let u64_offset = idx / 64;
+            let bit_idx = idx % 64;
+
+            for file_id in 0..num_files {
+                let bitset_idx = file_id * bits_per_file_u64 + u64_offset;
+                if bitset_idx < owned_file_bitsets.len() {
+                    // clear the bit (unknown/must-check)
+                    owned_file_bitsets[bitset_idx] &= !(1u64 << bit_idx);
+                }
+            }
 
             idx
         }
