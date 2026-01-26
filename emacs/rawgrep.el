@@ -1,14 +1,23 @@
 ;;; rawgrep.el --- Emacs integration for rawgrep -*- lexical-binding: t; -*-
+
 ;; Copyright (C) 2025
 ;; Author: Mark Tyrkba <marktyrkba456@gmail.com>
 ;; Version: 0.1.1
 ;; Package-Requires: ((emacs "24.1"))
 ;; Keywords: tools, grep, search
 ;; URL: https://github.com/rakivo/rawgrep
-
 ;;; Commentary:
 ;; This package provides Emacs integration for rawgrep, a fast grep alternative.
 ;; It allows you to interactively search using rawgrep with jumpable results.
+;;
+;; Usage:
+;;   M-x rawgrep
+;;
+;; Suggested keybinding (add to your init.el):
+;;   (global-set-key (kbd "M-e") 'rawgrep)
+;;
+;; Or use the provided helper:
+;;   (rawgrep-set-keybinding)
 
 ;;; Code:
 (defgroup rawgrep nil
@@ -85,8 +94,7 @@ Press C-g while editing arguments to cancel the search entirely."
     (error "Cannot find rawgrep executable.  Please set `rawgrep-executable'"))
   
   (let ((args (or rawgrep--last-args ""))
-        (path (or (and (not (string-empty-p rawgrep--last-path)) rawgrep--last-path)
-                  default-directory))
+        (path default-directory)
         (done nil))
     
     (condition-case nil
