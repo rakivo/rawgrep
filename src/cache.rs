@@ -141,6 +141,7 @@ impl<T: Copy> FatPtr<T> {
         unsafe { *ptr.add(idx) }
     }
 
+    #[allow(unused)]
     #[inline(always)]
     fn len(&self) -> usize {
         self.len
@@ -302,7 +303,6 @@ impl FragmentCache {
 
         let bits_per_file_u64 = (self.max_fragments as usize).div_ceil(64);
         let total_u64s = new_capacity * bits_per_file_u64;
-        let used_u64s = num_files * bits_per_file_u64;
 
         // allocate uninit and only copy what we need
         let mut new_file_bitsets = Box::<[u64]>::new_uninit_slice(total_u64s);
@@ -966,7 +966,7 @@ impl FragmentCache {
             //
 
             let num_files = self.num_files.load(Ordering::Relaxed) as usize;
-            let bits_per_file_u64 = (self.max_fragments as usize + 63) / 64;
+            let bits_per_file_u64 = (self.max_fragments as usize).div_ceil(64);
             let u64_offset = idx / 64;
             let bit_idx = idx % 64;
 
@@ -995,7 +995,7 @@ impl FragmentCache {
             // Clear this fragment position for all files (unknown state)
             //
             let num_files = self.num_files.load(Ordering::Relaxed) as usize;
-            let bits_per_file_u64 = (self.max_fragments as usize + 63) / 64;
+            let bits_per_file_u64 = (self.max_fragments as usize).div_ceil(64);
             let u64_offset = idx / 64;
             let bit_idx = idx % 64;
 
