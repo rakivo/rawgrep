@@ -65,6 +65,7 @@ gdt-cpus = { version = "25", default-features = false }
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
+    "Win32_System_Threading",
     "Win32_Storage_FileSystem",
     "Win32_System_IO",
     "Win32_System_Ioctl",

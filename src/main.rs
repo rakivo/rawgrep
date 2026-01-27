@@ -48,6 +48,8 @@ fn main() -> io::Result<()> {
     #[cfg(feature = "dhat")]
     let _profiler = dhat::Profiler::new_heap();
 
+    _ = rawgrep::platform::set_process_priority(-10);
+
     let cli = Cli::parse();
 
     let search_root_path_buf = match fs::canonicalize(&cli.search_root_path) {

@@ -19,6 +19,10 @@ pub trait Platform {
     /// Detect which partition/device a given path is mounted on
     /// Returns the device path (e.g., "/dev/sda1" on Linux)
     fn detect_partition_for_path(path: &Path) -> io::Result<String>;
+
+    /// Set process priority (-20 to 19, lower = higher priority)
+    /// Returns Ok(()) on success, Err on failure
+    fn set_process_priority(priority: i32) -> io::Result<()>;
 }
 
 // ============================================================================
@@ -135,6 +139,18 @@ pub mod linux {
                     ),
                 )
             })
+        }
+
+        fn set_process_priority(priority: i32) -> io::Result<()> {
+            let result = unsafe {
+                libc::setpriority(libc::PRIO_PROCESS, 0, priority)
+            };
+
+            if result == -1 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
         }
     }
 
@@ -266,6 +282,18 @@ pub mod macos {
                     "Device path contains invalid UTF-8"
                 ))
         }
+
+        fn set_process_priority(priority: i32) -> io::Result<()> {
+            let result = unsafe {
+                libc::setpriority(libc::PRIO_PROCESS, 0, priority)
+            };
+
+            if result == -1 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        }
     }
 }
 
@@ -286,6 +314,11 @@ pub mod windows {
     };
     use windows_sys::Win32::System::IO::DeviceIoControl;
     use windows_sys::Win32::System::Ioctl::IOCTL_DISK_GET_LENGTH_INFO;
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentProcess, SetPriorityClass,
+        ABOVE_NORMAL_PRIORITY_CLASS, HIGH_PRIORITY_CLASS,
+        NORMAL_PRIORITY_CLASS, BELOW_NORMAL_PRIORITY_CLASS,
+    };
 
     /// GET_LENGTH_INFORMATION structure for IOCTL_DISK_GET_LENGTH_INFO
     #[repr(C)]
@@ -393,6 +426,26 @@ pub mod windows {
             let trimmed = volume_str.trim_end_matches('\\');
             Ok(format!("\\\\.\\{trimmed}"))
         }
+
+        fn set_process_priority(priority: i32) -> io::Result<()> {
+            // Windows uses different priority classes, map Unix nice values to them
+            let priority_class = match priority {
+                i32::MIN..=-10 => HIGH_PRIORITY_CLASS,           // High priority
+                -9..=0 => ABOVE_NORMAL_PRIORITY_CLASS,           // Above normal
+                1..=10 => NORMAL_PRIORITY_CLASS,                 // Normal
+                11..=i32::MAX => BELOW_NORMAL_PRIORITY_CLASS,    // Below normal
+            };
+
+            let result = unsafe {
+                SetPriorityClass(GetCurrentProcess(), priority_class)
+            };
+
+            if result == 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        }
     }
 }
 
@@ -426,4 +479,9 @@ pub fn device_id(fd: &File) -> io::Result<u64> {
 #[inline]
 pub fn detect_partition_for_path(path: &Path) -> io::Result<String> {
     CurrentPlatform::detect_partition_for_path(path)
+}
+
+#[inline]
+pub fn set_process_priority(priority: i32) -> io::Result<()> {
+    CurrentPlatform::set_process_priority(priority)
 }
