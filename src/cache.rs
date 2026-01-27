@@ -966,7 +966,7 @@ impl FragmentCache {
             //
 
             let num_files = self.num_files.load(Ordering::Relaxed) as usize;
-            let bits_per_file_u64 = (self.max_fragments as usize).div_ceil(64);
+            let bits_per_file_u64 = (num_fragments as usize).div_ceil(64);
             let u64_offset = idx / 64;
             let bit_idx = idx % 64;
 
