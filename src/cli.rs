@@ -42,7 +42,7 @@ pub struct BufferConfig {
     name = "rawgrep",
     about = "Grep at the speed of raw disk",
     long_about = None,
-    version = "1.0",
+    version = "0.1.2",
     arg_required_else_help = true,
     override_usage = "<PATTERN> [PATH ...]"
 )]

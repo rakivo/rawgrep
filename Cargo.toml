@@ -1,6 +1,6 @@
 [package]
 name = "rawgrep"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 authors = ["Mark Tyrkba <marktyrkba456@gmail.com>"]
 readme = "README.md"
