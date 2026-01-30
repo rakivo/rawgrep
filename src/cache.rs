@@ -1,7 +1,6 @@
 use crate::util::{likely, unlikely};
 
 use std::fs::File;
-use std::mem::MaybeUninit;
 use std::time::Instant;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -303,6 +302,7 @@ impl FragmentCache {
 
         let bits_per_file_u64 = (self.max_fragments as usize).div_ceil(64);
         let total_u64s = new_capacity * bits_per_file_u64;
+        let used_u64s = num_files * bits_per_file_u64;
 
         // allocate uninit and only copy what we need
         let mut new_file_bitsets = Box::<[u64]>::new_uninit_slice(total_u64s);
@@ -329,21 +329,14 @@ impl FragmentCache {
                 num_files,
             );
 
-            let old_bits_per_file = num_fragments.div_ceil(64);
-            let new_bits_per_file = bits_per_file_u64; // (self.max_fragments as usize).div_ceil(64)
-
-            for file_id in 0..num_files {
-                std::ptr::copy_nonoverlapping(
-                    self.file_bitsets.ptr.add(file_id * old_bits_per_file),
-                    new_file_bitsets.as_mut_ptr().add(file_id * new_bits_per_file) as *mut u64,
-                    old_bits_per_file,
-                );
-
-                // Zero remaining u64s in this file's new bitset (for fragments num_fragments..max_fragments)
-                for i in old_bits_per_file..new_bits_per_file {
-                    new_file_bitsets.as_mut_ptr().add(file_id * new_bits_per_file + i).write(MaybeUninit::new(0u64));
-                }
-            }
+            //
+            // Copy used bitsets from mmap!!
+            //
+            std::ptr::copy_nonoverlapping(
+                self.file_bitsets.ptr,
+                new_file_bitsets.as_mut_ptr() as *mut u64,
+                self.file_bitsets.len().min(used_u64s),
+            );
 
             //
             // We leave the rest uninitialized - `merge_updates` will
@@ -966,7 +959,7 @@ impl FragmentCache {
             //
 
             let num_files = self.num_files.load(Ordering::Relaxed) as usize;
-            let bits_per_file_u64 = (num_fragments as usize).div_ceil(64);
+            let bits_per_file_u64 = num_fragments.div_ceil(64);
             let u64_offset = idx / 64;
             let bit_idx = idx % 64;
 
