@@ -1,3 +1,49 @@
+// @Testing @Refactor @Architecture
+//
+// TODO(#29): FragmentCache refactor
+// |
+// The FragmentCache is currently a mess to test because it's tightly coupled to disk I/O and mmap.
+// |
+// # Problems:
+// - Hard dependency on File/Mmap makes unit testing painful
+// - Can't easily test the core skip logic without dragging in filesystem
+// - No way to inject test data without going through serialization
+// |
+// What needs to happen:
+// |
+// * Extract a CacheStorage trait or similar to abstract the I/O layer
+//    * Real impl uses File/Mmap
+//    * Test impl uses in-memory HashMap or whatever
+//    * This lets us test the actual caching logic independently
+// |
+// * Add a ::new_in_memory() constructor for tests
+//    * Bypasses all disk operations
+//    * Just allocates the owned_* buffers directly
+//    * Use #[cfg(test)] to keep it out of release builds
+// |
+// * Add a ::with_test_data() that takes pre-populated arrays
+//    * Skip the whole merge_updates path for simple cases
+//    * Directly populate fragment_hashes, file_keys, etc.
+//    * Makes setup for tests like "file has absent fragment" simple
+// |
+// * Add property-based tests with proptest
+//    * Fuzz the ring buffer eviction (does it handle overflow correctly?)
+//    * Random file insertions (does lookup table stay consistent?)
+//    * Random fragment additions (does bitset math work?)
+// |
+// * Integration tests with tempfile for serialization
+//    * Test the actual mmap round-trip works
+//    * Verify alignment/padding is correct
+//    * Check that we can actually load what we saved
+// |
+// # The need
+//     The cache works fine in production, but there was a few times
+//     when it returned false-positives and I didn't get ALL the matches.
+//     |
+//     It was before all the fixes I did, and I don't remember that happening anymore,
+//     but for Software to be robust it must be tested thoroughly.
+//
+
 use crate::util::{likely, unlikely};
 
 use std::fs::File;
