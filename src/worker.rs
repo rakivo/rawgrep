@@ -332,9 +332,7 @@ impl<F: RawFs> WorkerContext<'_, F> {
 
         let _span = tracy::span!("process_files");
 
-        for i in 0..files.len() {
-            let (file_id, name_fat_ptr) = files[i];
-
+        for &(file_id, name_fat_ptr) in files {
             let Ok(node) = self.fs.parse_node(file_id) else {
                 continue;
             };

@@ -38,7 +38,7 @@ impl<'a> RawGrepper<'a, Ext4Fs> {
         let mut sb_bytes = [0u8; EXT4_SUPERBLOCK_SIZE];
         {
             use std::os::unix::fs::FileExt;
-            file.read_at(&mut sb_bytes, EXT4_SUPERBLOCK_OFFSET as u64)?;
+            file.read_at(&mut sb_bytes, EXT4_SUPERBLOCK_OFFSET)?;
         }
 
         let magic = u16::from_le_bytes([
