@@ -78,14 +78,14 @@ impl GitignoreChain {
                     .filter(|(d, _)| *d <= depth)
                     .cloned()
                     .collect();
-                
+
                 let mut has_any_negations = has_negations;
                 for (_, gi) in &new_stack {
                     has_any_negations |= gi.has_negations;
                 }
-                
+
                 new_stack.push((depth, new_gi));
-                
+
                 Self {
                     inner: Some(Arc::new(GitignoreChainInner {
                         stack: new_stack,
@@ -694,17 +694,17 @@ pub fn build_gitignore_from_file(gitignore_path: &str) -> Option<Gitignore> {
     Some(Gitignore::from_bytes(&content))
 }
 
-// ============================================================================
+//
 // Tests
-// ============================================================================
+//
 
 #[cfg(test)]
 mod chain_tests {
     use super::*;
 
-    // =========================================================================
+    //
     // BASIC CHAIN OPERATIONS
-    // =========================================================================
+    //
 
     #[test]
     fn test_empty_chain() {
@@ -738,9 +738,9 @@ mod chain_tests {
         assert!(chain.is_ignored(b"deep/path/file.tmp", false));
     }
 
-    // =========================================================================
+    //
     // CHAIN DEPTH AND STACKING
-    // =========================================================================
+    //
 
     #[test]
     fn test_chain_with_gitignore_adds_depth() {
@@ -836,9 +836,9 @@ mod chain_tests {
         assert!(chain.is_ignored(b"test.bak", false));
     }
 
-    // =========================================================================
+    //
     // NEGATION HANDLING IN CHAIN
-    // =========================================================================
+    //
 
     #[test]
     fn test_chain_negation_in_same_gitignore() {
@@ -912,9 +912,9 @@ mod chain_tests {
         assert!(chain.is_ignored(b"doc.md", false));
     }
 
-    // =========================================================================
+    //
     // CLONING AND ARC BEHAVIOR
-    // =========================================================================
+    //
 
     #[test]
     fn test_chain_clone_is_cheap() {
@@ -963,9 +963,9 @@ mod chain_tests {
         assert!(chain_modified.is_ignored(b"test.tmp", false));
     }
 
-    // =========================================================================
+    //
     // REAL-WORLD SCENARIOS
-    // =========================================================================
+    //
 
     #[test]
     fn test_chain_typical_project_structure() {
@@ -1110,9 +1110,9 @@ __pycache__/
         assert!(!chain_tests.is_ignored(b"types.generated.rs", false));
     }
 
-    // =========================================================================
+    //
     // EDGE CASES
-    // =========================================================================
+    //
 
     #[test]
     fn test_chain_empty_gitignore() {
@@ -1208,9 +1208,9 @@ __pycache__/
         assert!(chain.is_ignored(b"file-with-dashes.log", false));
     }
 
-    // =========================================================================
+    //
     // PERFORMANCE-RELATED TESTS
-    // =========================================================================
+    //
 
     #[test]
     fn test_chain_many_gitignores() {

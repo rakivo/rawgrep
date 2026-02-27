@@ -71,6 +71,10 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_Ioctl",
 ] }
 
+[dev-dependencies]
+proptest = "1"
+tempfile = "3"
+
 [build-dependencies]
 rustc_version = "0.2"
 

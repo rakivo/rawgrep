@@ -25,9 +25,9 @@ pub trait Platform {
     fn set_process_priority(priority: i32) -> io::Result<()>;
 }
 
-// ============================================================================
+//
 // Linux implementation
-// ============================================================================
+//
 
 #[cfg(target_os = "linux")]
 pub mod linux {
@@ -188,9 +188,9 @@ pub mod linux {
     }
 }
 
-// ============================================================================
+//
 // macOS implementation
-// ============================================================================
+//
 
 #[cfg(target_os = "macos")]
 pub mod macos {
@@ -297,9 +297,9 @@ pub mod macos {
     }
 }
 
-// ============================================================================
+//
 // Windows implementation
-// ============================================================================
+//
 
 #[cfg(target_os = "windows")]
 pub mod windows {
@@ -449,9 +449,9 @@ pub mod windows {
     }
 }
 
-// ============================================================================
+//
 // Platform type alias for current OS
-// ============================================================================
+//
 
 #[cfg(target_os = "linux")]
 pub type CurrentPlatform = linux::LinuxPlatform;
@@ -462,9 +462,9 @@ pub type CurrentPlatform = macos::MacOSPlatform;
 #[cfg(target_os = "windows")]
 pub type CurrentPlatform = windows::WindowsPlatform;
 
-// ===============================================
+//
 // Convenience functions using CurrentPlatform
-// ===============================================
+//
 
 #[inline]
 pub fn device_size(fd: &File) -> io::Result<u64> {

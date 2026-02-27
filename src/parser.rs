@@ -69,9 +69,6 @@ pub trait RawFs: Sync + Send {
     /// Parse file node by ID
     fn parse_node(&self, file_id: FileId) -> io::Result<Self::Node>;
 
-    /// Get a block's data (zero-copy slice into mmap)
-    fn get_block(&self, block_num: u64) -> &[u8];
-
     /// Read file content into buffer, returns false if binary detected
     fn read_file_content(
         &self,
@@ -82,18 +79,12 @@ pub trait RawFs: Sync + Send {
         check_binary: bool,
     ) -> io::Result<bool>;
 
-    /// Prefetch file data for upcoming read
-    fn prefetch_file(&self, parser: &mut Parser, node: &Self::Node, size: usize);
-
     /// Iterate directory entries from buffer
     fn with_directory_entries<R>(
         &self,
         buf: &[u8],
         callback: impl FnMut(FileId, usize, usize, FileType) -> ControlFlow<R>
     ) -> Option<R>;
-
-    /// Prefetch a memory region
-    fn prefetch_region(&self, offset: usize, length: usize);
 }
 
 /// Result of scanning directory entries

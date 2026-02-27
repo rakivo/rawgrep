@@ -74,7 +74,7 @@ fn main() -> io::Result<()> {
     let search_root_path = search_root_path_buf.to_string_lossy();
     let search_root_path = search_root_path.as_ref();
 
-    let (_file, mmap) = match open_device(&device) {
+    let file = match open_device(&device) {
         Ok(ok) => ok,
         Err(e) => {
             match e.kind() {
@@ -92,7 +92,7 @@ fn main() -> io::Result<()> {
         }
     };
 
-    let grep = match RawGrepper::new_ext4(&device, &cli, &mmap) {
+    let grep = match RawGrepper::new_ext4(&cli, &device, file) {
         Ok(ok) => ok,
         Err(e) => {
             match e.kind() {

@@ -3,7 +3,6 @@ use std::io::{self, BufWriter};
 use std::fs::{File, OpenOptions};
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 
-use memmap2::{Mmap, MmapOptions};
 use crossbeam_channel::unbounded;
 use crossbeam_deque::{Injector, Worker as DequeWorker};
 
@@ -12,7 +11,7 @@ use crate::matcher::Matcher;
 use crate::{eprintln_red, tracy};
 use crate::path_buf::SmallPathBuf;
 use crate::stats::{AtomicStats, Stats};
-use crate::platform::{device_id, device_size};
+use crate::platform::device_id;
 use crate::ignore::{Gitignore, GitignoreChain};
 use crate::cache::{CacheConfig, FragmentCache};
 use crate::parser::{BufKind, FileId, FileNode, Parser, RawFs};
@@ -34,18 +33,18 @@ pub struct RawGrepper<'a, F: RawFs> {
 }
 
 /// impl block for ext4-specific construction
-impl<'a> RawGrepper<'a, Ext4Fs<'a>> {
-    pub fn new_ext4(device_path: &str, cli: &'a Cli, mmap: &'a Mmap) -> io::Result<Self> {
-        let sb_bytes = &mmap[
-            EXT4_SUPERBLOCK_OFFSET as usize..
-            EXT4_SUPERBLOCK_OFFSET as usize + EXT4_SUPERBLOCK_SIZE
-        ];
+impl<'a> RawGrepper<'a, Ext4Fs> {
+    pub fn new_ext4(cli: &'a Cli, _device_path: &str, file: File) -> io::Result<Self> {
+        let mut sb_bytes = [0u8; EXT4_SUPERBLOCK_SIZE];
+        {
+            use std::os::unix::fs::FileExt;
+            file.read_at(&mut sb_bytes, EXT4_SUPERBLOCK_OFFSET as u64)?;
+        }
 
         let magic = u16::from_le_bytes([
             sb_bytes[EXT4_MAGIC_OFFSET + 0],
             sb_bytes[EXT4_MAGIC_OFFSET + 1],
         ]);
-
         if magic != EXT4_SUPER_MAGIC {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -53,18 +52,12 @@ impl<'a> RawGrepper<'a, Ext4Fs<'a>> {
             ));
         }
 
-        let sb = Ext4Fs::parse_superblock(sb_bytes)?;
-
-        let file = OpenOptions::new()
-            .read(true)
-            .write(false)
-            .open(device_path)?;
-
+        let sb = Ext4Fs::parse_superblock(&sb_bytes)?;
         let device_id = device_id(&file)?;
+        let file_size = file.metadata()?.len();
+        let max_block = file_size / sb.block_size as u64;
 
-        let max_block = (mmap.len() / sb.block_size as usize) as u64;
-        let fs = Ext4Fs { mmap, sb, device_id, max_block };
-
+        let fs = Ext4Fs { sb, device_id, max_block, file };
         Self::new_with_fs(cli, fs)
     }
 }
@@ -280,8 +273,7 @@ impl<'a, F: RawFs> RawGrepper<'a, F> {
     fn warmup_filesystem(&self) {
         let _span = tracy::span!("RawGrepper::warmup_filesystem");
 
-        // Prefetch first few megabytes which typically contain metadata
-        self.fs.prefetch_region(0, 4 * 1024 * 1024);
+        // ...
 
         // Give the async prefetch time to start
         std::thread::yield_now();
@@ -289,22 +281,42 @@ impl<'a, F: RawFs> RawGrepper<'a, F> {
 }
 
 #[inline]
-pub fn open_device(device_path: &str) -> io::Result<(File, Mmap)> {
+pub fn open_device(device_path: &str) -> io::Result<File> {
+    //
+    // @Volatile
+    //
+    // I don't wanna force a sync of literally everything on the computer,
+    // cuz on some systems it might be completely detrimental to the speed of this tool.
+    //
+    // While correctness must be the top priority, speed should be at least the second top priority,
+    // hence I decided to instead do the `ioctl` call...
+    //
+    // Though, we'll see how reliable and cross-platform it is..
+    //
+    // {
+    //     let t = std::time::Instant::now();
+    //     unsafe { libc::sync(); }
+    //     eprintln!("sync: {:.2}ms", t.elapsed().as_secs_f64() * 1000.0);
+    // }
+    //
+
     let file = OpenOptions::new()
         .read(true)
         .write(false)
         .open(device_path)?;
 
-    let size = device_size(&file)?;
+    #[cfg(target_os = "linux")] {
+        use std::os::unix::io::AsRawFd;
+        const BLKFLSBUF: libc::c_ulong = 0x1261;
+        unsafe { libc::ioctl(file.as_raw_fd(), BLKFLSBUF, 0) };
+    }
 
-    let mmap = unsafe {
-        MmapOptions::new()
-            .offset(0)
-            .len(size as _)
-            .map(&file)?
-    };
+    #[cfg(unix)] {
+        use std::os::unix::io::AsRawFd;
+        unsafe { libc::syncfs(file.as_raw_fd()); }
+    }
 
-    Ok((file, mmap))
+    Ok(file)
 }
 
 #[inline]
@@ -331,9 +343,9 @@ pub fn create_matcher_or_exit(cli: &Cli) -> Matcher {
     }
 }
 
-// ==========================================================
+//
 // CPU affinity helpers - gdt-cpus has bugs on macOS, so we provide fallbacks
-// ==========================================================
+//
 
 /// Get number of physical cores, falling back to provided default
 #[inline]

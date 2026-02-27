@@ -14,16 +14,15 @@ use super::{
     EXT4_INODE_TABLE_OFFSET, EXT4_ROOT_INODE,
 };
 
+use std::fs::File;
 use std::{io, mem};
-use std::borrow::Cow;
 use std::ops::ControlFlow;
 
-use memmap2::Mmap;
 use smallvec::SmallVec;
 
 /// Ext4 filesystem context
-pub struct Ext4Fs<'a> {
-    pub mmap: &'a Mmap,
+pub struct Ext4Fs {
+    pub file: File,
     pub sb: Ext4SuperBlock,
     pub device_id: u64,
     pub max_block: u64,
@@ -51,7 +50,7 @@ impl FileNode for Ext4Inode {
     }
 }
 
-impl<'a> RawFs for Ext4Fs<'a> {
+impl RawFs for Ext4Fs {
     type Node = Ext4Inode;
     type Context<'b> = &'b Self where Self: 'b;
 
@@ -76,10 +75,7 @@ impl<'a> RawFs for Ext4Fs<'a> {
         let inode_num = file_id as INodeNum;
 
         if unlikely(inode_num == 0) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Invalid inode number 0"
-            ));
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "Invalid inode number 0"));
         }
 
         let group = (inode_num - 1) / self.sb.inodes_per_group;
@@ -91,16 +87,15 @@ impl<'a> RawFs for Ext4Fs<'a> {
             self.sb.block_size as usize
         } + (group as usize * self.sb.desc_size as usize);
 
-        let bg_desc = &self.mmap[
-            bg_desc_offset..
-            bg_desc_offset + self.sb.desc_size as usize
-        ];
+        let mut bg_desc_buf = [0u8; 64]; // desc_size is at most 64 bytes
+        let desc_size = self.sb.desc_size as usize;
+        self.read_at_offset(&mut bg_desc_buf[..desc_size], bg_desc_offset as u64)?;
 
         let inode_table_block = u32::from_le_bytes([
-            bg_desc[EXT4_INODE_TABLE_OFFSET + 0],
-            bg_desc[EXT4_INODE_TABLE_OFFSET + 1],
-            bg_desc[EXT4_INODE_TABLE_OFFSET + 2],
-            bg_desc[EXT4_INODE_TABLE_OFFSET + 3],
+            bg_desc_buf[EXT4_INODE_TABLE_OFFSET + 0],
+            bg_desc_buf[EXT4_INODE_TABLE_OFFSET + 1],
+            bg_desc_buf[EXT4_INODE_TABLE_OFFSET + 2],
+            bg_desc_buf[EXT4_INODE_TABLE_OFFSET + 3],
         ]);
 
         let inode_offset = inode_table_block as usize *
@@ -108,13 +103,13 @@ impl<'a> RawFs for Ext4Fs<'a> {
             index as usize *
             self.sb.inode_size as usize;
 
-        let inode_bytes = &self.mmap[
-            inode_offset..
-            inode_offset + self.sb.inode_size as usize
-        ];
+        let mut inode_buf = [0u8; 512]; // inode_size is at most 512 bytes in practice
+        let inode_size = self.sb.inode_size as usize;
+        let to_read = inode_size.min(inode_buf.len());
+        self.read_at_offset(&mut inode_buf[..to_read], inode_offset as _)?;
 
         let raw = bytemuck::try_from_bytes::<raw::Ext4Inode>(
-            &inode_bytes[..std::mem::size_of::<raw::Ext4Inode>().min(inode_bytes.len())]
+            &inode_buf[..std::mem::size_of::<raw::Ext4Inode>().min(to_read)]
         ).map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid inode data"))?;
 
         let mode = u16::from_le(raw.mode);
@@ -151,6 +146,9 @@ impl<'a> RawFs for Ext4Fs<'a> {
             u32::from_le_bytes([block_bytes[56], block_bytes[57], block_bytes[58], block_bytes[59]]),
         ];
 
+        // eprintln!("parse_node: inode={} group={} index={} bg_desc_offset={} inode_table_block={} inode_offset={} size={}",
+        //           inode_num, group, index, bg_desc_offset, inode_table_block, inode_offset, size);
+
         Ok(Ext4Inode {
             inode_num: inode_num as u64,
             mode,
@@ -159,18 +157,6 @@ impl<'a> RawFs for Ext4Fs<'a> {
             mtime_sec,
             blocks,
         })
-    }
-
-    #[inline(always)]
-    fn get_block(&self, block_num: u64) -> &[u8] {
-        let offset = (block_num as usize).wrapping_mul(self.sb.block_size as usize);
-        debug_assert!(
-            self.mmap.get(offset..offset + self.sb.block_size as usize).is_some()
-        );
-        unsafe {
-            let ptr = self.mmap.as_ptr().add(offset);
-            core::slice::from_raw_parts(ptr, self.sb.block_size as usize)
-        }
     }
 
     #[inline]
@@ -189,7 +175,16 @@ impl<'a> RawFs for Ext4Fs<'a> {
 
         let file_size = node.size as usize;
         let size_to_read = file_size.min(max_size);
-        buf.reserve(size_to_read);
+
+        //
+        // If previous file left a huge buffer, release it before reserving for this file
+        // @Constant @Tune - 4MB threshold, files larger than this won't bloat next iteration
+        //
+        if buf.capacity() > 4 * 1024 * 1024 && size_to_read < buf.capacity() / 4 {
+            *buf = Vec::with_capacity(size_to_read);
+        } else {
+            buf.reserve(size_to_read);
+        }
 
         // Inline data: file content stored directly in inode's block array
         if node.flags & EXT4_INLINE_DATA_FL != 0 {
@@ -200,33 +195,6 @@ impl<'a> RawFs for Ext4Fs<'a> {
             self.read_extents(parser, node, size_to_read, file_size, kind, check_binary)
         } else {
             self.read_direct_blocks(parser, node, size_to_read, file_size, kind, check_binary)
-        }
-    }
-
-    #[inline]
-    fn prefetch_file(&self, parser: &mut Parser, node: &Self::Node, size_to_read: usize) {
-        // Inline data is already in the inode - nothing to prefetch
-        if node.flags & EXT4_INLINE_DATA_FL != 0 {
-            return;
-        }
-
-        if node.flags & EXT4_EXTENTS_FL != 0 {
-            if self.parse_extents_into_scratch(parser, node).is_ok() {
-                let extents = Self::scratch_as_extents(&parser.scratch);
-                self.prefetch_extent_blocks(extents, size_to_read);
-            }
-        } else {
-            // Direct blocks
-            let max_block = self.max_block;
-            let blocks: SmallVec<[u64; 12]> = node
-                .blocks
-                .iter()
-                .take(EXT4_BLOCK_POINTERS_COUNT)
-                .filter(|&&b| b != 0 && (b as u64) < max_block)
-                .map(|&b| b as u64)
-                .collect();
-
-            self.prefetch_direct_blocks(&blocks);
         }
     }
 
@@ -285,27 +253,10 @@ impl<'a> RawFs for Ext4Fs<'a> {
 
         None
     }
-
-    #[inline]
-    fn prefetch_region(&self, offset: usize, length: usize) {
-        if offset + length > self.mmap.len() {
-            return;
-        }
-
-        //
-        // Align to page boundaries
-        //
-        let page_size = 4096; // @Refactor should we make page-size dynamic?
-        let aligned_offset = offset & !(page_size - 1);
-        let aligned_length = ((offset + length + page_size - 1) & !(page_size - 1)) - aligned_offset;
-
-        let ptr = unsafe { self.mmap.as_ptr().add(aligned_offset) as *mut _ };
-        _ = memadvise::advise(ptr, aligned_length, memadvise::Advice::WillNeed);
-    }
 }
 
 // ext4-specific helper methods
-impl Ext4Fs<'_> {
+impl Ext4Fs {
     /// Read inline data from inode's block array (max 60 bytes)
     fn read_inline_data(
         &self,
@@ -480,11 +431,13 @@ impl Ext4Fs<'_> {
                 child_blocks.push(leaf_block);
             }
 
-            self.prefetch_blocks(Cow::Borrowed(&child_blocks));
-
             for child_block in child_blocks {
-                let block_data = self.get_block(child_block);
-                self.parse_extent_node(parser, block_data, level + 1)?;
+                let offset = child_block * self.sb.block_size as u64;
+                let block_size = self.sb.block_size as usize;
+                let mut block_buf = vec![0u8; block_size];
+                if self.read_at_offset(&mut block_buf, offset).is_ok() {
+                    self.parse_extent_node(parser, &block_buf, level + 1)?;
+                }
             }
         }
 
@@ -507,12 +460,14 @@ impl Ext4Fs<'_> {
         let extents: SmallVec<[Ext4Extent; MAX_EXTENTS_UNTIL_SPILL]> =
             copy_data(Self::scratch_as_extents(&parser.scratch));
 
-        self.prefetch_extent_blocks(&extents, size_to_read);
-
         if check_binary {
             if let Some(first_extent) = extents.first() {
-                let first_block = self.get_block(first_extent.start);
-                if check_first_block_binary(first_block, file_size) {
+                let mut first_block_buf = vec![0u8; self.sb.block_size as usize];
+                let offset = first_extent.start * self.sb.block_size as u64;
+                if self.read_at_offset(&mut first_block_buf, offset).is_err() {
+                    return Ok(true); // can't read, just search it
+                }
+                if check_first_block_binary(&first_block_buf, file_size) {
                     parser.get_buf_mut(kind).clear();
                     return Ok(false);
                 }
@@ -520,17 +475,6 @@ impl Ext4Fs<'_> {
         }
 
         self.copy_extents_to_buf(parser, &extents, size_to_read, kind);
-
-        //
-        //
-        //
-        // Release mmap pages back to OS after copying
-        // @Constant @Tune - threshold for when madvise overhead is worth it
-        //
-        //
-        if size_to_read >= 64 * 1024 {
-            self.release_extent_pages(&extents, size_to_read);
-        }
 
         parser.get_buf_mut(kind).truncate(size_to_read);
         Ok(true)
@@ -548,6 +492,8 @@ impl Ext4Fs<'_> {
         let _span = tracy::span!("Ext4Fs::read_direct_blocks");
 
         let max_block = self.max_block;
+        let block_size = self.sb.block_size as u64;
+
         let blocks: SmallVec<[u64; EXT4_BLOCK_POINTERS_COUNT]> = node
             .blocks
             .iter()
@@ -561,174 +507,45 @@ impl Ext4Fs<'_> {
             return Ok(true);
         }
 
-        self.prefetch_direct_blocks(&blocks);
-
-        if check_binary && let Some(&first_block_num) = blocks.first() {
-            let first_block = self.get_block(first_block_num);
-            if check_first_block_binary(first_block, file_size) {
-                parser.get_buf_mut(kind).clear();
-                return Ok(false);
+        if check_binary {
+            if let Some(&first_block_num) = blocks.first() {
+                let mut first_block_buf = [0u8; 4096];
+                let offset = first_block_num * block_size;
+                let to_read = (block_size as usize).min(first_block_buf.len());
+                let n = self.read_at_offset(&mut first_block_buf[..to_read], offset).unwrap_or(0);
+                if check_first_block_binary(&first_block_buf[..n], file_size) {
+                    parser.get_buf_mut(kind).clear();
+                    return Ok(false);
+                }
             }
         }
 
         let mut copied = 0;
-
         for &block_num in &blocks {
             if copied >= size_to_read { break; }
 
-            let block_data = self.get_block(block_num);
+            let offset = block_num * block_size;
             let remaining = size_to_read - copied;
-            let to_copy = block_data.len().min(remaining);
+            let to_read = (block_size as usize).min(remaining);
 
             let buf = parser.get_buf_mut(kind);
             let old_len = buf.len();
-            buf.resize(old_len + to_copy, 0);
+            buf.resize(old_len + to_read, 0);
 
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    block_data.as_ptr(),
-                    buf.as_mut_ptr().add(old_len),
-                    to_copy
-                );
+            match self.read_at_offset(&mut buf[old_len..], offset) {
+                Ok(n) => {
+                    buf.truncate(old_len + n);
+                    copied += n;
+                }
+                Err(_) => {
+                    buf.truncate(old_len);
+                    break;
+                }
             }
-
-            copied += to_copy;
         }
 
         parser.get_buf_mut(kind).truncate(size_to_read);
         Ok(true)
-    }
-
-    fn prefetch_blocks<const N: usize>(&self, blocks: Cow<SmallVec<[u64; N]>>) {
-        let _span = tracy::span!("Ext4Fs::prefetch_blocks");
-
-        // Only prefetch if we have significant non-contiguous ranges
-        // @Constant
-        if blocks.len() < 3 {
-            return;
-        }
-
-        let mut sorted = match blocks {
-            Cow::Borrowed(bw) => copy_data(bw),
-            Cow::Owned(ow) => ow,
-        };
-        sorted.sort_unstable();
-
-        let mut gaps = 0;
-        for i in 1..sorted.len() {
-            if sorted[i] > sorted[i-1] + 1 {
-                gaps += 1;
-            }
-        }
-
-        // Only worth prefetching if significantly fragmented
-        // @Constant
-        if gaps < 2 { return; }
-
-        sorted.dedup();
-
-        let mut range_start = sorted[0];
-        let mut range_end = sorted[0];
-
-        for &block in &sorted[1..] {
-            // Merge adjacent or close blocks (within 32 blocks)
-            // @Constant
-            if block <= range_end + 32 {
-                range_end = block;
-            } else {
-                // Only advise ranges >= 128KB
-                // @Constant
-                if (range_end - range_start) * self.sb.block_size as u64 >= 128 * 1024 {
-                    self.advise_range(range_start, range_end);
-                }
-                range_start = block;
-                range_end = block;
-            }
-        }
-
-        if (range_end - range_start) * self.sb.block_size as u64 >= 128 * 1024 {
-            self.advise_range(range_start, range_end);
-        }
-    }
-
-    #[inline(always)]
-    fn advise_range(&self, start_block: u64, end_block: u64) {
-        let offset = start_block as usize * self.sb.block_size as usize;
-        let length = (end_block - start_block + 1) as usize * self.sb.block_size as usize;
-
-        debug_assert!(offset + length <= self.mmap.len());
-
-        let ptr = unsafe { self.mmap.as_ptr().add(offset) as *mut _ };
-        _ = memadvise::advise(ptr, length, memadvise::Advice::WillNeed);
-    }
-
-    #[inline]
-    fn prefetch_extent_blocks(&self, extents: &[Ext4Extent], size_to_read: usize) {
-        let _span = tracy::span!("Ext4Fs::prefetch_extent_blocks");
-
-        let block_size = self.sb.block_size as usize;
-        let mut remaining = size_to_read;
-
-        for extent in extents {
-            if remaining == 0 { break }
-
-            let extent_bytes = extent.len as usize * block_size;
-            let bytes_to_prefetch = extent_bytes.min(remaining);
-            let blocks_to_prefetch = bytes_to_prefetch.div_ceil(block_size);
-
-            let offset = extent.start as usize * block_size;
-            let length = blocks_to_prefetch * block_size;
-
-            if offset + length <= self.mmap.len() {
-                let ptr = unsafe { self.mmap.as_ptr().add(offset) as *mut _ };
-                _ = memadvise::advise(ptr, length, memadvise::Advice::WillNeed);
-            }
-
-            remaining = remaining.saturating_sub(extent_bytes);
-        }
-    }
-
-    #[inline]
-    fn prefetch_direct_blocks(&self, blocks: &[u64]) {
-        if blocks.is_empty() {
-            return;
-        }
-
-        let block_size = self.sb.block_size as usize;
-        let mmap_len = self.mmap.len();
-
-        for &block in blocks {
-            let offset = block as usize * block_size;
-            if offset + block_size > mmap_len { continue }
-
-            let ptr = unsafe { self.mmap.as_ptr().add(offset) as *mut _ };
-            _ = memadvise::advise(ptr, block_size, memadvise::Advice::WillNeed);
-        }
-    }
-
-    #[inline]
-    fn release_extent_pages(&self, extents: &[Ext4Extent], size_to_read: usize) {
-        let block_size = self.sb.block_size as usize;
-        let mmap_len = self.mmap.len();
-        let mut remaining = size_to_read;
-
-        for extent in extents {
-            if remaining == 0 { break }
-
-            let extent_bytes = extent.len as usize * block_size;
-            let bytes_to_release = extent_bytes.min(remaining);
-            let blocks_to_release = bytes_to_release.div_ceil(block_size);
-
-            let offset = extent.start as usize * block_size;
-            let length = blocks_to_release * block_size;
-
-            if offset + length <= mmap_len {
-                let ptr = unsafe { self.mmap.as_ptr().add(offset) as *mut _ };
-                _ = memadvise::advise(ptr, length, memadvise::Advice::DontNeed);
-            }
-
-            remaining = remaining.saturating_sub(extent_bytes);
-        }
     }
 
     #[inline]
@@ -739,38 +556,43 @@ impl Ext4Fs<'_> {
         size_to_read: usize,
         kind: BufKind,
     ) {
-        let _span = tracy::span!("Ext4Fs::copy_extents_to_buf");
-
+        let block_size = self.sb.block_size as u64;
         let mut copied = 0;
 
         for extent in extents {
             if copied >= size_to_read { break; }
 
-            for block_offset in 0..extent.len {
-                if copied >= size_to_read { break; }
+            let offset = extent.start * block_size;
+            let extent_bytes = extent.len as usize * block_size as usize;
+            let remaining = size_to_read - copied;
+            let to_read = extent_bytes.min(remaining);
 
-                let phys_block = extent.start + block_offset as u64;
-                let block_data = self.get_block(phys_block);
+            let buf = parser.get_buf_mut(kind);
+            let old_len = buf.len();
+            buf.resize(old_len + to_read, 0);
 
-                let remaining = size_to_read - copied;
-                let to_copy = block_data.len().min(remaining);
-
-                let buf = parser.get_buf_mut(kind);
-                let old_len = buf.len();
-                buf.resize(old_len + to_copy, 0);
-
-                // SAFETY: src_ptr points to mmap'd data that remains valid.
-                // We've ensured no overlap and both pointers are valid.
-                unsafe {
-                    core::ptr::copy_nonoverlapping(
-                        block_data.as_ptr(),
-                        buf.as_mut_ptr().add(old_len),
-                        to_copy
-                    );
+            match self.read_at_offset(&mut buf[old_len..], offset) {
+                Ok(n) => {
+                    buf.truncate(old_len + n);
+                    copied += n;
                 }
-
-                copied += to_copy;
+                Err(_) => {
+                    buf.truncate(old_len);
+                    break;
+                }
             }
+        }
+    }
+
+    #[inline]
+    fn read_at_offset(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+        #[cfg(unix)] {
+            use std::os::unix::fs::FileExt;
+            self.file.read_at(buf, offset)
+        }
+        #[cfg(windows)] {
+            use std::os::windows::fs::FileExt;
+            self.file.seek_read(buf, offset)
         }
     }
 }

@@ -332,24 +332,8 @@ impl<F: RawFs> WorkerContext<'_, F> {
 
         let _span = tracy::span!("process_files");
 
-        if let Some(&(first_file_id, _)) = files.first() {
-            if let Ok(node) = self.fs.parse_node(first_file_id) {
-                let size = (node.size() as usize).min(self.max_file_byte_size());
-                self.fs.prefetch_file(&mut self.parser, &node, size);
-            }
-        }
-
         for i in 0..files.len() {
             let (file_id, name_fat_ptr) = files[i];
-
-            // Prefetch NEXT file while we process current
-            if i + 1 < files.len() {
-                let (next_file_id, _) = files[i + 1];
-                if let Ok(next_node) = self.fs.parse_node(next_file_id) {
-                    let size = (next_node.size() as usize).min(self.max_file_byte_size());
-                    self.fs.prefetch_file(&mut self.parser, &next_node, size);
-                }
-            }
 
             let Ok(node) = self.fs.parse_node(file_id) else {
                 continue;
