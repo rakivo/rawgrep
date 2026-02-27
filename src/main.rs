@@ -1,5 +1,5 @@
 use rawgrep::cli::Cli;
-use rawgrep::grep::{open_device, RawGrepper};
+use rawgrep::grep::{open_device_and_detect_fs, FsType, RawGrepper};
 use rawgrep::{eprint_blue, eprint_green, eprintln_red, CURSOR_HIDE, CURSOR_UNHIDE};
 
 use std::fs;
@@ -74,7 +74,7 @@ fn main() -> io::Result<()> {
     let search_root_path = search_root_path_buf.to_string_lossy();
     let search_root_path = search_root_path.as_ref();
 
-    let file = match open_device(&device) {
+    let (file, fs) = match open_device_and_detect_fs(&device) {
         Ok(ok) => ok,
         Err(e) => {
             match e.kind() {
@@ -92,7 +92,12 @@ fn main() -> io::Result<()> {
         }
     };
 
-    let grep = match RawGrepper::new_ext4(&cli, &device, file) {
+    let grep = match fs {
+        FsType::Apfs => RawGrepper::new_apfs(&cli, &device, file),
+        FsType::Ext4 => RawGrepper::new_ext4(&cli, &device, file),
+    };
+
+    let grep = match grep {
         Ok(ok) => ok,
         Err(e) => {
             match e.kind() {
