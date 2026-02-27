@@ -338,11 +338,14 @@ pub fn open_device_and_detect_fs(device_path: &str) -> io::Result<(File, FsType)
         use std::os::unix::io::AsRawFd;
         const BLKFLSBUF: libc::c_ulong = 0x1261;
         unsafe { libc::ioctl(file.as_raw_fd(), BLKFLSBUF, 0) };
-    }
-
-    #[cfg(unix)] {
-        use std::os::unix::io::AsRawFd;
         unsafe { libc::syncfs(file.as_raw_fd()); }
+    }
+    #[cfg(target_os = "macos")] {
+        // macOS has no syncfs() or BLKFLSBUF.
+        // F_FULLFSYNC flushes the volume containing the fd to physical storage,
+        // which is the closest equivalent for ensuring we read committed data.
+        use std::os::unix::io::AsRawFd;
+        unsafe { libc::fcntl(file.as_raw_fd(), libc::F_FULLFSYNC); }
     }
 
     // Read enough to cover both magic locations:
