@@ -1,3 +1,5 @@
+#![allow(clippy::needless_range_loop)]
+
 // @Testing @Refactor @Architecture
 //
 // TODO(#29): FragmentCache refactor
@@ -276,15 +278,9 @@ impl DiskStorage {
 }
 
 #[cfg(test)]
+#[derive(Default)]
 pub struct MemoryStorage {
     data: std::sync::Mutex<Option<Vec<u8>>>,
-}
-
-#[cfg(test)]
-impl MemoryStorage {
-    pub fn new() -> Self {
-        Self { data: std::sync::Mutex::new(None) }
-    }
 }
 
 #[cfg(test)]
@@ -368,7 +364,7 @@ impl FragmentCache<MemoryStorage> {
             cache_dir: None,
             ignore_cache: false,
         };
-        Self::create_empty(&config, MemoryStorage::new()).unwrap()
+        Self::create_empty(&config, MemoryStorage::default()).unwrap()
     }
 
     pub fn with_test_data(
