@@ -71,6 +71,9 @@ fn main() -> io::Result<()> {
         }
     });
 
+    #[cfg(target_os = "macos")]
+    let device = resolve_apfs_physical_store(&device)?;
+
     let search_root_path = search_root_path_buf.to_string_lossy();
     let search_root_path = search_root_path.as_ref();
 
@@ -145,4 +148,39 @@ fn main() -> io::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn resolve_apfs_physical_store(virtual_device: &str) -> io::Result<String> {
+    // virtual_device is e.g. "/dev/disk3s5"
+    // We need to find "disk0s2" via diskutil info -plist
+    let disk_id = virtual_device.trim_start_matches("/dev/");
+
+    let output = std::process::Command::new("diskutil")
+        .args(["info", "-plist", disk_id])
+        .output()?;
+
+    if !output.status.success() {
+        return Err(io::Error::new(io::ErrorKind::Other, "diskutil failed"));
+    }
+
+    // Parse the plist to find APFSPhysicalStores[0].APFSPhysicalStore
+    // Simple string search avoids a plist dependency
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let key = "<key>APFSPhysicalStore</key>";
+    let val_open  = "<string>";
+    let val_close = "</string>";
+
+    if let Some(key_pos) = stdout.find(key) {
+        let after_key = &stdout[key_pos + key.len()..];
+        if let Some(open_pos) = after_key.find(val_open) {
+            let after_open = &after_key[open_pos + val_open.len()..];
+            if let Some(close_pos) = after_open.find(val_close) {
+                let store = &after_open[..close_pos]; // e.g. "disk0s2"
+                return Ok(format!("/dev/{store}"));
+            }
+        }
+    }
+
+    Err(io::Error::new(io::ErrorKind::NotFound, "APFSPhysicalStore not found in diskutil output"))
 }
