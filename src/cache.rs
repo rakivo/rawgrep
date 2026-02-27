@@ -1,9 +1,5 @@
 #![allow(clippy::needless_range_loop)]
 
-// @Testing @Refactor @Architecture
-//
-//
-
 use crate::util::{likely, unlikely};
 
 use std::time::Instant;
