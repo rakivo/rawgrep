@@ -7,15 +7,13 @@ use std::io::{self};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use memmap2::Mmap;
 use smallvec::SmallVec;
-use serde::{Serialize, Deserialize};
 
 const FILE_LOOKUP_EMPTY: u32 = u32::MAX;
 
 /// Uniquely identifies a file across reboots
 #[repr(C, align(16))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FileKey {
     pub device_id: u64,
     pub inode: u64,
@@ -35,7 +33,7 @@ impl FileKey {
 
 /// Metadata for cache invalidation
 #[repr(C, align(16))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FileMeta {
     pub mtime_sec: i64,
     pub size: u64,
@@ -282,9 +280,6 @@ pub struct FragmentCache<S: CacheStorage = DiskStorage> {
     //
     // ---------------------------------------------------------------
 
-    // Keeps mmap alive (data pointers reference into this)
-    _mmap: Option<Mmap>,
-
     file_lookup: Box<[AtomicU32]>, // open-addressed hash table
 
     stats: CacheStats,
@@ -431,7 +426,6 @@ impl<S: CacheStorage> FragmentCache<S> {
             owned_file_keys: Some(owned_file_keys),
             owned_file_metas: Some(owned_file_metas),
             owned_file_bitsets: Some(owned_file_bitsets),
-            _mmap: None,
             file_lookup,
             stats: CacheStats::default(),
             storage
@@ -530,9 +524,6 @@ impl<S: CacheStorage> FragmentCache<S> {
 
         // ----------- Update capacity
         self.file_capacity = new_capacity;
-
-        // ----------- Drop mmap
-        self._mmap = None;
 
         let total_time = start.elapsed();
         eprintln!(
@@ -848,7 +839,6 @@ impl<S: CacheStorage> FragmentCache<S> {
             owned_file_keys:       Some(owned_file_keys),
             owned_file_metas:      Some(owned_file_metas),
             owned_file_bitsets:    Some(owned_file_bitsets),
-            _mmap: None,
             file_lookup,
             stats: CacheStats::default(),
             storage

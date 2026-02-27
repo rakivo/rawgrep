@@ -42,13 +42,11 @@ clap-full  = { package="clap", version="4.5", default-features=false, features=[
 clap-tiny  = { package="clap", version="4.5", default-features=false, features=["std", "derive"], optional=true }
 
 aho-corasick = { version = "1.1.4", default-features = false }
-memmap2 = { version = "0.9", default-features = false }
 smallvec = { version = "1.15.1", features = ["const_generics"] }
 mimalloc = { version = "=0.1.47", optional = true }
 ctrlc = { version = "3.5.1", default-features = false }
 memchr = { version = "2.7.6", default-features = false, features = ["std"] }
 libc = { version = "0.2.177", default-features = false }
-memadvise = { version = "0.1", default-features = false }
 tracy-client = { version = "0.17.3", default-features = false }
 crossbeam-channel = { version = "0.5.15", default-features = false, features = ["std"] }
 crossbeam-deque = { version = "0.8.6", default-features = false, features = ["std"] }
@@ -56,7 +54,6 @@ itoa = { version = "1.0.15", default-features = false }
 fastrand = { version = "2.3.0", default-features = false, features = ["std"] }
 bytemuck = { version = "1.24", features = ["derive"] }
 dhat = { version = "0.3.3", default-features = false, optional = true }
-serde = { version = "1.0", features = ["derive"] }
 nohash-hasher = "0.2.0"
 
 [target.'cfg(not(target_os = "macos"))'.dependencies]
