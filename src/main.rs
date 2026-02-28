@@ -74,9 +74,6 @@ fn main() -> io::Result<()> {
     #[cfg(target_os = "macos")]
     let device = resolve_apfs_physical_store(&device)?;
 
-    let search_root_path = search_root_path_buf.to_string_lossy();
-    let search_root_path = search_root_path.as_ref();
-
     let (file, fs) = match open_device_and_detect_fs(&device) {
         Ok(ok) => ok,
         Err(e) => {
@@ -98,6 +95,7 @@ fn main() -> io::Result<()> {
     let grep = match fs {
         FsType::Apfs => RawGrepper::new_apfs(&cli, &device, file),
         FsType::Ext4 => RawGrepper::new_ext4(&cli, &device, file),
+        FsType::Ntfs => RawGrepper::new_ntfs(&cli, &device, file),
     };
 
     let grep = match grep {
@@ -118,6 +116,18 @@ fn main() -> io::Result<()> {
         }
     };
 
+    let search_root_path_for_fs = if cli.device.is_some() {
+        //
+        // Try to find where this device is mounted and strip that prefix
+        //
+        rawgrep::platform::strip_mountpoint_prefix(&device, &search_root_path_buf)
+            .unwrap_or_else(|| search_root_path_buf.to_string_lossy().into_owned())
+    } else {
+        search_root_path_buf.to_string_lossy().into_owned()
+    };
+
+    let search_root_path = search_root_path_for_fs.as_ref();
+
     let start_inode = match grep.try_resolve_path_to_file_id(search_root_path) {
         Ok(ok) => ok,
         Err(e) => {
@@ -127,7 +137,11 @@ fn main() -> io::Result<()> {
     };
 
     eprint_blue!("Searching ");
+    eprint_green!("'{search_root_path}' ");
+    eprint_blue!("on device ");
     eprint_green!("'{device}' ");
+    eprint_blue!("with fs ");
+    eprint_green!("'{fs:?}' ");
     eprint_blue!("for pattern: ");
     eprintln_red!("'{pattern}'", pattern = cli.pattern);
 

@@ -1,6 +1,6 @@
 use crate::tracy;
 
-use std::sync::Arc;
+use std::{path::MAIN_SEPARATOR, sync::Arc};
 
 use memchr::{memchr, memrchr};
 use smallvec::SmallVec;
@@ -107,7 +107,7 @@ impl GitignoreChain {
             return false;
         }
 
-        let filename_start = memrchr(b'/', path).map_or(0, |i| i + 1);
+        let filename_start = memrchr(MAIN_SEPARATOR as _, path).map_or(0, |i| i + 1);
         let filename = unsafe { path.get_unchecked(filename_start..) };
 
         if inner.stack.len() == 1 {
@@ -261,15 +261,15 @@ impl Gitignore {
                 continue;
             }
 
-            let (pattern_bytes, anchored) = if pattern_bytes[0] == b'/' {
+            let (pattern_bytes, anchored) = if pattern_bytes[0] == MAIN_SEPARATOR as _ {
                 (&pattern_bytes[1..], true)
             } else if pattern_bytes.starts_with(b"**/") {
                 (&pattern_bytes[3..], false)
             } else {
-                (pattern_bytes, memchr(b'/', pattern_bytes).is_some())
+                (pattern_bytes, memchr(MAIN_SEPARATOR as _, pattern_bytes).is_some())
             };
 
-            let dir_only = pattern_bytes.last() == Some(&b'/');
+            let dir_only = pattern_bytes.last() == Some(&(MAIN_SEPARATOR as _));
             let pattern_bytes = if dir_only {
                 &pattern_bytes[..pattern_bytes.len() - 1]
             } else {
@@ -504,7 +504,7 @@ fn match_anchored_literal(pattern: &[u8], path: &[u8]) -> bool {
     }
 
     let prefix = unsafe { path.get_unchecked(..len) };
-    prefix == pattern && (path.len() == len || unsafe { *path.get_unchecked(len) } == b'/')
+    prefix == pattern && (path.len() == len || unsafe { *path.get_unchecked(len) } == MAIN_SEPARATOR as _)
 }
 
 #[inline(always)]

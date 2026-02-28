@@ -1,6 +1,49 @@
-use std::sync::Arc;
+use std::{fs::File, io, sync::Arc};
 
 use smallvec::SmallVec;
+
+#[inline]
+pub fn read_u32_le(buf: &[u8], offset: usize) -> u32 {
+    u32::from_le_bytes(buf[offset..offset+4].try_into().unwrap())
+}
+
+#[inline]
+pub fn read_u16_le(buf: &[u8], offset: usize) -> u16 {
+    u16::from_le_bytes(buf[offset..offset+2].try_into().unwrap())
+}
+
+#[inline]
+pub fn read_at_offset(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+    #[cfg(unix)] {
+        use std::os::unix::fs::FileExt;
+        file.read_at(buf, offset)
+    }
+
+    #[cfg(windows)] {
+        use std::os::windows::fs::FileExt;
+
+        const SECTOR: u64 = 512;
+
+        let aligned_offset = offset & !(SECTOR - 1);
+        let prefix = (offset - aligned_offset) as usize;
+        if prefix == 0 && buf.len() % SECTOR as usize == 0 {
+            // Already aligned, read directly
+            return file.seek_read(buf, offset);
+        }
+
+        // Unaligned, probably never would happen but for @Robustness,
+        // read into a sector-aligned temp buffer and copy out.
+        let aligned_len = ((prefix + buf.len()) + SECTOR as usize - 1) & !(SECTOR as usize - 1);
+        let mut tmp = vec![0u8; aligned_len];
+        let n = file.seek_read(&mut tmp, aligned_offset)?;
+
+        let available = n.saturating_sub(prefix);
+        let to_copy = available.min(buf.len());
+        buf[..to_copy].copy_from_slice(&tmp[prefix..prefix + to_copy]);
+
+        Ok(to_copy)
+    }
+}
 
 #[inline(always)]
 pub const fn is_dot_entry(name: &[u8]) -> bool {

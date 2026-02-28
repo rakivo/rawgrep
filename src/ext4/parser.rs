@@ -2,17 +2,12 @@
 
 use crate::tracy;
 use crate::copy_data;
+use crate::util::read_at_offset;
 use crate::util::{likely, unlikely};
 use crate::worker::MAX_EXTENTS_UNTIL_SPILL;
 use crate::parser::{BufKind, FileId, FileNode, FileType, Parser, RawFs, check_first_block_binary};
 
-use super::{
-    raw, Ext4Extent, Ext4Inode, Ext4SuperBlock, INodeNum,
-    EXT4_BLOCKS_PER_GROUP_OFFSET, EXT4_BLOCK_POINTERS_COUNT, EXT4_BLOCK_SIZE_OFFSET,
-    EXT4_DESC_SIZE_OFFSET, EXT4_EXTENTS_FL, EXT4_INLINE_DATA_FL, EXT4_EXTENT_MAGIC, EXT4_FT_DIR,
-    EXT4_FT_REG_FILE, EXT4_INODES_PER_GROUP_OFFSET, EXT4_INODE_SIZE_OFFSET,
-    EXT4_INODE_TABLE_OFFSET, EXT4_ROOT_INODE,
-};
+use super::*;
 
 use std::fs::File;
 use std::{io, mem};
@@ -586,13 +581,6 @@ impl Ext4Fs {
 
     #[inline]
     fn read_at_offset(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
-        #[cfg(unix)] {
-            use std::os::unix::fs::FileExt;
-            self.file.read_at(buf, offset)
-        }
-        #[cfg(windows)] {
-            use std::os::windows::fs::FileExt;
-            self.file.seek_read(buf, offset)
-        }
+        read_at_offset(&self.file, buf, offset)
     }
 }

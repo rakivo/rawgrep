@@ -1,4 +1,4 @@
-use std::ops::{Deref, DerefMut};
+use std::{ops::{Deref, DerefMut}, path::{MAIN_SEPARATOR, MAIN_SEPARATOR_STR}};
 
 use smallvec::SmallVec;
 
@@ -54,7 +54,7 @@ impl<const N: usize> SmallPathBuf<N> {
         let bytes = self.as_slice();
 
         // Handle trailing slash: "/usr/bin/" -> find slash before the trailing one
-        let search_end = if bytes[self.len() - 1] == b'/' {
+        let search_end = if bytes[self.len() - 1] == MAIN_SEPARATOR as _ {
             self.len().saturating_sub(1)
         } else {
             self.len()
@@ -66,11 +66,11 @@ impl<const N: usize> SmallPathBuf<N> {
 
         // Search backwards for '/'
         for i in (0..search_end).rev() {
-            if bytes[i] == b'/' {
+            if bytes[i] == MAIN_SEPARATOR as _ {
                 // Found a slash
                 if i == 0 {
                     // Path was "/something", parent is "/"
-                    return Self::from_bytes(b"/");
+                    return Self::from_bytes(MAIN_SEPARATOR_STR.as_bytes())
                 } else {
                     // Path was "/foo/bar", parent is "/foo"
                     return Self::from_bytes(&bytes[..i]);
@@ -94,17 +94,17 @@ impl<const N: usize> SmallPathBuf<N> {
 
         // Skip trailing slashes
         let mut end = self.len();
-        while end > 0 && bytes[end - 1] == b'/' {
+        while end > 0 && bytes[end - 1] == MAIN_SEPARATOR as _ {
             end -= 1;
         }
 
         if end == 0 {
-            return b"/";
+            return MAIN_SEPARATOR_STR.as_bytes();
         }
 
         // Find last slash before the name
         for i in (0..end).rev() {
-            if bytes[i] == b'/' {
+            if bytes[i] == MAIN_SEPARATOR as _ {
                 return &bytes[i + 1..end];
             }
         }
@@ -113,4 +113,3 @@ impl<const N: usize> SmallPathBuf<N> {
         &bytes[..end]
     }
 }
-

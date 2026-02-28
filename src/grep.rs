@@ -1,3 +1,4 @@
+use std::path::{MAIN_SEPARATOR, MAIN_SEPARATOR_STR};
 use std::sync::Arc;
 use std::io::{self, BufWriter};
 use std::fs::{File, OpenOptions};
@@ -9,6 +10,7 @@ use crossbeam_deque::{Injector, Worker as DequeWorker};
 use crate::apfs::{ApfsFs, ApfsVolume, APFS_NX_MAGIC};
 use crate::cli::Cli;
 use crate::matcher::Matcher;
+use crate::ntfs::NtfsFs;
 use crate::{eprintln_red, tracy};
 use crate::path_buf::SmallPathBuf;
 use crate::stats::{AtomicStats, Stats};
@@ -206,14 +208,14 @@ impl<'a, F: RawFs> RawGrepper<'a, F> {
     pub fn try_resolve_path_to_file_id(&self, path: &str) -> io::Result<FileId> {
         let _span = tracy::span!("RawGrepper::try_resolve_path_to_file_id");
 
-        if path == "/" || path.is_empty() {
+        if path == MAIN_SEPARATOR_STR || path.is_empty() {
             return Ok(self.fs.root_id());
         }
 
         let mut parser = Parser::default();
         let mut file_id = self.fs.root_id();
 
-        for part in path.split('/').filter(|p| !p.is_empty()) {
+        for part in path.split(MAIN_SEPARATOR).filter(|p| !p.is_empty()) {
             let node = self.fs.parse_node(file_id)?;
 
             if !node.is_dir() {
@@ -309,6 +311,50 @@ impl<'a> RawGrepper<'a, ApfsFs> {
     }
 }
 
+/// impl block for ntfs-specific construction
+impl<'a> RawGrepper<'a, NtfsFs> {
+    #[inline]
+    pub fn new_ntfs(cli: &'a Cli, _device_path: &str, file: File) -> io::Result<AnyGrepper<'a>> {
+        let mut boot = [0u8; 512];
+        {
+            use std::os::unix::fs::FileExt;
+            file.read_at(&mut boot, 0)?;
+        }
+
+        if &boot[3..11] != b"NTFS    " {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Not an NTFS filesystem".to_owned(),
+            ));
+        }
+
+        let device_id = device_id(&file)?;
+        let fs = NtfsFs::new(file, device_id)?;
+        Self::new_with_fs(cli, fs).map(AnyGrepper::Ntfs)
+    }
+}
+
+#[cfg(windows)]
+#[inline]
+fn open_device(path: &str) -> io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use winapi::um::winbase::FILE_FLAG_NO_BUFFERING;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0x3) // FILE_SHARE_READ | FILE_SHARE_WRITE
+        .custom_flags(FILE_FLAG_NO_BUFFERING) // required for raw volume reads
+        .open(path)
+}
+
+#[cfg(unix)]
+#[inline]
+fn open_device(path: &str) -> io::Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .write(false)
+        .open(path)
+}
+
 #[inline]
 pub fn open_device_and_detect_fs(device_path: &str) -> io::Result<(File, FsType)> {
     //
@@ -329,10 +375,7 @@ pub fn open_device_and_detect_fs(device_path: &str) -> io::Result<(File, FsType)
     // }
     //
 
-    let file = OpenOptions::new()
-        .read(true)
-        .write(false)
-        .open(device_path)?;
+    let file = open_device(device_path)?;
 
     #[cfg(target_os = "linux")] {
         use std::os::unix::io::AsRawFd;
@@ -444,13 +487,19 @@ fn macos_num_physical_cores() -> Option<usize> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FsType {
-    Ext4,
-    Apfs,
+    Ext4, Apfs, Ntfs
 }
 
 /// Peek at raw bytes to identify the filesystem type.
 /// `block0` should be at least 2048 bytes (to cover the ext4 superblock at offset 1024).
 pub fn detect_fs_type(block0: &[u8]) -> Option<FsType> {
+    // NTFS: OEM ID at offset 3, 8 bytes: "NTFS    "
+    if block0.len() >= 11 {
+        if &block0[3..11] == b"NTFS    " {
+            return Some(FsType::Ntfs);
+        }
+    }
+
     // APFS: NX magic at offset 32 in block 0
     if block0.len() >= 36 {
         let magic = u32::from_le_bytes(block0[32..36].try_into().unwrap());
@@ -474,6 +523,7 @@ pub fn detect_fs_type(block0: &[u8]) -> Option<FsType> {
 pub enum AnyGrepper<'a> {
     Ext4(RawGrepper<'a, Ext4Fs>),
     Apfs(RawGrepper<'a, ApfsFs>),
+    Ntfs(RawGrepper<'a, NtfsFs>),
 }
 
 impl<'a> AnyGrepper<'a> {
@@ -487,6 +537,7 @@ impl<'a> AnyGrepper<'a> {
         match self {
             AnyGrepper::Ext4(g) => g.search(root_file_id, running, root_gi),
             AnyGrepper::Apfs(g) => g.search(root_file_id, running, root_gi),
+            AnyGrepper::Ntfs(g) => g.search(root_file_id, running, root_gi),
         }
     }
 
@@ -495,6 +546,7 @@ impl<'a> AnyGrepper<'a> {
         match self {
             AnyGrepper::Ext4(g) => g.try_resolve_path_to_file_id(path),
             AnyGrepper::Apfs(g) => g.try_resolve_path_to_file_id(path),
+            AnyGrepper::Ntfs(g) => g.try_resolve_path_to_file_id(path),
         }
     }
 }

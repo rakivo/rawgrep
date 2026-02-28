@@ -29,6 +29,7 @@ pub mod cli;
 pub mod grep;
 pub mod ext4;
 pub mod apfs;
+pub mod ntfs;
 pub mod util;
 pub mod stats;
 pub mod tracy;

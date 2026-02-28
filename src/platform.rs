@@ -23,6 +23,16 @@ pub trait Platform {
     /// Set process priority (-20 to 19, lower = higher priority)
     /// Returns Ok(()) on success, Err on failure
     fn set_process_priority(priority: i32) -> io::Result<()>;
+
+    /// Given a device path and an absolute filesystem path, return the portion
+    /// of the path that is relative to the device's mount point.
+    ///
+    /// e.g. device = "ntfs_test.img", path = "/mnt/ntfs_test/Odin"
+    ///      mount point of that device = "/mnt/ntfs_test"
+    ///      returns Some("Odin")
+    ///
+    /// Returns None if the device isn't mounted or the path isn't under its mount.
+    fn strip_mountpoint_prefix(device: &str, path: &Path) -> Option<String>;
 }
 
 //
@@ -34,7 +44,7 @@ pub mod linux {
     use super::*;
 
     use std::fs;
-    use std::path::PathBuf;
+    use std::path::{PathBuf, MAIN_SEPARATOR_STR};
     use std::os::fd::AsRawFd;
 
     const BLKGETSIZE64: libc::c_ulong = 0x80081272;
@@ -152,6 +162,59 @@ pub mod linux {
                 Ok(())
             }
         }
+
+        fn strip_mountpoint_prefix(device: &str, path: &Path) -> Option<String> {
+            let mounts = fs::read_to_string("/proc/mounts")
+                .or_else(|_| fs::read_to_string("/etc/mtab"))
+                .ok()?;
+
+            // Canonicalize the requested device path
+            let canonical_device = fs::canonicalize(device)
+                .unwrap_or_else(|_| PathBuf::from(device));
+
+            let mut best_mountpoint: Option<PathBuf> = None;
+            let mut best_len = 0usize;
+
+            for line in mounts.lines() {
+                let mut parts = line.split_whitespace();
+                let dev = parts.next()?;
+                let mountpoint_escaped = parts.next()?;
+
+                // Canonicalize the mounted device
+                let canonical_mounted = fs::canonicalize(dev)
+                    .unwrap_or_else(|_| PathBuf::from(dev));
+
+                // Direct match (e.g. /dev/sda1 == /dev/sda1)
+                let matches = canonical_mounted == canonical_device
+                // Loop device: check /sys/block/loopN/loop/backing_file
+                    || loop_device_backing_file(&canonical_mounted)
+                    .as_deref()
+                    .and_then(|b| fs::canonicalize(b).ok())
+                    .map(|b| b == canonical_device)
+                    .unwrap_or(false);
+
+                if !matches {
+                    continue;
+                }
+
+                let mountpoint = unescape_mountpoint(mountpoint_escaped);
+                let mount_path = fs::canonicalize(&mountpoint)
+                    .unwrap_or_else(|_| PathBuf::from(&mountpoint));
+
+                if path.starts_with(&mount_path) {
+                    let len = mount_path.as_os_str().len();
+                    if len >= best_len {
+                        best_len = len;
+                        best_mountpoint = Some(mount_path);
+                    }
+                }
+            }
+
+            let mountpoint = best_mountpoint?;
+            let relative = path.strip_prefix(&mountpoint).ok()?;
+            let s = relative.to_string_lossy();
+            Some(if s.is_empty() { MAIN_SEPARATOR_STR.to_string() } else { s.into_owned() })
+        }
     }
 
     /// Unescape octal sequences in mountpoint paths (e.g., \040 -> space)
@@ -185,6 +248,15 @@ pub mod linux {
         }
 
         result
+    }
+
+    /// Read /sys/block/loopN/loop/backing_file to find what image a loop device backs.
+    fn loop_device_backing_file(dev: &Path) -> Option<String> {
+        // dev is e.g. /dev/loop3 — extract "loop3"
+        let name = dev.file_name()?.to_str()?;
+        if !name.starts_with("loop") { return None; }
+        let backing = fs::read_to_string(format!("/sys/block/{name}/loop/backing_file")).ok()?;
+        Some(backing.trim().to_string())
     }
 }
 
@@ -293,6 +365,44 @@ pub mod macos {
             } else {
                 Ok(())
             }
+        }
+
+        fn strip_mountpoint_prefix(device: &str, path: &Path) -> Option<String> {
+            use std::ffi::CStr;
+
+            // statfs on the path gives us the mount point directly
+            let path_bytes = path.as_os_str().as_bytes();
+            let mut path_cstr = Vec::with_capacity(path_bytes.len() + 1);
+            path_cstr.extend_from_slice(path_bytes);
+            path_cstr.push(0);
+
+            let mut statfs_buf: libc::statfs = unsafe { std::mem::zeroed() };
+            let res = unsafe {
+                libc::statfs(path_cstr.as_ptr() as *const libc::c_char, &mut statfs_buf)
+            };
+            if res < 0 { return None; }
+
+            // Check the device matches
+            let mounted_from = unsafe {
+                CStr::from_ptr(statfs_buf.f_mntfromname.as_ptr())
+                    .to_string_lossy()
+                    .into_owned()
+            };
+            let canonical_device = std::fs::canonicalize(device)
+                .unwrap_or_else(|_| std::path::PathBuf::from(device));
+            let canonical_mounted = std::fs::canonicalize(&mounted_from)
+                .unwrap_or_else(|_| std::path::PathBuf::from(&mounted_from));
+            if canonical_device != canonical_mounted { return None; }
+
+            let mountpoint = unsafe {
+                CStr::from_ptr(statfs_buf.f_mntonname.as_ptr())
+                    .to_string_lossy()
+                    .into_owned()
+            };
+            let mount_path = std::path::Path::new(&mountpoint);
+            let relative = path.strip_prefix(mount_path).ok()?;
+            let s = relative.to_string_lossy();
+            Some(if s.is_empty() { MAIN_SEPARATOR_STR.to_string() } else { s.into_owned() })
         }
     }
 }
@@ -446,6 +556,37 @@ pub mod windows {
                 Ok(())
             }
         }
+
+        fn strip_mountpoint_prefix(device: &str, path: &Path) -> Option<String> {
+            use std::os::windows::ffi::OsStrExt;
+
+            let path_wide: Vec<u16> = path.as_os_str()
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect();
+
+            let mut volume_path = vec![0u16; 260];
+            let result = unsafe {
+                GetVolumePathNameW(
+                    path_wide.as_ptr(),
+                    volume_path.as_mut_ptr(),
+                    volume_path.len() as u32,
+                )
+            };
+            if result == 0 { return None; }
+
+            let len = volume_path.iter().position(|&c| c == 0).unwrap_or(volume_path.len());
+            let mountpoint = String::from_utf16_lossy(&volume_path[..len]);
+            // mountpoint is e.g. "C:\" — check it matches device
+            let trimmed = mountpoint.trim_end_matches('\\');
+            let device_path = format!("\\\\.\\{trimmed}");
+            if !device.eq_ignore_ascii_case(&device_path) { return None; }
+
+            let mount_path = std::path::Path::new(&mountpoint);
+            let relative = path.strip_prefix(mount_path).ok()?;
+            let s = relative.to_string_lossy();
+            Some(if s.is_empty() { MAIN_SEPARATOR_STR.to_string() } else { s.into_owned() })
+        }
     }
 }
 
@@ -484,4 +625,9 @@ pub fn detect_partition_for_path(path: &Path) -> io::Result<String> {
 #[inline]
 pub fn set_process_priority(priority: i32) -> io::Result<()> {
     CurrentPlatform::set_process_priority(priority)
+}
+
+#[inline]
+pub fn strip_mountpoint_prefix(device: &str, path: &Path) -> Option<String> {
+    CurrentPlatform::strip_mountpoint_prefix(device, path)
 }

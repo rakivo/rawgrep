@@ -29,6 +29,7 @@ use crate::{
 
 use std::mem;
 use std::ops::Not;
+use std::path::MAIN_SEPARATOR;
 use std::sync::Arc;
 use std::time::Duration;
 use std::io::{self, BufWriter, Write};
@@ -174,7 +175,7 @@ impl<F: RawFs> WorkerContext<'_, F> {
         if likely(!work.path_bytes.is_empty()) {
             let last_segment = work.path_bytes
                 .iter()
-                .rposition(|&b| b == b'/')
+                .rposition(|&b| b == MAIN_SEPARATOR as _)
                 .map(|pos| &work.path_bytes[pos + 1..])
                 .unwrap_or(&work.path_bytes);
 
@@ -260,7 +261,7 @@ impl<F: RawFs> WorkerContext<'_, F> {
                     );
                     child_path.extend_from_slice(&work.path_bytes);
                     if needs_slash {
-                        child_path.push(b'/');
+                        child_path.push(MAIN_SEPARATOR as _);
                     }
                     child_path.extend_from_slice(name_bytes);
 
@@ -377,7 +378,7 @@ impl<F: RawFs> WorkerContext<'_, F> {
             self.path.clear();
             self.path.extend_from_slice(parent_path);
             if likely(!parent_path.is_empty()) {
-                self.path.push(b'/');
+                self.path.push(MAIN_SEPARATOR as _);
             }
             self.path.extend_from_slice(file_name);
         }
@@ -491,10 +492,10 @@ impl<F: RawFs> WorkerContext<'_, F> {
                         // @Cuntpaste from above
                         {
                             let root = self.cli.search_root_path.as_bytes();
-                            let ends_with_slash = root.last() == Some(&b'/');
+                            let ends_with_slash = root.last() == Some(&(MAIN_SEPARATOR as _));
                             self.parser.output.extend_from_slice(root);
                             if !ends_with_slash {
-                                self.parser.output.push(b'/');
+                                self.parser.output.push(MAIN_SEPARATOR as _);
                             }
                             self.parser.output.extend_from_slice(&self.path);
                         }
@@ -512,10 +513,10 @@ impl<F: RawFs> WorkerContext<'_, F> {
 
                     {
                         let root = self.cli.search_root_path.as_bytes();
-                        let ends_with_slash = root.last() == Some(&b'/');
+                        let ends_with_slash = root.last() == Some(&(MAIN_SEPARATOR as _));
                         self.parser.output.extend_from_slice(root);
                         if !ends_with_slash {
-                            self.parser.output.push(b'/');
+                            self.parser.output.push(MAIN_SEPARATOR as _);
                         }
                         self.parser.output.extend_from_slice(&self.path);
                     }
