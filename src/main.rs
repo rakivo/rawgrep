@@ -104,13 +104,13 @@ fn main() -> io::Result<()> {
         Ok(ok) => ok,
         Err(e) => {
             match e.kind() {
-                io::ErrorKind::InvalidData => {
+                io::ErrorKind::InvalidData if fs == FsType::Ext4 => {
                     eprintln_red!("error: invalid ext4 filesystem on this path: {e}");
                     eprintln_red!("help: make sure the path points to a partition (e.g., /dev/sda1) and not a whole disk (e.g., /dev/sda)");
                     eprintln_red!("tip: try running `df -Th /` to find your root partition");
                 }
                 _ => {
-                    eprintln_red!("error: failed to initialize ext4 reader: {e}");
+                    eprintln_red!("error: failed to initialize {fs:?} reader: {e}");
                 }
             }
 
