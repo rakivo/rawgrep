@@ -1,5 +1,5 @@
 use rawgrep::cli::Cli;
-use rawgrep::grep::{open_device, RawGrepper};
+use rawgrep::grep::{open_device_and_detect_fs, FsType, RawGrepper};
 use rawgrep::{eprint_blue, eprint_green, eprintln_red, CURSOR_HIDE, CURSOR_UNHIDE};
 
 use std::fs;
@@ -71,10 +71,13 @@ fn main() -> io::Result<()> {
         }
     });
 
+    #[cfg(target_os = "macos")]
+    let device = resolve_apfs_physical_store(&device)?;
+
     let search_root_path = search_root_path_buf.to_string_lossy();
     let search_root_path = search_root_path.as_ref();
 
-    let file = match open_device(&device) {
+    let (file, fs) = match open_device_and_detect_fs(&device) {
         Ok(ok) => ok,
         Err(e) => {
             match e.kind() {
@@ -92,17 +95,22 @@ fn main() -> io::Result<()> {
         }
     };
 
-    let grep = match RawGrepper::new_ext4(&cli, &device, file) {
+    let grep = match fs {
+        FsType::Apfs => RawGrepper::new_apfs(&cli, &device, file),
+        FsType::Ext4 => RawGrepper::new_ext4(&cli, &device, file),
+    };
+
+    let grep = match grep {
         Ok(ok) => ok,
         Err(e) => {
             match e.kind() {
-                io::ErrorKind::InvalidData => {
+                io::ErrorKind::InvalidData if fs == FsType::Ext4 => {
                     eprintln_red!("error: invalid ext4 filesystem on this path: {e}");
                     eprintln_red!("help: make sure the path points to a partition (e.g., /dev/sda1) and not a whole disk (e.g., /dev/sda)");
                     eprintln_red!("tip: try running `df -Th /` to find your root partition");
                 }
                 _ => {
-                    eprintln_red!("error: failed to initialize ext4 reader: {e}");
+                    eprintln_red!("error: failed to initialize {fs:?} reader: {e}");
                 }
             }
 
@@ -140,4 +148,39 @@ fn main() -> io::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn resolve_apfs_physical_store(virtual_device: &str) -> io::Result<String> {
+    // virtual_device is e.g. "/dev/disk3s5"
+    // We need to find "disk0s2" via diskutil info -plist
+    let disk_id = virtual_device.trim_start_matches("/dev/");
+
+    let output = std::process::Command::new("diskutil")
+        .args(["info", "-plist", disk_id])
+        .output()?;
+
+    if !output.status.success() {
+        return Err(io::Error::new(io::ErrorKind::Other, "diskutil failed"));
+    }
+
+    // Parse the plist to find APFSPhysicalStores[0].APFSPhysicalStore
+    // Simple string search avoids a plist dependency
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let key = "<key>APFSPhysicalStore</key>";
+    let val_open  = "<string>";
+    let val_close = "</string>";
+
+    if let Some(key_pos) = stdout.find(key) {
+        let after_key = &stdout[key_pos + key.len()..];
+        if let Some(open_pos) = after_key.find(val_open) {
+            let after_open = &after_key[open_pos + val_open.len()..];
+            if let Some(close_pos) = after_open.find(val_close) {
+                let store = &after_open[..close_pos]; // e.g. "disk0s2"
+                return Ok(format!("/dev/{store}"));
+            }
+        }
+    }
+
+    Err(io::Error::new(io::ErrorKind::NotFound, "APFSPhysicalStore not found in diskutil output"))
 }

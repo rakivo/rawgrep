@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize};
 use crossbeam_channel::unbounded;
 use crossbeam_deque::{Injector, Worker as DequeWorker};
 
+use crate::apfs::{ApfsFs, ApfsVolume, APFS_NX_MAGIC};
 use crate::cli::Cli;
 use crate::matcher::Matcher;
 use crate::{eprintln_red, tracy};
@@ -30,36 +31,6 @@ pub struct RawGrepper<'a, F: RawFs> {
     matcher: Matcher,
     cache: Option<FragmentCache>,
     fragment_hashes: Vec<u32>,
-}
-
-/// impl block for ext4-specific construction
-impl<'a> RawGrepper<'a, Ext4Fs> {
-    pub fn new_ext4(cli: &'a Cli, _device_path: &str, file: File) -> io::Result<Self> {
-        let mut sb_bytes = [0u8; EXT4_SUPERBLOCK_SIZE];
-        {
-            use std::os::unix::fs::FileExt;
-            file.read_at(&mut sb_bytes, EXT4_SUPERBLOCK_OFFSET)?;
-        }
-
-        let magic = u16::from_le_bytes([
-            sb_bytes[EXT4_MAGIC_OFFSET + 0],
-            sb_bytes[EXT4_MAGIC_OFFSET + 1],
-        ]);
-        if magic != EXT4_SUPER_MAGIC {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Not an ext4 filesystem".to_owned()
-            ));
-        }
-
-        let sb = Ext4Fs::parse_superblock(&sb_bytes)?;
-        let device_id = device_id(&file)?;
-        let file_size = file.metadata()?.len();
-        let max_block = file_size / sb.block_size as u64;
-
-        let fs = Ext4Fs { sb, device_id, max_block, file };
-        Self::new_with_fs(cli, fs)
-    }
 }
 
 /// impl block for generic RawFs
@@ -280,8 +251,66 @@ impl<'a, F: RawFs> RawGrepper<'a, F> {
     }
 }
 
+/// impl block for ext4-specific construction
+impl<'a> RawGrepper<'a, Ext4Fs> {
+    #[inline]
+    pub fn new_ext4(cli: &'a Cli, _device_path: &str, file: File) -> io::Result<AnyGrepper<'a>> {
+        let mut sb_bytes = [0u8; EXT4_SUPERBLOCK_SIZE];
+        {
+            use std::os::unix::fs::FileExt;
+            file.read_at(&mut sb_bytes, EXT4_SUPERBLOCK_OFFSET)?;
+        }
+
+        let magic = u16::from_le_bytes([
+            sb_bytes[EXT4_MAGIC_OFFSET + 0],
+            sb_bytes[EXT4_MAGIC_OFFSET + 1],
+        ]);
+        if magic != EXT4_SUPER_MAGIC {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Not an ext4 filesystem".to_owned()
+            ));
+        }
+
+        let sb = Ext4Fs::parse_superblock(&sb_bytes)?;
+        let device_id = device_id(&file)?;
+        let file_size = file.metadata()?.len();
+        let max_block = file_size / sb.block_size as u64;
+
+        let fs = Ext4Fs { sb, device_id, max_block, file };
+        Self::new_with_fs(cli, fs).map(AnyGrepper::Ext4)
+    }
+}
+
+/// impl block for apfs-specific construction
+impl<'a> RawGrepper<'a, ApfsFs> {
+    #[inline]
+    pub fn new_apfs(cli: &'a Cli, _device_path: &str, file: File) -> io::Result<AnyGrepper<'a>> {
+        // Read the first block (4096 bytes covers the NX superblock at block 0).
+        // We don't know block_size yet, so read the maximum possible default.
+        let mut block0 = [0u8; 4096];
+        {
+            use std::os::unix::fs::FileExt;
+            file.read_at(&mut block0, 0)?;
+        }
+
+        let sb = ApfsFs::parse_container_superblock(&block0)?;
+
+        let device_id = device_id(&file)?;
+
+        let fs = ApfsFs { file, sb, device_id, volume: ApfsVolume { omap_root_paddr: 0, root_tree_paddr: 0 } };
+
+        // parse_volume() needs self.file + self.sb, so we construct a temporary
+        // ApfsFs first, resolve the volume, then patch it in.
+        let volume = fs.parse_volume()?;
+        let fs = ApfsFs { volume, ..fs };
+
+        Self::new_with_fs(cli, fs).map(AnyGrepper::Apfs)
+    }
+}
+
 #[inline]
-pub fn open_device(device_path: &str) -> io::Result<File> {
+pub fn open_device_and_detect_fs(device_path: &str) -> io::Result<(File, FsType)> {
     //
     // @Volatile
     //
@@ -309,14 +338,27 @@ pub fn open_device(device_path: &str) -> io::Result<File> {
         use std::os::unix::io::AsRawFd;
         const BLKFLSBUF: libc::c_ulong = 0x1261;
         unsafe { libc::ioctl(file.as_raw_fd(), BLKFLSBUF, 0) };
-    }
-
-    #[cfg(unix)] {
-        use std::os::unix::io::AsRawFd;
         unsafe { libc::syncfs(file.as_raw_fd()); }
     }
+    #[cfg(target_os = "macos")] {
+        // macOS has no syncfs() or BLKFLSBUF.
+        // F_FULLFSYNC flushes the volume containing the fd to physical storage,
+        // which is the closest equivalent for ensuring we read committed data.
+        use std::os::unix::io::AsRawFd;
+        unsafe { libc::fcntl(file.as_raw_fd(), libc::F_FULLFSYNC); }
+    }
 
-    Ok(file)
+    // Read enough to cover both magic locations:
+    // APFS at offset 32, ext4 superblock at offset 1024+56=1080 -> 2048 bytes is sufficient
+    let mut probe = [0u8; 2048];
+    {
+        use std::os::unix::fs::FileExt;
+        file.read_at(&mut probe, 0)?;
+    }
+
+    let fs = detect_fs_type(&probe).expect("unexpected filesystem");
+
+    Ok((file, fs))
 }
 
 #[inline]
@@ -397,5 +439,62 @@ fn macos_num_physical_cores() -> Option<usize> {
         Some(count as usize)
     } else {
         None
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FsType {
+    Ext4,
+    Apfs,
+}
+
+/// Peek at raw bytes to identify the filesystem type.
+/// `block0` should be at least 2048 bytes (to cover the ext4 superblock at offset 1024).
+pub fn detect_fs_type(block0: &[u8]) -> Option<FsType> {
+    // APFS: NX magic at offset 32 in block 0
+    if block0.len() >= 36 {
+        let magic = u32::from_le_bytes(block0[32..36].try_into().unwrap());
+        if magic == APFS_NX_MAGIC {
+            return Some(FsType::Apfs);
+        }
+    }
+
+    // ext4: magic at offset 1024 + 56 = 1080
+    if block0.len() >= EXT4_SUPERBLOCK_OFFSET as usize + EXT4_MAGIC_OFFSET + 2 {
+        let off = EXT4_SUPERBLOCK_OFFSET as usize + EXT4_MAGIC_OFFSET;
+        let magic = u16::from_le_bytes(block0[off..off + 2].try_into().unwrap());
+        if magic == EXT4_SUPER_MAGIC {
+            return Some(FsType::Ext4);
+        }
+    }
+
+    None
+}
+
+pub enum AnyGrepper<'a> {
+    Ext4(RawGrepper<'a, Ext4Fs>),
+    Apfs(RawGrepper<'a, ApfsFs>),
+}
+
+impl<'a> AnyGrepper<'a> {
+    #[inline]
+    pub fn search(
+        self,
+        root_file_id: FileId,
+        running: &AtomicBool,
+        root_gi: Option<Gitignore>,
+    ) -> io::Result<Stats> {
+        match self {
+            AnyGrepper::Ext4(g) => g.search(root_file_id, running, root_gi),
+            AnyGrepper::Apfs(g) => g.search(root_file_id, running, root_gi),
+        }
+    }
+
+    #[inline]
+    pub fn try_resolve_path_to_file_id(&self, path: &str) -> io::Result<FileId> {
+        match self {
+            AnyGrepper::Ext4(g) => g.try_resolve_path_to_file_id(path),
+            AnyGrepper::Apfs(g) => g.try_resolve_path_to_file_id(path),
+        }
     }
 }
