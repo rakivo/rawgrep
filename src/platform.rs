@@ -416,6 +416,7 @@ pub mod windows {
     use super::*;
     use std::os::windows::io::AsRawHandle;
     use std::os::windows::ffi::OsStrExt;
+    use std::path::MAIN_SEPARATOR_STR;
 
     use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
     use windows_sys::Win32::Storage::FileSystem::{

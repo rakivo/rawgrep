@@ -330,8 +330,8 @@ impl<'a> RawGrepper<'a, NtfsFs> {
 #[inline]
 fn open_device(path: &str) -> io::Result<File> {
     use std::os::windows::fs::OpenOptionsExt;
-    use winapi::um::winbase::FILE_FLAG_NO_BUFFERING;
-    std::fs::OpenOptions::new()
+    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_NO_BUFFERING;
+    OpenOptions::new()
         .read(true)
         .share_mode(0x3) // FILE_SHARE_READ | FILE_SHARE_WRITE
         .custom_flags(FILE_FLAG_NO_BUFFERING) // required for raw volume reads
