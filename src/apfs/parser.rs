@@ -16,6 +16,7 @@
 
 use crate::tracy;
 use crate::parser::{BufKind, FileId, FileNode, FileType, Parser, RawFs, check_first_block_binary};
+use crate::util::read_at_offset;
 
 use super::{
     raw, ApfsInode, ApfsSuperBlock, ApfsVolume,
@@ -278,18 +279,9 @@ impl ApfsFs {
 // ─────────────────────────────────────────────────────────────────────────────
 
 impl ApfsFs {
-    // ── Low-level I/O ────────────────────────────────────────────────────────
-
     #[inline]
     fn read_at_offset(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
-        #[cfg(unix)] {
-            use std::os::unix::fs::FileExt;
-            self.file.read_at(buf, offset)
-        }
-        #[cfg(windows)] {
-            use std::os::windows::fs::FileExt;
-            self.file.seek_read(buf, offset)
-        }
+        read_at_offset(&self.file, buf, offset)
     }
 
     #[inline]

@@ -11,6 +11,7 @@ use crate::apfs::{ApfsFs, ApfsVolume, APFS_NX_MAGIC};
 use crate::cli::Cli;
 use crate::matcher::Matcher;
 use crate::ntfs::NtfsFs;
+use crate::util::read_at_offset;
 use crate::{eprintln_red, tracy};
 use crate::path_buf::SmallPathBuf;
 use crate::stats::{AtomicStats, Stats};
@@ -258,10 +259,7 @@ impl<'a> RawGrepper<'a, Ext4Fs> {
     #[inline]
     pub fn new_ext4(cli: &'a Cli, _device_path: &str, file: File) -> io::Result<AnyGrepper<'a>> {
         let mut sb_bytes = [0u8; EXT4_SUPERBLOCK_SIZE];
-        {
-            use std::os::unix::fs::FileExt;
-            file.read_at(&mut sb_bytes, EXT4_SUPERBLOCK_OFFSET)?;
-        }
+        read_at_offset(&file, &mut sb_bytes, EXT4_SUPERBLOCK_OFFSET)?;
 
         let magic = u16::from_le_bytes([
             sb_bytes[EXT4_MAGIC_OFFSET + 0],
@@ -291,10 +289,7 @@ impl<'a> RawGrepper<'a, ApfsFs> {
         // Read the first block (4096 bytes covers the NX superblock at block 0).
         // We don't know block_size yet, so read the maximum possible default.
         let mut block0 = [0u8; 4096];
-        {
-            use std::os::unix::fs::FileExt;
-            file.read_at(&mut block0, 0)?;
-        }
+        read_at_offset(&file, &mut block0, 0)?;
 
         let sb = ApfsFs::parse_container_superblock(&block0)?;
 
@@ -316,10 +311,7 @@ impl<'a> RawGrepper<'a, NtfsFs> {
     #[inline]
     pub fn new_ntfs(cli: &'a Cli, _device_path: &str, file: File) -> io::Result<AnyGrepper<'a>> {
         let mut boot = [0u8; 512];
-        {
-            use std::os::unix::fs::FileExt;
-            file.read_at(&mut boot, 0)?;
-        }
+        read_at_offset(&file, &mut boot, 0)?;
 
         if &boot[3..11] != b"NTFS    " {
             return Err(io::Error::new(
@@ -394,10 +386,7 @@ pub fn open_device_and_detect_fs(device_path: &str) -> io::Result<(File, FsType)
     // Read enough to cover both magic locations:
     // APFS at offset 32, ext4 superblock at offset 1024+56=1080 -> 2048 bytes is sufficient
     let mut probe = [0u8; 2048];
-    {
-        use std::os::unix::fs::FileExt;
-        file.read_at(&mut probe, 0)?;
-    }
+    read_at_offset(&file, &mut probe, 0)?;
 
     let fs = detect_fs_type(&probe).expect("unexpected filesystem");
 
