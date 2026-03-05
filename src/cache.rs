@@ -62,7 +62,7 @@ pub struct CacheStats {
 pub struct CacheConfig {
     pub max_fragments: usize,
     pub max_files: usize,
-    pub cache_dir: Option<PathBuf>,
+    pub cache_dir: Option<Box<Path>>,
     pub ignore_cache: bool,
 }
 
@@ -271,7 +271,7 @@ pub struct FragmentCache<S: CacheStorage = DiskStorage> {
     file_metas: FatPtr<FileMeta>, // for cache invalidation
     file_bitsets: FatPtr<u64>,    // flattened bitsets: file_id * num_fragments_in_u64 + bit_idx
 
-    // Owned data (None when using mmap, populated on copy-on-write)
+    // @Cleanup
     owned_fragment_hashes: Option<Box<[u32]>>,
     owned_file_keys: Option<Box<[FileKey]>>,
     owned_file_metas: Option<Box<[FileMeta]>>,
@@ -291,7 +291,8 @@ impl FragmentCache<DiskStorage> {
     /// Create new or load existing cache
     #[inline]
     pub fn new(config: &CacheConfig) -> io::Result<Self> {
-        let storage = DiskStorage::new(Self::get_cache_path(&config.cache_dir)?);
+        let path = Self::get_cache_path(config.cache_dir.as_deref())?;
+        let storage = DiskStorage::new(path);
 
         if !config.ignore_cache {
             if let Ok(cache) = Self::load_from_disk(storage.clone(), config) {
@@ -1263,9 +1264,9 @@ impl<S: CacheStorage> FragmentCache<S> {
     }
 
     #[inline]
-    fn get_cache_path(cache_dir: &Option<PathBuf>) -> io::Result<PathBuf> {
+    fn get_cache_path(cache_dir: Option<&Path>) -> io::Result<PathBuf> {
         let dir = if let Some(d) = cache_dir {
-            d.clone()
+            d.to_path_buf()
         } else {
             let home = if let Ok(sudo_user) = std::env::var("SUDO_USER") {
                 //
@@ -1330,7 +1331,7 @@ mod tests {
     use proptest::prelude::*;
     use smallvec::SmallVec;
 
-    // ─── Helpers ──────────────────────────────────────────────────────────────
+    // --- Helpers --------------------------------------------------------------
 
     fn key(n: u64)              -> FileKey  { FileKey::new(1, n) }
     fn meta(mtime: i64, sz: u64) -> FileMeta { FileMeta::new(mtime, sz) }
@@ -1338,7 +1339,7 @@ mod tests {
     fn absent_presence(n: usize) -> Vec<bool> { vec![false; n] }
     fn present_presence(n: usize) -> Vec<bool> { vec![true; n] }
 
-    // ─── can_skip_file ────────────────────────────────────────────────────────
+    // --- can_skip_file --------------------------------------------------------
 
     #[test]
     fn absent_fragment_allows_skip() {
@@ -1401,7 +1402,7 @@ mod tests {
         assert!(!cache.can_skip_file(key(1), meta(1, 1), &[0x9999_9999]));
     }
 
-    // ─── merge_updates ────────────────────────────────────────────────────────
+    // --- merge_updates --------------------------------------------------------
 
     #[test]
     fn merge_updates_absent_fragment_skippable() {
@@ -1454,7 +1455,7 @@ mod tests {
         }
     }
 
-    // ─── ring buffer ─────────────────────────────────────────────────────────
+    // --- ring buffer ---------------------------------------------------------
 
     #[test]
     fn ring_buffer_eviction_clears_evicted_slot() {
@@ -1475,9 +1476,9 @@ mod tests {
             vec![SmallVec::from_slice(&[false])],
         ).unwrap();
 
-        // evicted fragment → unknown → cannot skip
+        // evicted fragment -> unknown -> cannot skip
         assert!(!cache.can_skip_file(k, m, &[hashes[0]]));
-        // new fragment → absent → can skip
+        // new fragment -> absent -> can skip
         assert!(cache.can_skip_file(k, m, &[new_hash]));
     }
 
@@ -1498,7 +1499,7 @@ mod tests {
         let _ = cache.memory_usage(); // just assert no corruption
     }
 
-    // ─── proptest ─────────────────────────────────────────────────────────────
+    // --- proptest -------------------------------------------------------------
 
     proptest! {
         #[test]
@@ -1571,7 +1572,7 @@ mod tests {
         }
     }
 
-    // ─── disk roundtrip (DiskStorage) ────────────────────────────────────────
+    // --- disk roundtrip (DiskStorage) ----------------------------------------
 
     #[test]
     fn disk_roundtrip_preserves_data() {
@@ -1579,7 +1580,7 @@ mod tests {
         let config = CacheConfig {
             max_fragments: 64,
             max_files: 256,
-            cache_dir: Some(dir.path().to_path_buf()),
+            cache_dir: Some(dir.path().into()),
             ignore_cache: false,
         };
 
@@ -1609,7 +1610,7 @@ mod tests {
             let config = CacheConfig {
                 max_fragments: 128,
                 max_files: 64,
-                cache_dir: Some(dir.path().to_path_buf()),
+                cache_dir: Some(dir.path().into()),
                 ignore_cache: false,
             };
 
@@ -1640,7 +1641,7 @@ mod tests {
         let config = CacheConfig {
             max_fragments: 32,
             max_files: 128,
-            cache_dir: Some(dir.path().to_path_buf()),
+            cache_dir: Some(dir.path().into()),
             ignore_cache: false,
         };
 
@@ -1660,7 +1661,7 @@ mod tests {
         {
             let mut cache = FragmentCache::new(&config).unwrap();
 
-            // insert new file → triggers CoW
+            // insert new file -> triggers CoW
             let hash2 = 0xBBBB_BBBB_u32;
             let k2    = key(2);
             let m2    = meta(2, 2);
@@ -1674,7 +1675,7 @@ mod tests {
         }
     }
 
-    // ─── False-positive absent: targeted regression tests ─────────────────────
+    // --- False-positive absent: targeted regression tests ---------------------
 
     #[test]
     fn no_false_absent_basic() {
@@ -1867,13 +1868,13 @@ mod tests {
             vec![SmallVec::from_slice(&[false, true, false])], // A absent, B present, C absent
         ).unwrap();
 
-        // A is absent → can_skip returns true (skip because A definitely not in file)
+        // A is absent -> can_skip returns true (skip because A definitely not in file)
         // This is correct for literal pattern fragments: if fragment A (part of pattern)
         // is absent, the full pattern can't match
         assert!(cache.can_skip_file(k, m, &[hash_a]),
                 "should skip: fragment A is absent");
 
-        // B is present → cannot skip
+        // B is present -> cannot skip
         assert!(!cache.can_skip_file(k, m, &[hash_b]),
                 "false absent: fragment B is present");
 
@@ -1883,7 +1884,7 @@ mod tests {
                 "should skip when at least one required fragment is absent");
     }
 
-    // ─── Proptest: no false absents under random merges ───────────────────────
+    // --- Proptest: no false absents under random merges -----------------------
 
     proptest! {
         #[test]
@@ -1981,7 +1982,7 @@ mod tests {
         }
     }
 
-    // ─── Stride boundary stress tests ─────────────────────────────────────────
+    // --- Stride boundary stress tests -----------------------------------------
 
     #[test]
     fn no_false_absent_stride_jumps_at_64_boundary() {
@@ -2140,7 +2141,7 @@ mod tests {
                 "false absent: hash_b present after stride boundary");
     }
 
-    // ─── Proptest: exhaustive stride stress ───────────────────────────────────
+    // --- Proptest: exhaustive stride stress -----------------------------------
 
     proptest! {
         #[test]
@@ -2268,7 +2269,7 @@ mod tests {
         }
     }
 
-    // ─── False present: cache must correctly identify absent fragments ─────────
+    // --- False present: cache must correctly identify absent fragments ---------
 
     #[test]
     fn absent_fragment_skips_correctly_basic() {
@@ -2506,7 +2507,7 @@ mod tests {
         assert!(!cache.can_skip_file(k, m, &[hash_next]), "next present, must not skip");
     }
 
-    // ─── Proptest: absent correctness ─────────────────────────────────────────
+    // --- Proptest: absent correctness -----------------------------------------
 
     proptest! {
         #[test]

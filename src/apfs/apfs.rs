@@ -2,7 +2,7 @@ use std::fmt::Display;
 
 pub type ObjId = u64;
 
-// ─── Container Superblock (NX) ───────────────────────────────────────────────
+// --- Container Superblock (NX) -----------------------------------------------
 
 pub const APFS_NX_MAGIC: u32                = 0x4253584E; // 'NXSB'
 pub const APFS_BLOCK_SIZE_DEFAULT: u32      = 4096;
@@ -15,20 +15,20 @@ pub const APFS_NX_BLOCK_COUNT_OFFSET: usize = 12; // __le64 nx_block_count (star
 pub const APFS_NX_OMAP_OID_OFFSET: usize   = 160; // __le64 nx_omap_oid
 pub const APFS_NX_FS_OID_OFFSET: usize     = 176; // __le64 nx_fs_oid[100] – first entry is the volume
 
-// ─── Volume Superblock (APSB) ─────────────────────────────────────────────────
+// --- Volume Superblock (APSB) -------------------------------------------------
 
 pub const APFS_APSB_MAGIC: u32             = 0x42535041; // 'APSB'
 pub const APFS_APSB_ROOT_TREE_OID_OFFSET: usize = 128;  // __le64 apfs_root_tree_oid
 pub const APFS_APSB_OMAP_OID_OFFSET: usize      = 120;  // __le64 apfs_omap_oid
 
-// ─── Object types ─────────────────────────────────────────────────────────────
+// --- Object types -------------------------------------------------------------
 
 pub const APFS_OBJ_TYPE_NX_SUPERBLOCK: u16 = 0x0001;
 pub const APFS_OBJ_TYPE_BTREE: u16         = 0x0002;
 pub const APFS_OBJ_TYPE_BTREE_NODE: u16    = 0x0003;
 pub const APFS_OBJ_TYPE_FS: u16            = 0x000D; // volume superblock
 
-// ─── Object map / B-tree node header ─────────────────────────────────────────
+// --- Object map / B-tree node header -----------------------------------------
 
 /// Every APFS block starts with a 32-byte object header (obj_phys_t)
 pub const APFS_OBJ_HDR_SIZE: usize         = 32;
@@ -37,7 +37,7 @@ pub const APFS_OBJ_HDR_OID_OFFSET: usize   = 8;
 /// Offset of the 2-byte object type field (low 16 bits of __le32 o_type)
 pub const APFS_OBJ_HDR_TYPE_OFFSET: usize  = 24;
 
-// ─── B-tree node header (btree_node_phys_t) ──────────────────────────────────
+// --- B-tree node header (btree_node_phys_t) ----------------------------------
 
 pub const APFS_BTNODE_HDR_SIZE: usize      = 56; // obj header (32) + btn header (24)
 pub const APFS_BTNODE_FLAGS_OFFSET: usize  = 32; // __le16 btn_flags inside node
@@ -51,47 +51,47 @@ pub const APFS_BTNODE_VAL_FREE_LIST_OFFSET: usize = 52;
 pub const APFS_BTNODE_FLAG_LEAF: u16       = 0x0004;
 pub const APFS_BTNODE_FLAG_FIXED_KV: u16   = 0x0004; // same bit, re-used name for clarity
 
-// ─── Object-map value (omap_val_t) ───────────────────────────────────────────
+// --- Object-map value (omap_val_t) -------------------------------------------
 
 pub const APFS_OMAP_VAL_SIZE: usize        = 16; // flags (4) + size (4) + paddr (8)
 pub const APFS_OMAP_VAL_PADDR_OFFSET: usize = 8; // __le64 ov_paddr
 
-// ─── File-system record types (j_obj_types) ──────────────────────────────────
+// --- File-system record types (j_obj_types) ----------------------------------
 
 pub const APFS_TYPE_INODE: u8              = 3;
 pub const APFS_TYPE_XATTR: u8             = 4;
 pub const APFS_TYPE_FILE_EXTENT: u8        = 8;  // physical extent record
 pub const APFS_TYPE_DIR_REC: u8            = 9;  // directory entry (j_drec_hashed_key_t)
 
-// ─── Inode flags ─────────────────────────────────────────────────────────────
+// --- Inode flags -------------------------------------------------------------
 
 pub const APFS_INODE_IS_APFS_PRIVATE: u64 = 0x0001;
 pub const APFS_INODE_MAINTAIN_DIR_STATS: u64 = 0x0040;
 
-// ─── Mode bits ───────────────────────────────────────────────────────────────
+// --- Mode bits ---------------------------------------------------------------
 
 pub const S_IFMT: u16  = 0xF000;
 pub const S_IFREG: u16 = 0x8000;
 pub const S_IFDIR: u16 = 0x4000;
 pub const S_IFLNK: u16 = 0xA000;
 
-// ─── Directory entry file types ───────────────────────────────────────────────
+// --- Directory entry file types -----------------------------------------------
 
 pub const DT_UNKNOWN: u8 = 0;
 pub const DT_REG: u8     = 8;
 pub const DT_DIR: u8     = 4;
 pub const DT_LNK: u8     = 10;
 
-// ─── Root inode number ────────────────────────────────────────────────────────
+// --- Root inode number --------------------------------------------------------
 
 pub const APFS_ROOT_DIR_INO_NUM: u64 = 2;
 
-// ─── Compressed file xattr name ──────────────────────────────────────────────
+// --- Compressed file xattr name ----------------------------------------------
 
 pub const APFS_XATTR_DECMPFS: &[u8] = b"com.apple.decmpfs";
 pub const APFS_XATTR_RSRC_FORK: &[u8] = b"com.apple.ResourceFork";
 
-// ─── High-level parsed structures ────────────────────────────────────────────
+// --- High-level parsed structures --------------------------------------------
 
 #[derive(Clone, Copy)]
 pub struct ApfsSuperBlock {
@@ -135,7 +135,7 @@ pub struct ApfsInode {
 pub mod raw {
     use bytemuck::{Pod, Zeroable};
 
-    // ── obj_phys_t ──────────────────────────────────────────────────────────
+    // -- obj_phys_t ----------------------------------------------------------
     // Every APFS block on-disk starts with this 32-byte header.
     //
     // struct obj_phys_t {
@@ -155,7 +155,7 @@ pub mod raw {
         pub o_subtype: u32,      // 0x1C
     }
 
-    // ── btree_node_phys_t ───────────────────────────────────────────────────
+    // -- btree_node_phys_t ---------------------------------------------------
     //
     // struct btree_node_phys_t {
     //     obj_phys_t  btn_o;
@@ -188,7 +188,7 @@ pub mod raw {
         // btn_data[] follows at 0x38
     }
 
-    // ── kvoff_t – used inside the ToC for variable-length nodes ────────────
+    // -- kvoff_t – used inside the ToC for variable-length nodes ------------
     //
     // struct kvoff_t { uint16_t k; uint16_t v; }
     #[repr(C)]
@@ -198,7 +198,7 @@ pub mod raw {
         pub v: u16,
     }
 
-    // ── kvloc_t – used inside the ToC for fixed-length nodes ───────────────
+    // -- kvloc_t – used inside the ToC for fixed-length nodes ---------------
     //
     // struct kvloc_t { nloc_t k; nloc_t v; }
     #[repr(C)]
@@ -210,7 +210,7 @@ pub mod raw {
         pub v_len: u16,
     }
 
-    // ── j_key_t – every fs-record key starts with this ─────────────────────
+    // -- j_key_t – every fs-record key starts with this ---------------------
     //
     // struct j_key_t { uint64_t obj_id_and_type; }
     //   bits 63-60 = record type
@@ -221,7 +221,7 @@ pub mod raw {
         pub obj_id_and_type: u64,
     }
 
-    // ── j_inode_val_t ───────────────────────────────────────────────────────
+    // -- j_inode_val_t -------------------------------------------------------
     //
     // (only the fields we actually use; the struct is larger on disk)
     #[repr(C)]
@@ -247,7 +247,7 @@ pub mod raw {
         pub _pad2:  u32,       // 0x5C
     }
 
-    // ── j_drec_hashed_key_t ─────────────────────────────────────────────────
+    // -- j_drec_hashed_key_t -------------------------------------------------
     //
     // struct j_drec_hashed_key_t {
     //     j_key_t  hdr;
@@ -263,7 +263,7 @@ pub mod raw {
         // name bytes follow immediately after this fixed header in the key area
     }
 
-    // ── j_drec_val_t ────────────────────────────────────────────────────────
+    // -- j_drec_val_t --------------------------------------------------------
     //
     // struct j_drec_val_t {
     //     uint64_t file_id;
@@ -280,7 +280,7 @@ pub mod raw {
         pub _pad:       [u8; 6],  // 0x12  explicit pad; sizeof == 24, matches on-disk xfield alignment
     }
 
-    // ── omap_key_t / omap_val_t ─────────────────────────────────────────────
+    // -- omap_key_t / omap_val_t ---------------------------------------------
     //
     // struct omap_key_t  { uint64_t ok_oid; uint64_t ok_xid; }
     // struct omap_val_t  { uint32_t ov_flags; uint32_t ov_size; uint64_t ov_paddr; }
@@ -299,7 +299,7 @@ pub mod raw {
         pub ov_paddr: u64,
     }
 
-    // ── j_phys_ext_key_t / j_phys_ext_val_t (file extents) ──────────────────
+    // -- j_phys_ext_key_t / j_phys_ext_val_t (file extents) ------------------
     //
     // struct j_phys_ext_key_t { j_key_t hdr; uint64_t logical_addr; }
     // struct j_phys_ext_val_t { uint64_t len_and_flags; uint64_t phys_block_num; uint64_t crypto_id; }

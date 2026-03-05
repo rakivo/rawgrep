@@ -55,6 +55,9 @@ fastrand = { version = "2.3.0", default-features = false, features = ["std"] }
 bytemuck = { version = "1.24", features = ["derive"] }
 dhat = { version = "0.3.3", default-features = false, optional = true }
 nohash-hasher = "0.2.0"
+parking_lot = "0.12.5"
+tracing             = "0.1"
+tracing-subscriber  = { version = "0.3", features = ["env-filter"] }
 
 [target.'cfg(not(target_os = "macos"))'.dependencies]
 gdt-cpus = { version = "25", default-features = false }

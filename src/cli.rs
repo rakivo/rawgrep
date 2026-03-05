@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::Path;
 use std::sync::OnceLock;
 use std::num::NonZeroUsize;
 
@@ -37,7 +37,7 @@ pub struct BufferConfig {
 // TODO(#21): add --files-with-matches / --files-without-match
 // TODO(#22): add --json output mode for integration tools later
 // TODO(#23): add --stats-extended (per-file timings, cache hit/miss)
-#[derive(Parser)]
+#[derive(Parser, Clone)]
 #[command(
     name = "rawgrep",
     about = "Grep at the speed of raw disk",
@@ -49,15 +49,15 @@ pub struct BufferConfig {
 pub struct Cli {
     /// Pattern to search for (supports regex syntax)
     #[arg(value_name = "PATTERN")]
-    pub pattern: String,
+    pub pattern: Box<str>,
 
     /// Directory path to search in
     #[arg(value_name = "PATH", default_value = ".")]
-    pub search_root_path: String,
+    pub search_root_path: Box<str>,
 
     /// Block device to read from (auto-detected if not specified)
     #[arg(short, long, value_name = "DEVICE")]
-    pub device: Option<String>,
+    pub device: Option<Box<str>>,
 
     /// Print statistics at the end
     #[arg(short, long)]
@@ -124,7 +124,7 @@ pub struct Cli {
 
     /// Cache directory (default: ~/.cache/rawgrep/)
     #[arg(long = "cache-dir", value_name = "DIR")]
-    pub cache_dir: Option<PathBuf>,
+    pub cache_dir: Option<Box<Path>>,
 
     /// Ignore existing cache and rebuild from scratch
     #[arg(long = "rebuild-cache")]

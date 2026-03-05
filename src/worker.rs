@@ -37,7 +37,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use smallvec::{smallvec, SmallVec};
 use crossbeam_channel::{Receiver, Sender};
-use crossbeam_deque::{Injector, Steal, Stealer, Worker as DequeWorker};
+use crossbeam_deque::{Injector, Steal, Stealer};
+pub use crossbeam_deque::Worker as DequeWorker;
 
 pub const LARGE_DIR_THRESHOLD: usize = 256; // Split dirs with 1000+ entries @Tune
 pub const FILE_BATCH_SIZE: usize = 64; // Process files in batches of 500 @Tune
@@ -61,6 +62,65 @@ pub struct DirWork {
     pub path_bytes: Arc<[u8]>,
     pub gitignore_chain: GitignoreChain,
     pub depth: u16
+}
+
+#[derive(Debug)]
+pub struct RawMatch {
+    pub path:     Box<[u8]>,          // full file path
+    pub line_num: u32,                // 1-indexed line number
+    pub text:     Box<[u8]>,          // the matched line content
+    pub ranges:   Box<[(u32, u32)]>,  // byte ranges of match spans within text
+}
+
+#[derive(Clone)]
+pub struct ChannelSink(pub Sender<RawMatch>);
+
+#[derive(Clone)]
+pub struct NoSink;
+
+pub trait MatchSink: Send + Sync + Clone {
+    const NEEDS_RANGES: bool;
+
+    fn push(
+        &self,
+        path:   impl Into<Box<[u8]>>,
+        line_num: u32,
+        text:   impl Into<Box<[u8]>>,
+        ranges: impl Into<Box<[(u32, u32)]>>
+    );
+}
+
+impl MatchSink for NoSink {
+    const NEEDS_RANGES: bool = false;
+
+    #[inline(always)]
+    fn push(
+        &self,
+        _: impl Into<Box<[u8]>>,
+        _: u32,
+        _: impl Into<Box<[u8]>>,
+        _: impl Into<Box<[(u32, u32)]>>
+    ) {}
+}
+
+impl MatchSink for ChannelSink {
+    const NEEDS_RANGES: bool = true;
+
+    #[inline(always)]
+    fn push(
+        &self,
+        path:   impl Into<Box<[u8]>>,
+        line_num: u32,
+        text:   impl Into<Box<[u8]>>,
+        ranges: impl Into<Box<[(u32, u32)]>>
+    ) {
+        self.0.send(RawMatch {
+            path:     path.into(),
+            line_num: line_num as u32,
+            text:     text.into(),
+            ranges:   ranges.into(),
+        }).ok();
+    }
 }
 
 pub struct OutputWorker {
@@ -87,6 +147,9 @@ impl OutputWorker {
 
 pub struct WorkerResult {
     pub stats: Stats,
+
+    pub parser: Parser,
+
     pub file_keys: Vec<FileKey>,
     pub file_metas: Vec<FileMeta>,
 
@@ -94,7 +157,7 @@ pub struct WorkerResult {
     pub fragment_presence: Vec<SmallVec<[bool; 32]>>
 }
 
-pub struct WorkerContext<'a, F: RawFs> {
+pub struct WorkerContext<'a, F: RawFs, S: MatchSink> {
     pub cache: Option<&'a FragmentCache>,
     pub fragment_hashes: &'a [u32],
     pub fs: &'a F,
@@ -108,12 +171,14 @@ pub struct WorkerContext<'a, F: RawFs> {
     pub output_tx: Sender<Vec<u8>>,
     pub worker_id: u16,
 
+    pub sink: S,
+
     pub pending_file_keys: Vec<FileKey>,
     pub pending_file_metas: Vec<FileMeta>,
     pub pending_fragment_presence: Vec<SmallVec<[bool; 32]>>,
 }
 
-impl<F: RawFs> WorkerContext<'_, F> {
+impl<F: RawFs, S: MatchSink> WorkerContext<'_, F, S> {
     #[inline(always)]
     fn init(&mut self) {
         let config = self.cli.get_buffer_config();
@@ -125,6 +190,7 @@ impl<F: RawFs> WorkerContext<'_, F> {
         self.flush_output();
         WorkerResult {
             stats: self.stats,
+            parser: self.parser,
             file_keys: self.pending_file_keys,
             file_metas: self.pending_file_metas,
             fragment_presence: self.pending_fragment_presence
@@ -152,7 +218,7 @@ impl<F: RawFs> WorkerContext<'_, F> {
 }
 
 // impl block of the core logic
-impl<F: RawFs> WorkerContext<'_, F> {
+impl<F: RawFs, S: MatchSink> WorkerContext<'_, F, S> {
     pub fn dispatch_directory(
         &mut self,
         mut work: DirWork,
@@ -442,7 +508,7 @@ impl<F: RawFs> WorkerContext<'_, F> {
 }
 
 // impl block for find_and_print_matches
-impl<F: RawFs> WorkerContext<'_, F> {
+impl<F: RawFs, S: MatchSink> WorkerContext<'_, F, S> {
     #[inline]
     fn find_and_print_matches(&mut self) -> io::Result<bool> {
         let _span = tracy::span!("find_and_print_matches_fast");
@@ -532,8 +598,8 @@ impl<F: RawFs> WorkerContext<'_, F> {
                     self.parser.output.extend_from_slice(COLOR_CYAN.as_bytes());
                 }
 
-                let line_num = line_num_buf.format(line_num);
-                self.parser.output.extend_from_slice(line_num.as_bytes());
+                let line_num_str = line_num_buf.format(line_num);
+                self.parser.output.extend_from_slice(line_num_str.as_bytes());
                 if should_print_color {
                     self.parser.output.extend_from_slice(COLOR_RESET.as_bytes());
                 }
@@ -560,6 +626,15 @@ impl<F: RawFs> WorkerContext<'_, F> {
 
                 self.parser.output.extend_from_slice(&display[last..]);
                 self.parser.output.push(b'\n');
+
+                if S::NEEDS_RANGES {
+                    let ranges = self.matcher.find_matches(line)
+                        .map(|(s, e)| (s as _, e as _))
+                        .collect::<SmallVec<[_; 4]>>()
+                        .into_boxed_slice();
+
+                    self.sink.push(self.path.as_ref(), line_num as _, line, ranges);
+                }
             }
 
             if line_end >= buf_len { break }
@@ -577,7 +652,7 @@ impl<F: RawFs> WorkerContext<'_, F> {
 }
 
 /// impl block of gitignore helper functions
-impl<F: RawFs> WorkerContext<'_, F> {
+impl<F: RawFs, S: MatchSink> WorkerContext<'_, F, S> {
     #[inline]
     fn try_load_gitignore(&mut self, gi_file_id: FileId) -> Option<Gitignore> {
         let _span = tracy::span!("WorkerContext::try_load_gitignore");
@@ -601,7 +676,7 @@ impl<F: RawFs> WorkerContext<'_, F> {
     }
 }
 
-impl<F: RawFs> WorkerContext<'_, F> {
+impl<F: RawFs, S: MatchSink> WorkerContext<'_, F, S> {
     pub fn start_worker_loop(
         mut self,
 

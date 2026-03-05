@@ -12,14 +12,14 @@ use crate::cli::Cli;
 use crate::matcher::Matcher;
 use crate::ntfs::NtfsFs;
 use crate::util::read_at_offset;
-use crate::{eprintln_red, tracy};
+use crate::{Result, Error, eprintln_red, tracy};
 use crate::path_buf::SmallPathBuf;
 use crate::stats::{AtomicStats, Stats};
 use crate::platform::device_id;
 use crate::ignore::{Gitignore, GitignoreChain};
 use crate::cache::{CacheConfig, FragmentCache};
 use crate::parser::{BufKind, FileId, FileNode, Parser, RawFs};
-use crate::worker::{DirWork, OutputWorker, WorkItem, WorkerContext, WorkerResult};
+use crate::worker::{DirWork, MatchSink, NoSink, OutputWorker, WorkItem, WorkerContext, WorkerResult};
 use crate::ext4::{
     Ext4Fs,
     EXT4_MAGIC_OFFSET,
@@ -28,18 +28,19 @@ use crate::ext4::{
     EXT4_SUPER_MAGIC,
 };
 
-pub struct RawGrepper<'a, F: RawFs> {
-    cli: &'a Cli,
+pub struct RawGrepper<F: RawFs, S: MatchSink = NoSink> {
+    cli: Cli,
     fs: F,
     matcher: Matcher,
     cache: Option<FragmentCache>,
     fragment_hashes: Vec<u32>,
+    pub sink: S
 }
 
 /// impl block for generic RawFs
-impl<'a, F: RawFs> RawGrepper<'a, F> {
-    pub fn new_with_fs(cli: &'a Cli, fs: F) -> io::Result<Self> {
-        let matcher = create_matcher_or_exit(cli);
+impl<F: RawFs, S: MatchSink> RawGrepper<F, S> {
+    pub fn new_with_fs(cli: &Cli, fs: F, sink: S) -> Result<Self> {
+        let matcher = make_matcher(cli)?;
         let fragment_hashes = matcher.extract_fragment_hashes();
 
         let cache = if !cli.no_cache && !fragment_hashes.is_empty() {
@@ -64,7 +65,7 @@ impl<'a, F: RawFs> RawGrepper<'a, F> {
             None
         };
 
-        Ok(RawGrepper { cli, fs, matcher, cache, fragment_hashes })
+        Ok(RawGrepper { cli: cli.clone(), fs, matcher, cache, fragment_hashes, sink })
     }
 
     pub fn search(
@@ -120,6 +121,7 @@ impl<'a, F: RawFs> RawGrepper<'a, F> {
             let handles = workers.into_iter().enumerate().map(|(worker_id, local_worker)| {
                 let stealers = &stealers;
                 let output_tx = output_tx.clone();
+                let sink = self.sink.clone();
                 let cli = &self.cli;
 
                 let cache = self.cache.as_ref();
@@ -142,6 +144,8 @@ impl<'a, F: RawFs> RawGrepper<'a, F> {
                         output_tx,
                         worker_id: worker_id as _,
 
+                        sink,
+
                         pending_file_keys: Vec::new(),
                         pending_file_metas: Vec::new(),
                         pending_fragment_presence: Vec::new(),
@@ -151,7 +155,8 @@ impl<'a, F: RawFs> RawGrepper<'a, F> {
                         stats: worker_stats,
                         file_keys,
                         file_metas,
-                        fragment_presence
+                        fragment_presence,
+                        ..
                     } = worker.start_worker_loop(
                         running,
                         active_workers,
@@ -255,9 +260,9 @@ impl<'a, F: RawFs> RawGrepper<'a, F> {
 }
 
 /// impl block for ext4-specific construction
-impl<'a> RawGrepper<'a, Ext4Fs> {
+impl<S: MatchSink> RawGrepper<Ext4Fs, S> {
     #[inline]
-    pub fn new_ext4(cli: &'a Cli, _device_path: &str, file: File) -> io::Result<AnyGrepper<'a>> {
+    pub fn new_ext4(cli: &Cli, _device_path: &str, file: File, sink: S) -> Result<AnyGrepper<S>> {
         let mut sb_bytes = [0u8; EXT4_SUPERBLOCK_SIZE];
         read_at_offset(&file, &mut sb_bytes, EXT4_SUPERBLOCK_OFFSET)?;
 
@@ -266,10 +271,11 @@ impl<'a> RawGrepper<'a, Ext4Fs> {
             sb_bytes[EXT4_MAGIC_OFFSET + 1],
         ]);
         if magic != EXT4_SUPER_MAGIC {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Not an ext4 filesystem".to_owned()
-            ));
+            return Err(Error::UnknownFilesystem(
+                "make sure the path points to a partition (e.g. /dev/sda1), \
+                 not a whole disk (e.g. /dev/sda)\n\
+                 tip: run `df -Th /` to find your root partition".into())
+            );
         }
 
         let sb = Ext4Fs::parse_superblock(&sb_bytes)?;
@@ -278,14 +284,14 @@ impl<'a> RawGrepper<'a, Ext4Fs> {
         let max_block = file_size / sb.block_size as u64;
 
         let fs = Ext4Fs { sb, device_id, max_block, file };
-        Self::new_with_fs(cli, fs).map(AnyGrepper::Ext4)
+        Self::new_with_fs(cli, fs, sink).map(AnyGrepper::Ext4)
     }
 }
 
 /// impl block for apfs-specific construction
-impl<'a> RawGrepper<'a, ApfsFs> {
+impl<S: MatchSink> RawGrepper<ApfsFs, S> {
     #[inline]
-    pub fn new_apfs(cli: &'a Cli, _device_path: &str, file: File) -> io::Result<AnyGrepper<'a>> {
+    pub fn new_apfs(cli: &Cli, _device_path: &str, file: File, sink: S) -> Result<AnyGrepper<S>> {
         // Read the first block (4096 bytes covers the NX superblock at block 0).
         // We don't know block_size yet, so read the maximum possible default.
         let mut block0 = [0u8; 4096];
@@ -302,27 +308,24 @@ impl<'a> RawGrepper<'a, ApfsFs> {
         let volume = fs.parse_volume()?;
         let fs = ApfsFs { volume, ..fs };
 
-        Self::new_with_fs(cli, fs).map(AnyGrepper::Apfs)
+        Self::new_with_fs(cli, fs, sink).map(AnyGrepper::Apfs)
     }
 }
 
 /// impl block for ntfs-specific construction
-impl<'a> RawGrepper<'a, NtfsFs> {
+impl<S: MatchSink> RawGrepper<NtfsFs, S> {
     #[inline]
-    pub fn new_ntfs(cli: &'a Cli, _device_path: &str, file: File) -> io::Result<AnyGrepper<'a>> {
+    pub fn new_ntfs(cli: &Cli, _device_path: &str, file: File, sink: S) -> Result<AnyGrepper<S>> {
         let mut boot = [0u8; 512];
         read_at_offset(&file, &mut boot, 0)?;
 
         if &boot[3..11] != b"NTFS    " {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Not an NTFS filesystem".to_owned(),
-            ));
+            return Err(Error::UnknownFilesystem("not an NTFS filesystem".into()))
         }
 
         let device_id = device_id(&file)?;
         let fs = NtfsFs::new(file, device_id)?;
-        Self::new_with_fs(cli, fs).map(AnyGrepper::Ntfs)
+        Self::new_with_fs(cli, fs, sink).map(AnyGrepper::Ntfs)
     }
 }
 
@@ -394,27 +397,11 @@ pub fn open_device_and_detect_fs(device_path: &str) -> io::Result<(File, FsType)
 }
 
 #[inline]
-pub fn create_matcher_or_exit(cli: &Cli) -> Matcher {
-    match Matcher::new(cli) {
-        Ok(m) => m,
-        Err(e) => {
-            match e.kind() {
-                io::ErrorKind::InvalidInput => {
-                    eprintln_red!("error: invalid pattern '{pattern}'", pattern = cli.pattern);
-                    eprintln_red!("tip: test your regex with `grep -E` or a regex tester before running");
-                    eprintln_red!("patterns must be valid regex or a literal/alternation extractable form");
-                }
-                io::ErrorKind::NotFound => {
-                    eprintln_red!("error: referenced something that wasn't found: {e}");
-                }
-                _ => {
-                    eprintln_red!("error: failed to build matcher: {e}");
-                }
-            }
-
-            std::process::exit(1);
-        }
-    }
+pub fn make_matcher(cli: &Cli) -> Result<Matcher> {
+    Matcher::new(cli).map_err(|e| match e.kind() {
+        io::ErrorKind::InvalidInput => Error::InvalidPattern(cli.pattern.clone()),
+        _ => Error::Io(e),
+    })
 }
 
 //
@@ -509,13 +496,13 @@ pub fn detect_fs_type(block0: &[u8]) -> Option<FsType> {
     None
 }
 
-pub enum AnyGrepper<'a> {
-    Ext4(RawGrepper<'a, Ext4Fs>),
-    Apfs(RawGrepper<'a, ApfsFs>),
-    Ntfs(RawGrepper<'a, NtfsFs>),
+pub enum AnyGrepper<S: MatchSink = NoSink> {
+    Ext4(RawGrepper<Ext4Fs, S>),
+    Apfs(RawGrepper<ApfsFs, S>),
+    Ntfs(RawGrepper<NtfsFs, S>),
 }
 
-impl<'a> AnyGrepper<'a> {
+impl<S: MatchSink> AnyGrepper<S> {
     #[inline]
     pub fn search(
         self,
@@ -536,6 +523,85 @@ impl<'a> AnyGrepper<'a> {
             AnyGrepper::Ext4(g) => g.try_resolve_path_to_file_id(path),
             AnyGrepper::Apfs(g) => g.try_resolve_path_to_file_id(path),
             AnyGrepper::Ntfs(g) => g.try_resolve_path_to_file_id(path),
+        }
+    }
+}
+
+impl<F: RawFs, S: MatchSink> RawGrepper<F, S> {
+    #[inline]
+    pub fn cli(&self) -> &Cli {
+        &self.cli
+    }
+
+    #[inline]
+    pub fn matcher(&self) -> &Matcher {
+        &self.matcher
+    }
+
+    #[inline]
+    pub fn fs(&self) -> &F {
+        &self.fs
+    }
+
+    #[inline]
+    pub fn fragment_hashes(&self) -> &[u32] {
+        &self.fragment_hashes
+    }
+
+    #[inline]
+    pub fn cache(&self) -> Option<&FragmentCache> {
+        self.cache.as_ref()
+    }
+
+    #[inline]
+    pub fn cache_mut(&mut self) -> Option<&mut FragmentCache> {
+        self.cache.as_mut()
+    }
+}
+
+impl<S: MatchSink> AnyGrepper<S> {
+    #[inline]
+    pub fn cli(&self) -> &Cli {
+        match self {
+            AnyGrepper::Ext4(g) => g.cli(),
+            AnyGrepper::Apfs(g) => g.cli(),
+            AnyGrepper::Ntfs(g) => g.cli(),
+        }
+    }
+
+    #[inline]
+    pub fn matcher(&self) -> &Matcher {
+        match self {
+            AnyGrepper::Ext4(g) => g.matcher(),
+            AnyGrepper::Apfs(g) => g.matcher(),
+            AnyGrepper::Ntfs(g) => g.matcher(),
+        }
+    }
+
+    #[inline]
+    pub fn fragment_hashes(&self) -> &[u32] {
+        match self {
+            AnyGrepper::Ext4(g) => g.fragment_hashes(),
+            AnyGrepper::Apfs(g) => g.fragment_hashes(),
+            AnyGrepper::Ntfs(g) => g.fragment_hashes(),
+        }
+    }
+
+    #[inline]
+    pub fn cache(&self) -> Option<&FragmentCache> {
+        match self {
+            AnyGrepper::Ext4(g) => g.cache(),
+            AnyGrepper::Apfs(g) => g.cache(),
+            AnyGrepper::Ntfs(g) => g.cache(),
+        }
+    }
+
+    #[inline]
+    pub fn cache_mut(&mut self) -> Option<&mut FragmentCache> {
+        match self {
+            AnyGrepper::Ext4(g) => g.cache_mut(),
+            AnyGrepper::Apfs(g) => g.cache_mut(),
+            AnyGrepper::Ntfs(g) => g.cache_mut(),
         }
     }
 }

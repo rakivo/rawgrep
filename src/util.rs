@@ -1,6 +1,7 @@
 use std::{fs::File, io, sync::Arc};
 
 use smallvec::SmallVec;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 #[inline]
 pub fn read_u32_le(buf: &[u8], offset: usize) -> u32 {
@@ -163,6 +164,62 @@ where
         boxed
     } else {
         vec_into_boxed_slice_noshrink(v.into_vec())
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub fn resolve_apfs_physical_store(virtual_device: &str) -> Result<String, Error> {
+    let disk_id = virtual_device.trim_start_matches("/dev/");
+
+    let output = std::process::Command::new("diskutil")
+        .args(["info", "-plist", disk_id])
+        .output()
+        .map_err(Error::Io)?;
+
+    if !output.status.success() {
+        return Err(Error::Io(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "diskutil info failed",
+        )));
+    }
+
+    let stdout    = String::from_utf8_lossy(&output.stdout);
+    let key       = "<key>APFSPhysicalStore</key>";
+    let val_open  = "<string>";
+    let val_close = "</string>";
+
+    if let Some(kp) = stdout.find(key) {
+        let after_key = &stdout[kp + key.len()..];
+        if let Some(op) = after_key.find(val_open) {
+            let after_open = &after_key[op + val_open.len()..];
+            if let Some(cp) = after_open.find(val_close) {
+                return Ok(format!("/dev/{}", &after_open[..cp]));
+            }
+        }
+    }
+
+    Err(Error::Io(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        "APFSPhysicalStore not found in diskutil output",
+    )))
+}
+
+#[inline]
+pub fn init_logging() {
+    if let Ok(level) = std::env::var("RAWGREP_LOG") {
+        let filter = EnvFilter::new("off")
+            .add_directive(format!("rawgrep={level}").parse().unwrap())
+            .add_directive(format!("rawgrep_ui={level}").parse().unwrap());
+
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .without_time()
+                    .with_target(false)
+                    .compact()
+                    .with_ansi(std::env::var("DONT_USE_COLOR").is_err())
+            ).init();
     }
 }
 

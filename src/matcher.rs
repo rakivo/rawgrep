@@ -97,7 +97,7 @@ impl Matcher {
         let pattern = &cli.pattern;
 
         if cli.force_literal {
-            return Ok(Matcher::Literal(Finder::new(pattern).into_owned()));
+            return Ok(Matcher::Literal(Finder::new(pattern.as_bytes()).into_owned()));
         }
 
         // Try literal extraction first

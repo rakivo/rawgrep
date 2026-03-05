@@ -252,7 +252,7 @@ pub mod linux {
 
     /// Read /sys/block/loopN/loop/backing_file to find what image a loop device backs.
     fn loop_device_backing_file(dev: &Path) -> Option<String> {
-        // dev is e.g. /dev/loop3 — extract "loop3"
+        // dev is e.g. /dev/loop3 - extract "loop3"
         let name = dev.file_name()?.to_str()?;
         if !name.starts_with("loop") { return None; }
         let backing = fs::read_to_string(format!("/sys/block/{name}/loop/backing_file")).ok()?;
@@ -578,7 +578,7 @@ pub mod windows {
 
             let len = volume_path.iter().position(|&c| c == 0).unwrap_or(volume_path.len());
             let mountpoint = String::from_utf16_lossy(&volume_path[..len]);
-            // mountpoint is e.g. "C:\" — check it matches device
+            // mountpoint is e.g. "C:\" - check it matches device
             let trimmed = mountpoint.trim_end_matches('\\');
             let device_path = format!("\\\\.\\{trimmed}");
             if !device.eq_ignore_ascii_case(&device_path) { return None; }

@@ -2,7 +2,7 @@
 //!
 //! Supports:
 //!   - Container superblock (NX) parsing
-//!   - Container object-map B-tree (omap) lookup (OID → physical block)
+//!   - Container object-map B-tree (omap) lookup (OID -> physical block)
 //!   - Volume superblock (APSB) parsing
 //!   - Volume fs-record B-tree traversal for inodes and directory entries
 //!   - File data via j_phys_ext records (extent map)
@@ -34,9 +34,9 @@ use std::fs::File;
 use std::{io, mem};
 use std::ops::ControlFlow;
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Public façade
-// ─────────────────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
+// Public facade
+// -----------------------------------------------------------------------------
 
 /// APFS container (one or more volumes).  We expose the *first* volume only,
 /// which matches the common single-volume case seen in practice.
@@ -47,9 +47,9 @@ pub struct ApfsFs {
     pub device_id: u64,
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
 // FileNode impl
-// ─────────────────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
 
 impl FileNode for ApfsInode {
     #[inline(always)] fn file_id(&self) -> FileId { self.inode_num }
@@ -58,9 +58,9 @@ impl FileNode for ApfsInode {
     #[inline(always)] fn is_dir(&self)  -> bool   { (self.mode & S_IFMT) == S_IFDIR }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
 // RawFs impl
-// ─────────────────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
 
 impl RawFs for ApfsFs {
     type Node = ApfsInode;
@@ -191,9 +191,9 @@ impl RawFs for ApfsFs {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
 // Superblock parsing (called from the entry-point that opens the device)
-// ─────────────────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
 
 impl ApfsFs {
     /// Parse the NX (container) superblock from the first block of the device.
@@ -240,7 +240,7 @@ impl ApfsFs {
     pub fn parse_volume(&self) -> io::Result<ApfsVolume> {
         let _span = tracy::span!("ApfsFs::parse_volume");
 
-        // Resolve volume OID → physical block address via container omap
+        // Resolve volume OID -> physical block address via container omap
         let vol_paddr = self.omap_lookup(self.sb.omap_root_paddr, self.sb.volume_oid)?;
 
         let bs = self.sb.block_size as usize;
@@ -265,18 +265,18 @@ impl ApfsFs {
                 .try_into().unwrap(),
         );
 
-        // Resolve volume's omap OID → paddr (it lives in the container omap)
+        // Resolve volume's omap OID -> paddr (it lives in the container omap)
         let vol_omap_paddr = self.omap_lookup(self.sb.omap_root_paddr, omap_oid)?;
-        // Resolve fs-record tree OID → paddr via the volume's own omap
+        // Resolve fs-record tree OID -> paddr via the volume's own omap
         let root_tree_paddr = self.omap_lookup(vol_omap_paddr, root_tree_oid)?;
 
         Ok(ApfsVolume { omap_root_paddr: vol_omap_paddr, root_tree_paddr })
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
 // Internal helpers
-// ─────────────────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
 
 impl ApfsFs {
     #[inline]
@@ -294,9 +294,9 @@ impl ApfsFs {
         Ok(())
     }
 
-    // ── Object-map B-tree lookup (omap) ─────────────────────────────────────
+    // -- Object-map B-tree lookup (omap) -------------------------------------
 
-    /// Walk the omap B-tree rooted at `root_paddr` to resolve `oid` → paddr.
+    /// Walk the omap B-tree rooted at `root_paddr` to resolve `oid` -> paddr.
     ///
     /// The omap uses fixed-length keys (OmapKey = 16 bytes) and values
     /// (OmapVal = 16 bytes), so nodes use `kvloc_t` table-of-contents entries.
@@ -382,7 +382,7 @@ impl ApfsFs {
         Err(io::Error::new(io::ErrorKind::InvalidData, "omap tree too deep or corrupt"))
     }
 
-    // ── fs-record B-tree helpers ─────────────────────────────────────────────
+    // -- fs-record B-tree helpers ---------------------------------------------
 
     /// fs-record keys are keyed by (inode_num << 4 | record_type).
     /// We search for the lowest key with inode_num == target_ino.
@@ -485,7 +485,7 @@ impl ApfsFs {
                             let child_oid = u64::from_le_bytes(
                                 block[v_abs_end..v_abs_end + 8].try_into().unwrap_or([0; 8])
                             );
-                            // Resolve child OID → paddr via volume omap
+                            // Resolve child OID -> paddr via volume omap
                             if let Ok(paddr) = self.omap_lookup(self.volume.omap_root_paddr, child_oid) {
                                 best_child_paddr = Some(paddr);
                             }
@@ -506,7 +506,7 @@ impl ApfsFs {
         Err(io::Error::new(io::ErrorKind::InvalidData, "fs-record tree too deep or corrupt"))
     }
 
-    // ── Inode lookup ─────────────────────────────────────────────────────────
+    // -- Inode lookup ---------------------------------------------------------
 
     fn lookup_inode(&self, ino: u64) -> io::Result<ApfsInode> {
         let _span = tracy::span!("ApfsFs::lookup_inode");
@@ -541,7 +541,7 @@ impl ApfsFs {
         })
     }
 
-    // ── Directory entry scan ─────────────────────────────────────────────────
+    // -- Directory entry scan -------------------------------------------------
 
     /// Iterate all `APFS_TYPE_DIR_REC` records for directory `dir_ino`,
     /// calling `callback(child_id, name_bytes, dt_type)`.
@@ -592,7 +592,7 @@ impl ApfsFs {
         })
     }
 
-    // ── Extent collection ────────────────────────────────────────────────────
+    // -- Extent collection ----------------------------------------------------
 
     /// Collect all `(physical_block, byte_length)` pairs for file `ino` that
     /// cover the first `size_to_read` bytes, in logical order.
