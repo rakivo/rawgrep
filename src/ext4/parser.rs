@@ -5,7 +5,8 @@ use crate::copy_data;
 use crate::util::read_at_offset;
 use crate::util::{likely, unlikely};
 use crate::worker::MAX_EXTENTS_UNTIL_SPILL;
-use crate::parser::{BufKind, FileId, FileNode, FileType, Parser, RawFs, check_first_block_binary};
+use crate::parser::{BufKind, FileId, FileNode, FileType, Parser, RawFs, binary_probe};
+use crate::worker::STREAMING_CHUNK_SIZE;
 
 use super::*;
 
@@ -55,6 +56,11 @@ impl RawFs for Ext4Fs {
     }
 
     #[inline(always)]
+    fn device_file(&self) -> &File {
+        &self.file
+    }
+
+    #[inline(always)]
     fn block_size(&self) -> u32 {
         self.sb.block_size
     }
@@ -64,6 +70,7 @@ impl RawFs for Ext4Fs {
         EXT4_ROOT_INODE as FileId
     }
 
+    #[inline]
     fn parse_node(&self, file_id: FileId) -> io::Result<Self::Node> {
         let _span = tracy::span!("Ext4Fs::parse_node");
 
@@ -141,9 +148,6 @@ impl RawFs for Ext4Fs {
             u32::from_le_bytes([block_bytes[56], block_bytes[57], block_bytes[58], block_bytes[59]]),
         ];
 
-        // eprintln!("parse_node: inode={} group={} index={} bg_desc_offset={} inode_table_block={} inode_offset={} size={}",
-        //           inode_num, group, index, bg_desc_offset, inode_table_block, inode_offset, size);
-
         Ok(Ext4Inode {
             inode_num: inode_num as u64,
             mode,
@@ -171,25 +175,145 @@ impl RawFs for Ext4Fs {
         let file_size = node.size as usize;
         let size_to_read = file_size.min(max_size);
 
-        //
-        // If previous file left a huge buffer, release it before reserving for this file
-        // @Constant @Tune - 4MB threshold, files larger than this won't bloat next iteration
-        //
-        if buf.capacity() > 4 * 1024 * 1024 && size_to_read < buf.capacity() / 4 {
-            *buf = Vec::with_capacity(size_to_read);
-        } else {
-            buf.reserve(size_to_read);
-        }
-
         // Inline data: file content stored directly in inode's block array
         if node.flags & EXT4_INLINE_DATA_FL != 0 {
             return self.read_inline_data(parser, node, size_to_read, kind, check_binary);
         }
 
+        let Some(chunks) = self.collect_file_chunks(
+            &mut parser.scratch,
+            node,
+            size_to_read,
+            check_binary,
+        )? else {
+            parser.get_buf_mut(kind).clear();
+            return Ok(false);
+        };
+
+        for (disk_offset, len) in &chunks {
+            let buf = parser.get_buf_mut(kind);
+            let old_len = buf.len();
+            buf.resize(old_len + len, 0);
+            match self.read_at_offset(&mut buf[old_len..], *disk_offset) {
+                Ok(n) => buf.truncate(old_len + n),
+                Err(_) => { buf.truncate(old_len); break; }
+            }
+        }
+
+        parser.get_buf_mut(kind).truncate(size_to_read);
+        Ok(true)
+    }
+
+    fn collect_file_chunks(
+        &self,
+        scratch: &mut Vec<u8>,
+        node: &Ext4Inode,
+        max_size: usize,
+        check_binary: bool,
+    ) -> io::Result<Option<SmallVec<[(u64, usize); 32]>>> {
+        let _span = tracy::span!("Ext4Fs::collect_file_chunks");
+
+        let file_size = node.size as usize;
+        let block_size = self.sb.block_size as u64;
+
+        // Inline data has no disk offsets - caller handles it via read_file_content
+        if node.flags & EXT4_INLINE_DATA_FL != 0 {
+            return Ok(Some(SmallVec::new()));
+        }
+
         if node.flags & EXT4_EXTENTS_FL != 0 {
-            self.read_extents(parser, node, size_to_read, file_size, kind, check_binary)
+            //
+            // Parse extents into scratch
+            //
+
+            scratch.clear();
+            let block_bytes = bytemuck::cast_slice(&node.blocks);
+            self.parse_extent_node_into(scratch, block_bytes, 0)?;
+
+            let extents: SmallVec<[_; MAX_EXTENTS_UNTIL_SPILL]> = copy_data(Self::scratch_as_extents(scratch));
+
+            if check_binary {
+                // Binary probe
+                if let Some(first) = extents.first() {
+                    let mut probe = [0u8; 8192];  // ext4 block size is at most 8192 bytes
+                    let probe = &mut probe[..block_size as usize];
+
+                    let offset = first.start * block_size;
+                    if self.read_at_offset(probe, offset).is_err() {
+                        return Ok(Some(SmallVec::new())); // unreadable
+                    }
+                    if binary_probe(&probe, file_size) {
+                        return Ok(None);                  // binary
+                    }
+                }
+            }
+
+            let mut chunks = SmallVec::new();
+            let mut total = 0usize;
+
+            for extent in &extents {
+                if total >= max_size { break; }
+                let extent_bytes = extent.len as usize * block_size as usize;
+                let mut extent_offset = 0usize;
+
+                while extent_offset < extent_bytes {
+                    if total >= max_size { break; }
+
+                    let remaining = max_size - total;
+                    let to_read = STREAMING_CHUNK_SIZE.min(remaining).min(extent_bytes - extent_offset);
+                    let disk_offset = extent.start * block_size + extent_offset as u64;
+                    chunks.push((disk_offset, to_read));
+
+                    extent_offset += to_read;
+                    total += to_read;
+                }
+            }
+
+            Ok(Some(chunks))
         } else {
-            self.read_direct_blocks(parser, node, size_to_read, file_size, kind, check_binary)
+            //
+            // Direct blocks
+            //
+
+            let blocks: SmallVec<[_; EXT4_BLOCK_POINTERS_COUNT]> = node
+                .blocks.iter()
+                .take(EXT4_BLOCK_POINTERS_COUNT)
+                .filter(|&&b| b != 0 && (b as u64) < self.max_block)
+                .map(|&b| b as u64)
+                .collect();
+
+            if blocks.is_empty() {
+                return Ok(Some(SmallVec::new()));
+            }
+
+            if check_binary {
+                // Binary probe
+                if let Some(&first) = blocks.first() {
+                    let mut probe = [0u8; 8192];  // ext4 block size is at most 8192 bytes
+                    let probe = &mut probe[..block_size as usize];
+
+                    let to_read = (block_size as usize).min(probe.len());
+                    let n = self.read_at_offset(&mut probe[..to_read], first * block_size).unwrap_or(0);
+                    if binary_probe(&probe[..n], file_size) {
+                        return Ok(None); // binary
+                    }
+                }
+            }
+
+            let mut chunks = SmallVec::new();
+            let mut total = 0usize;
+
+            for &block_num in &blocks {
+                if total >= max_size { break; }
+
+                let remaining = max_size - total;
+                let to_read = (block_size as usize).min(remaining);
+                chunks.push((block_num * block_size, to_read));
+
+                total += to_read;
+            }
+
+            Ok(Some(chunks))
         }
     }
 
@@ -253,6 +377,7 @@ impl RawFs for Ext4Fs {
 // ext4-specific helper methods
 impl Ext4Fs {
     /// Read inline data from inode's block array (max 60 bytes)
+    #[inline]
     fn read_inline_data(
         &self,
         parser: &mut Parser,
@@ -267,7 +392,7 @@ impl Ext4Fs {
         let inline_bytes: &[u8] = bytemuck::cast_slice(&node.blocks);
         let actual_size = size_to_read.min(inline_bytes.len());
 
-        if check_binary && check_first_block_binary(&inline_bytes[..actual_size], actual_size) {
+        if check_binary && binary_probe(&inline_bytes[..actual_size], actual_size) {
             return Ok(false);
         }
 
@@ -276,6 +401,7 @@ impl Ext4Fs {
         Ok(true)
     }
 
+    #[inline]
     pub fn parse_superblock(data: &[u8]) -> io::Result<Ext4SuperBlock> {
         let _span = tracy::span!("Ext4Fs::parse_superblock");
 
@@ -325,30 +451,14 @@ impl Ext4Fs {
         })
     }
 
-    /// Parse extents into parser.scratch as [Ext4Extent]
-    fn parse_extents_into_scratch(&self, parser: &mut Parser, node: &Ext4Inode) -> io::Result<()> {
-        let _span = tracy::span!("Ext4Fs::parse_extents_into_scratch");
-
-        parser.scratch.clear();
-        let block_bytes = bytemuck::cast_slice(&node.blocks);
-        self.parse_extent_node(parser, block_bytes, 0)?;
-        Ok(())
-    }
-
     #[inline]
     fn scratch_as_extents(scratch: &[u8]) -> &[Ext4Extent] {
         bytemuck::cast_slice(scratch)
     }
 
-    #[inline]
-    fn push_extent_to_scratch(parser: &mut Parser, extent: Ext4Extent) {
-        let bytes = bytemuck::bytes_of(&extent);
-        parser.scratch.extend_from_slice(bytes);
-    }
-
-    fn parse_extent_node(
+    fn parse_extent_node_into(
         &self,
-        parser: &mut Parser,
+        scratch: &mut Vec<u8>,
         data: &[u8],
         level: usize,
     ) -> io::Result<()> {
@@ -394,11 +504,13 @@ impl Ext4Fs {
                 let start_block = ((ee_start_hi as u64) << 32) | (ee_start_lo as u64);
 
                 if likely(ee_len > 0 && ee_len <= 32768) {
-                    Self::push_extent_to_scratch(parser, Ext4Extent {
+                    let extent = Ext4Extent {
                         start: start_block,
                         len: ee_len,
                         _pad: [0; 6],
-                    });
+                    };
+                    let bytes = bytemuck::bytes_of(&extent);
+                    scratch.extend_from_slice(bytes);
                 }
             }
         } else {
@@ -427,156 +539,17 @@ impl Ext4Fs {
             }
 
             for child_block in child_blocks {
+                let mut probe = [0u8; 8192];  // ext4 block size is at most 8192 bytes
+                let probe = &mut probe[..self.sb.block_size as usize];
+
                 let offset = child_block * self.sb.block_size as u64;
-                let block_size = self.sb.block_size as usize;
-                let mut block_buf = vec![0u8; block_size];
-                if self.read_at_offset(&mut block_buf, offset).is_ok() {
-                    self.parse_extent_node(parser, &block_buf, level + 1)?;
+                if self.read_at_offset(probe, offset).is_ok() {
+                    self.parse_extent_node_into(scratch, &probe, level + 1)?;
                 }
             }
         }
 
         Ok(())
-    }
-
-    fn read_extents(
-        &self,
-        parser: &mut Parser,
-        node: &Ext4Inode,
-        size_to_read: usize,
-        file_size: usize,
-        kind: BufKind,
-        check_binary: bool,
-    ) -> io::Result<bool> {
-        let _span = tracy::span!("Ext4Fs::read_extents");
-
-        self.parse_extents_into_scratch(parser, node)?;
-
-        let extents: SmallVec<[Ext4Extent; MAX_EXTENTS_UNTIL_SPILL]> =
-            copy_data(Self::scratch_as_extents(&parser.scratch));
-
-        if check_binary {
-            if let Some(first_extent) = extents.first() {
-                let mut first_block_buf = vec![0u8; self.sb.block_size as usize];
-                let offset = first_extent.start * self.sb.block_size as u64;
-                if self.read_at_offset(&mut first_block_buf, offset).is_err() {
-                    return Ok(true); // can't read, just search it
-                }
-                if check_first_block_binary(&first_block_buf, file_size) {
-                    parser.get_buf_mut(kind).clear();
-                    return Ok(false);
-                }
-            }
-        }
-
-        self.copy_extents_to_buf(parser, &extents, size_to_read, kind);
-
-        parser.get_buf_mut(kind).truncate(size_to_read);
-        Ok(true)
-    }
-
-    fn read_direct_blocks(
-        &self,
-        parser: &mut Parser,
-        node: &Ext4Inode,
-        size_to_read: usize,
-        file_size: usize,
-        kind: BufKind,
-        check_binary: bool,
-    ) -> io::Result<bool> {
-        let _span = tracy::span!("Ext4Fs::read_direct_blocks");
-
-        let max_block = self.max_block;
-        let block_size = self.sb.block_size as u64;
-
-        let blocks: SmallVec<[u64; EXT4_BLOCK_POINTERS_COUNT]> = node
-            .blocks
-            .iter()
-            .take(EXT4_BLOCK_POINTERS_COUNT)
-            .filter(|&&b| b != 0 && (b as u64) < max_block)
-            .map(|&b| b as u64)
-            .collect();
-
-        // No valid blocks - file may be sparse or corrupted
-        if blocks.is_empty() {
-            return Ok(true);
-        }
-
-        if check_binary {
-            if let Some(&first_block_num) = blocks.first() {
-                let mut first_block_buf = [0u8; 4096];
-                let offset = first_block_num * block_size;
-                let to_read = (block_size as usize).min(first_block_buf.len());
-                let n = self.read_at_offset(&mut first_block_buf[..to_read], offset).unwrap_or(0);
-                if check_first_block_binary(&first_block_buf[..n], file_size) {
-                    parser.get_buf_mut(kind).clear();
-                    return Ok(false);
-                }
-            }
-        }
-
-        let mut copied = 0;
-        for &block_num in &blocks {
-            if copied >= size_to_read { break; }
-
-            let offset = block_num * block_size;
-            let remaining = size_to_read - copied;
-            let to_read = (block_size as usize).min(remaining);
-
-            let buf = parser.get_buf_mut(kind);
-            let old_len = buf.len();
-            buf.resize(old_len + to_read, 0);
-
-            match self.read_at_offset(&mut buf[old_len..], offset) {
-                Ok(n) => {
-                    buf.truncate(old_len + n);
-                    copied += n;
-                }
-                Err(_) => {
-                    buf.truncate(old_len);
-                    break;
-                }
-            }
-        }
-
-        parser.get_buf_mut(kind).truncate(size_to_read);
-        Ok(true)
-    }
-
-    #[inline]
-    fn copy_extents_to_buf(
-        &self,
-        parser: &mut Parser,
-        extents: &[Ext4Extent],
-        size_to_read: usize,
-        kind: BufKind,
-    ) {
-        let block_size = self.sb.block_size as u64;
-        let mut copied = 0;
-
-        for extent in extents {
-            if copied >= size_to_read { break; }
-
-            let offset = extent.start * block_size;
-            let extent_bytes = extent.len as usize * block_size as usize;
-            let remaining = size_to_read - copied;
-            let to_read = extent_bytes.min(remaining);
-
-            let buf = parser.get_buf_mut(kind);
-            let old_len = buf.len();
-            buf.resize(old_len + to_read, 0);
-
-            match self.read_at_offset(&mut buf[old_len..], offset) {
-                Ok(n) => {
-                    buf.truncate(old_len + n);
-                    copied += n;
-                }
-                Err(_) => {
-                    buf.truncate(old_len);
-                    break;
-                }
-            }
-        }
     }
 
     #[inline]

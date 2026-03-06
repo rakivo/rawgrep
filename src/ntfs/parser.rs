@@ -4,7 +4,8 @@ use smallvec::SmallVec;
 
 use crate::tracy;
 use crate::util::{is_dot_entry, read_at_offset, read_u16_le, read_u32_le};
-use crate::parser::{BufKind, FileId, FileNode, FileType, Parser, RawFs, check_first_block_binary};
+use crate::parser::{BufKind, FileId, FileNode, FileType, Parser, RawFs, binary_probe};
+use crate::worker::STREAMING_CHUNK_SIZE;
 
 use super::*;
 
@@ -40,14 +41,10 @@ impl RawFs for NtfsFs {
     type Node = NtfsNode;
     type Context<'b> = &'b Self where Self: 'b;
 
-    #[inline(always)]
-    fn device_id(&self) -> u64 { self.device_id }
-
-    #[inline(always)]
-    fn block_size(&self) -> u32 { self.sb.cluster_size }
-
-    #[inline(always)]
-    fn root_id(&self) -> FileId { NTFS_ROOT_DIR_RECORD }
+    #[inline(always)] fn device_id(&self) -> u64 { self.device_id }
+    #[inline(always)] fn block_size(&self) -> u32 { self.sb.cluster_size }
+    #[inline(always)] fn device_file(&self) -> &File { &self.file }
+    #[inline(always)] fn root_id(&self) -> FileId { NTFS_ROOT_DIR_RECORD }
 
     #[inline]
     fn parse_node(&self, file_id: FileId) -> io::Result<Self::Node> {
@@ -59,6 +56,7 @@ impl RawFs for NtfsFs {
         parse_mft_record(&record, file_id)
     }
 
+    #[inline]
     fn read_file_content(
         &self,
         parser: &mut Parser,
@@ -76,20 +74,8 @@ impl RawFs for NtfsFs {
         let buf = parser.get_buf_mut(kind);
         buf.clear();
 
-        let file_size = node.size as usize;
+        let file_size   = node.size as usize;
         let size_to_read = file_size.min(max_size);
-
-        //
-        // @Cutnpaste from Ext4Fs::read_file_content
-        //
-        // If previous file left a huge buffer, release it before reserving for this file
-        // @Constant @Tune - 4MB threshold, files larger than this won't bloat next iteration
-        //
-        if buf.capacity() > 4 * 1024 * 1024 && size_to_read < buf.capacity() / 4 {
-            *buf = Vec::with_capacity(size_to_read);
-        } else {
-            buf.reserve(size_to_read);
-        }
 
         let mut record = vec![0u8; self.sb.mft_record_size as usize]; // @Heap
         self.read_mft_record(node.record_num, &mut record)?;
@@ -99,10 +85,101 @@ impl RawFs for NtfsFs {
         };
 
         if is_resident {
-            self.read_resident_data(parser, attr_slice, size_to_read, file_size, kind, check_binary)
-        } else {
-            self.read_nonresident_data(parser, attr_slice, size_to_read, file_size, kind, check_binary)
+            return self.read_resident_data(parser, attr_slice, size_to_read, file_size, kind, check_binary);
         }
+
+        let Some(chunks) = self.collect_file_chunks(
+            &mut parser.scratch,
+            node,
+            size_to_read,
+            check_binary,
+        )? else {
+            parser.get_buf_mut(kind).clear();
+            return Ok(false); // binary
+        };
+
+        for (disk_offset, len) in &chunks {
+            let buf = parser.get_buf_mut(kind);
+
+            let old_len = buf.len();
+            buf.resize(old_len + len, 0);
+            match self.read_at_offset(&mut buf[old_len..], *disk_offset) {
+                Ok(n)  => buf.truncate(old_len + n),
+                Err(_) => { buf.truncate(old_len); break; }
+            }
+        }
+
+        parser.get_buf_mut(kind).truncate(size_to_read);
+        Ok(true)
+    }
+
+    fn collect_file_chunks(
+        &self,
+        _scratch: &mut Vec<u8>,   // unused for NTFS cuz runlists are decoded inline
+        node: &NtfsNode,
+        max_size: usize,
+        check_binary: bool,
+    ) -> io::Result<Option<SmallVec<[(u64, usize); 32]>>> {
+        let _span = tracy::span!("NtfsFs::collect_file_chunks");
+
+        let file_size = node.size as usize;
+        let cluster_size = self.sb.cluster_size as u64;
+
+        if node.is_dir() {
+            // Directories are handled separately via `read_dir_linearised`
+            return Ok(Some(SmallVec::new()));
+        }
+
+        let mut record = vec![0u8; self.sb.mft_record_size as usize]; // @Heap
+        self.read_mft_record(node.record_num, &mut record)?;
+
+        let Some((is_resident, attr_slice)) = find_attribute(&record, NTFS_ATTR_DATA, None) else {
+            return Ok(Some(SmallVec::new())); // no $DATA, metadata-only or empty
+        };
+
+        debug_assert!(!is_resident);
+
+        let runs = decode_runlist(attr_slice, &self.sb)?;
+
+        if check_binary && let Some(first) = runs.iter().find(|r| r.lcn != u64::MAX) {
+            let mut probe = vec![0u8; self.sb.cluster_size as usize]; // @Heap
+
+            let _ = self.read_at_offset(&mut probe, first.lcn * cluster_size);
+            if binary_probe(&probe, file_size) {
+                return Ok(None);
+            }
+        }
+
+        let mut chunks = SmallVec::<[_; 32]>::new();
+        let mut total = 0usize;
+
+        for run in &runs {
+            if total >= max_size { break; }
+
+            if run.lcn == u64::MAX {
+                // Sparse run, skip it for now?...
+                let to_skip = ((run.len * cluster_size) as usize).min(max_size - total);
+                total += to_skip;
+                continue;
+            }
+
+            let run_bytes = (run.len * cluster_size) as usize;
+            let mut run_offset = 0usize;
+
+            while run_offset < run_bytes {
+                if total >= max_size { break; }
+
+                let remaining  = max_size - total;
+                let to_read    = STREAMING_CHUNK_SIZE.min(remaining).min(run_bytes - run_offset);
+                let disk_offset = run.lcn * cluster_size + run_offset as u64;
+
+                chunks.push((disk_offset, to_read));
+                run_offset += to_read;
+                total      += to_read;
+            }
+        }
+
+        Ok(Some(chunks))
     }
 
     #[inline]
@@ -153,7 +230,7 @@ impl NtfsFs {
         let sb = parse_boot_sector(&boot)?;
 
         let mft_start = sb.mft_offset();
-        let mut mft_record = vec![0u8; sb.mft_record_size as usize];
+        let mut mft_record = vec![0u8; sb.mft_record_size as usize]; // @Heap
         read_at_offset(&file, &mut mft_record, mft_start)?;
 
         apply_fixups(&mut mft_record)?;
@@ -198,60 +275,11 @@ impl NtfsFs {
         let data = &attr_slice[value_off..end];
         let actual = data.len().min(size_to_read);
 
-        if check_binary && check_first_block_binary(&data[..actual], file_size) {
+        if check_binary && binary_probe(&data[..actual], file_size) {
             return Ok(false);
         }
 
         parser.get_buf_mut(kind).extend_from_slice(&data[..actual]);
-        Ok(true)
-    }
-
-    fn read_nonresident_data(
-        &self,
-        parser: &mut Parser,
-        attr_slice: &[u8],
-        size_to_read: usize, file_size: usize,
-        kind: BufKind,
-        check_binary: bool,
-    ) -> io::Result<bool> {
-        let _span = tracy::span!("NtfsFs::read_nonresident_data");
-
-        let runs = decode_runlist(attr_slice, &self.sb)?;
-        let cluster_size = self.sb.cluster_size as u64;
-
-        if check_binary && let Some(first_run) = runs.iter().find(|r| r.lcn != u64::MAX) {
-            let mut first_cluster = vec![0u8; self.sb.cluster_size as usize]; // @Heap
-            _ = self.read_at_offset(&mut first_cluster, first_run.lcn * cluster_size);
-
-            if check_first_block_binary(&first_cluster, file_size) {
-                return Ok(false);
-            }
-        }
-
-        let mut copied = 0usize;
-        for run in &runs {
-            if copied >= size_to_read { break; }
-
-            if run.lcn == u64::MAX {
-                let to_fill = ((run.len * cluster_size) as usize).min(size_to_read - copied);
-                let buf = parser.get_buf_mut(kind);
-                buf.resize(buf.len() + to_fill, 0);
-                copied += to_fill;
-                continue;
-            }
-
-            let to_read = ((run.len * cluster_size) as usize).min(size_to_read - copied);
-            let buf = parser.get_buf_mut(kind);
-            let old_len = buf.len();
-            buf.resize(old_len + to_read, 0);
-
-            match self.read_at_offset(&mut buf[old_len..], run.lcn * cluster_size) {
-                Ok(n) => { buf.truncate(old_len + n); copied += n; }
-                Err(_) => { buf.truncate(old_len); break; }
-            }
-        }
-
-        parser.get_buf_mut(kind).truncate(size_to_read);
         Ok(true)
     }
 
@@ -351,7 +379,7 @@ impl NtfsFs {
 
             let Some(lcn) = lcn_start else { continue; };
 
-            let mut indx = vec![0u8; index_block_size as usize];
+            let mut indx = vec![0u8; index_block_size as usize]; // @Heap
             if self.read_at_offset(&mut indx, lcn * cluster_size).is_err() { continue; }
 
             //

@@ -105,7 +105,6 @@ pub struct RawGrepConfig {
     pub no_color:       bool,
     pub jump:           bool,
     pub stats:          bool,
-    pub pipe_to_stdout: bool,
 
     // ---- matcher --------------------------------------------------------
     pub force_literal: bool,
@@ -133,7 +132,6 @@ impl RawGrepConfig {
             all:              false,
             unrestricted:     0,
             no_color:         false,
-            pipe_to_stdout:   true,
             jump:             false,
             stats:            false,
             force_literal:    false,
@@ -174,7 +172,6 @@ impl RawGrepConfig {
             all:              c.all,
             unrestricted:     c.unrestricted,
             no_color:         c.no_color,
-            pipe_to_stdout:   true,
             jump:             c.jump,
             stats:            c.stats,
             force_literal:    c.force_literal,

@@ -15,7 +15,7 @@
 //!   - Encryption (wrapped keys)
 
 use crate::tracy;
-use crate::parser::{BufKind, FileId, FileNode, FileType, Parser, RawFs, check_first_block_binary};
+use crate::parser::{BufKind, FileId, FileNode, FileType, Parser, RawFs, binary_probe};
 use crate::util::read_at_offset;
 
 use super::{
@@ -67,6 +67,7 @@ impl RawFs for ApfsFs {
     type Context<'b> = &'b Self where Self: 'b;
 
     #[inline(always)] fn device_id(&self)  -> u64 { self.device_id }
+    #[inline(always)] fn device_file(&self) -> &File { &self.file }
     #[inline(always)] fn block_size(&self) -> u32 { self.sb.block_size }
     #[inline(always)] fn root_id(&self)    -> FileId { APFS_ROOT_DIR_INO_NUM }
 
@@ -117,7 +118,7 @@ impl RawFs for ApfsFs {
             let probe  = self.sb.block_size as usize;
             let mut tmp = vec![0u8; probe];
             let n = self.read_at_offset(&mut tmp, offset).unwrap_or(0);
-            if check_first_block_binary(&tmp[..n], file_size) {
+            if binary_probe(&tmp[..n], file_size) {
                 return Ok(false);
             }
         }

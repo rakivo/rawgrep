@@ -4,10 +4,13 @@ use crate::worker::BINARY_PROBE_BYTE_SIZE;
 use crate::cli::BufferConfig;
 use crate::util::is_dot_entry;
 
+use std::fs::File;
 use std::io;
 use std::ops::ControlFlow;
 
+use bumpalo::Bump;
 use smallvec::SmallVec;
+use bumpalo::collections::Vec as BumpVec;
 
 #[derive(Copy, Clone)]
 pub enum BufKind {
@@ -60,6 +63,12 @@ pub trait RawFs: Sync + Send {
     /// Device ID for cache keys
     fn device_id(&self) -> u64;
 
+    fn device_file(&self) -> &File;
+
+    fn read_at_offset(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+        crate::util::read_at_offset(self.device_file(), buf, offset)
+    }
+
     /// Block size in bytes
     fn block_size(&self) -> u32;
 
@@ -79,6 +88,16 @@ pub trait RawFs: Sync + Send {
         check_binary: bool,
     ) -> io::Result<bool>;
 
+    fn collect_file_chunks(
+        &self,
+        _scratch: &mut Vec<u8>,
+        _node: &Self::Node,
+        _max_size: usize,
+        _check_binary: bool,
+    ) -> io::Result<Option<SmallVec<[(u64, usize); 32]>>> {
+        Ok(None)
+    }
+
     /// Iterate directory entries from buffer
     fn with_directory_entries<R>(
         &self,
@@ -96,19 +115,31 @@ pub struct DirScanResult<const N: usize = 64> {
 }
 
 /// Filesystem-agnostic parser with reusable buffers
-#[derive(Default)]
-pub struct Parser {
+pub struct Parser<'a> {
     pub file: Vec<u8>,
     pub dir: Vec<u8>,
     pub gitignore: Vec<u8>,
-    pub output: Vec<u8>,
-
+    pub chunk: Vec<u8>,
     // Filesystem-specific scratch space (used by RawFs implementations)
     pub scratch: Vec<u8>,
+
+    pub output: BumpVec<'a, u8>,
 }
 
-impl Parser {
-    #[inline]
+impl<'a> Parser<'a> {
+    #[inline(always)]
+    pub fn new(bump: &'a Bump) -> Self {
+        Self {
+            file: Vec::new(),
+            dir: Vec::new(),
+            gitignore: Vec::new(),
+            output: BumpVec::new_in(bump),
+            scratch: Vec::new(),
+            chunk: Vec::new()
+        }
+    }
+
+    #[inline(always)]
     pub fn init(&mut self, config: &BufferConfig) {
         self.dir.reserve(config.dir_buf);
         self.file.reserve(config.file_buf);
@@ -214,7 +245,7 @@ impl Parser {
 
 /// Helper for binary detection during file read
 #[inline]
-pub fn check_first_block_binary(block: &[u8], file_size: usize) -> bool {
+pub fn binary_probe(block: &[u8], file_size: usize) -> bool {
     let probe_size = file_size.min(BINARY_PROBE_BYTE_SIZE).min(block.len());
     is_binary_chunk(&block[..probe_size])
 }

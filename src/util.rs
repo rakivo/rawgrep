@@ -223,6 +223,64 @@ pub fn init_logging() {
     }
 }
 
+
+//
+// CPU affinity helpers - gdt-cpus has bugs on macOS, so we provide fallbacks
+//
+
+/// Get number of physical cores, falling back to provided default
+#[inline]
+pub fn num_physical_cores_or(fallback: usize) -> usize {
+    #[cfg(not(target_os = "macos"))]
+    {
+        gdt_cpus::num_physical_cores().unwrap_or(fallback)
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        // macOS: use sysctl to get physical core count
+        macos_num_physical_cores().unwrap_or(fallback)
+    }
+}
+
+/// Pin current thread to a specific core (best-effort, ignores failures)
+#[inline]
+pub fn pin_thread_to_core(core_id: usize) {
+    #[cfg(not(target_os = "macos"))]
+    {
+        _ = gdt_cpus::pin_thread_to_core(core_id);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // macOS doesn't support thread-to-core pinning via public APIs
+        // Thread affinity hints are handled by the kernel
+        _ = core_id;
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub fn macos_num_physical_cores() -> Option<usize> {
+    // sysctl hw.physicalcpu
+    let mut count: libc::c_int = 0;
+    let mut size = std::mem::size_of::<libc::c_int>();
+
+    let ret = unsafe {
+        libc::sysctlbyname(
+            c"hw.physicalcpu".as_ptr(),
+            &mut count as *mut _ as *mut libc::c_void,
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+
+    if ret == 0 && count > 0 {
+        Some(count as usize)
+    } else {
+        None
+    }
+}
+
 // ---------------
 // Nightly implementation
 // ----------------------

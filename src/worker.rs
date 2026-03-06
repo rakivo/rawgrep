@@ -15,9 +15,7 @@ use crate::parser::{
     BufFatPtr, BufKind, FileId, FileNode, FileType, ParsedEntry, Parser, RawFs
 };
 use crate::util::{
-    is_common_skip_dir,
-    likely, unlikely,
-    truncate_utf8,
+    is_common_skip_dir, likely, truncate_utf8, unlikely
 };
 use crate::{
     tracy,
@@ -36,9 +34,21 @@ use std::io::{self, BufWriter, Write};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use smallvec::{smallvec, SmallVec};
+use bumpalo::collections::Vec as BumpVec;
 use crossbeam_channel::{Receiver, Sender};
 use crossbeam_deque::{Injector, Steal, Stealer};
 pub use crossbeam_deque::Worker as DequeWorker;
+
+//
+// @Important @Note
+//
+// `STREAMING_THRESHOLD` must be AT LEAST more than ~800 bytes,
+// so when we're gonna try to stream a file, we won't stumble upon
+// an NTFS resident file (implementation details...).
+//
+pub const STREAMING_THRESHOLD: usize = 10 * 1024 * 1024; // 10MB @Tune
+
+pub const STREAMING_CHUNK_SIZE: usize = 512 * 1024;      // 512KB read buffer @Tune
 
 pub const LARGE_DIR_THRESHOLD: usize = 256; // Split dirs with 1000+ entries @Tune
 pub const FILE_BATCH_SIZE: usize = 64; // Process files in batches of 500 @Tune
@@ -79,7 +89,7 @@ pub struct ChannelSink(pub Sender<RawMatch>);
 pub struct NoSink;
 
 pub trait MatchSink: Send + Sync + Clone {
-    const NEEDS_RANGES: bool;
+    const STDOUT_NOP: bool;
 
     fn push(
         &self,
@@ -91,7 +101,7 @@ pub trait MatchSink: Send + Sync + Clone {
 }
 
 impl MatchSink for NoSink {
-    const NEEDS_RANGES: bool = false;
+    const STDOUT_NOP: bool = false;
 
     #[inline(always)]
     fn push(
@@ -104,7 +114,7 @@ impl MatchSink for NoSink {
 }
 
 impl MatchSink for ChannelSink {
-    const NEEDS_RANGES: bool = true;
+    const STDOUT_NOP: bool = true;
 
     #[inline(always)]
     fn push(
@@ -124,7 +134,9 @@ impl MatchSink for ChannelSink {
 }
 
 pub struct OutputWorker {
-    pub rx: Receiver<Vec<u8>>,
+    pub rx: Receiver<&'static [u8]>,
+    pub flush_req_rx: Receiver<()>,
+    pub flush_ack_tx: Sender<()>,
     pub writer: BufWriter<io::Stdout>,
 }
 
@@ -133,11 +145,28 @@ impl OutputWorker {
     pub fn run(mut self) {
         let _span = tracy::span!("OutputThread::run");
 
-        while let Ok(buf) = self.rx.recv() {
-            _ = self.writer.write_all(&buf);
+        loop {
+            crossbeam_channel::select! {
+                recv(self.rx) -> msg => match msg {
+                    Ok(buf) => {
+                        _ = self.writer.write_all(buf);
+                        if self.writer.buffer().len() > OUTPUTTER_FLUSH_BATCH {
+                            _ = self.writer.flush();
+                        }
+                    }
 
-            if self.writer.buffer().len() > OUTPUTTER_FLUSH_BATCH {
-                _ = self.writer.flush();
+                    Err(_) => break,
+                },
+
+                recv(self.flush_req_rx) -> _ => {
+                    // Drain remaining output first
+                    for buf in self.rx.try_iter() {
+                        _ = self.writer.write_all(&buf);
+                    }
+
+                    _ = self.writer.flush();
+                    _ = self.flush_ack_tx.send(());
+                }
             }
         }
 
@@ -145,10 +174,40 @@ impl OutputWorker {
     }
 }
 
-pub struct WorkerResult {
+/// Carry state for streaming match across chunk boundaries
+pub struct ChunkCarry {
+    /// Incomplete last line carried from previous chunk
+    pub tail: Vec<u8>,
+    pub combine_buf: Vec<u8>,
+    /// Any matches was found so far in this file
+    pub found_any: bool,
+    /// Line number counter across chunks
+    pub line_num: u32,
+}
+
+impl ChunkCarry {
+    #[inline]
+    pub fn new() -> Self {
+        Self {
+            tail: Vec::new(),
+            combine_buf: Vec::new(),
+            found_any: false,
+            line_num: 1
+        }
+    }
+
+    #[inline]
+    pub fn reset(&mut self) {
+        self.tail.clear();
+        self.found_any = false;
+        self.line_num = 1;
+    }
+}
+
+pub struct WorkerResult<'a> {
     pub stats: Stats,
 
-    pub parser: Parser,
+    pub parser: Parser<'a>,
 
     pub file_keys: Vec<FileKey>,
     pub file_metas: Vec<FileMeta>,
@@ -157,18 +216,21 @@ pub struct WorkerResult {
     pub fragment_presence: Vec<SmallVec<[bool; 32]>>
 }
 
-pub struct WorkerContext<'a, F: RawFs, S: MatchSink> {
+pub struct WorkerContext<'a, 'output_arena, F: RawFs, S: MatchSink> {
+    pub chunk_carry: Option<ChunkCarry>,
+
     pub cache: Option<&'a FragmentCache>,
-    pub fragment_hashes: &'a [u32],
     pub fs: &'a F,
+    pub fragment_hashes: &'a [u32],
     pub matcher: &'a Matcher,
     pub cli: &'a Cli,
 
     pub stats: Stats,
-    pub parser: Parser,
+    pub parser: Parser<'output_arena>,
+    pub newlines_buffer: Vec<u32>,  // Reused across `find_and_print_matches` calls
 
     pub path: SmallPathBuf,
-    pub output_tx: Sender<Vec<u8>>,
+    pub output_tx: Sender<&'static [u8]>,
     pub worker_id: u16,
 
     pub sink: S,
@@ -178,15 +240,16 @@ pub struct WorkerContext<'a, F: RawFs, S: MatchSink> {
     pub pending_fragment_presence: Vec<SmallVec<[bool; 32]>>,
 }
 
-impl<F: RawFs, S: MatchSink> WorkerContext<'_, F, S> {
+impl<'a, 'output_arena, F: RawFs, S: MatchSink> WorkerContext<'a, 'output_arena, F, S> {
     #[inline(always)]
     fn init(&mut self) {
         let config = self.cli.get_buffer_config();
-        self.parser.init(&config)
+        self.parser.init(&config);
+        self.newlines_buffer.reserve(1024);  // 4KB @Tune @Constant
     }
 
     #[inline(always)]
-    fn finish(mut self) -> WorkerResult {
+    fn finish(mut self) -> WorkerResult<'output_arena> {
         self.flush_output();
         WorkerResult {
             stats: self.stats,
@@ -199,12 +262,17 @@ impl<F: RawFs, S: MatchSink> WorkerContext<'_, F, S> {
 
     #[inline(always)]
     pub fn flush_output(&mut self) {
-        if !self.parser.output.is_empty() {
-            _ = self.output_tx.send(std::mem::replace(
-                &mut self.parser.output,
-                Vec::with_capacity(64 * 1024)
-            ));
+        if S::STDOUT_NOP {
+            self.parser.output.clear();
+            return;
         }
+
+        if self.parser.output.is_empty() {
+            return;
+        }
+
+        _ = self.output_tx.send(unsafe { core::mem::transmute(self.parser.output.as_slice()) });
+        self.parser.output.clear();
     }
 
     #[inline(always)]
@@ -218,7 +286,7 @@ impl<F: RawFs, S: MatchSink> WorkerContext<'_, F, S> {
 }
 
 // impl block of the core logic
-impl<F: RawFs, S: MatchSink> WorkerContext<'_, F, S> {
+impl<F: RawFs, S: MatchSink> WorkerContext<'_, '_, F, S> {
     pub fn dispatch_directory(
         &mut self,
         mut work: DirWork,
@@ -473,25 +541,131 @@ impl<F: RawFs, S: MatchSink> WorkerContext<'_, F, S> {
             }
         }
 
-        let size = (node.size() as usize).min(self.max_file_byte_size());
+        let max_size = (node.size() as usize).min(self.max_file_byte_size());
+        let check_binary = !self.cli.should_search_binary();
 
-        if self.fs.read_file_content(&mut self.parser, node, size, BufKind::File, !self.cli.should_search_binary())? {
-            self.stats.files_searched += 1;
-            self.stats.bytes_searched += self.parser.file.len();
-
-            let had_matches = self.find_and_print_matches()?;
-
-            if let Some((file_key, file_meta)) = cache_key {
-                self.pending_file_keys.push(file_key);
-                self.pending_file_metas.push(file_meta);
-                let fragment_presence = self.check_fragment_presence(had_matches);
-                self.pending_fragment_presence.push(fragment_presence);
-            }
+        let found_any = if likely(max_size < STREAMING_THRESHOLD) {
+            self.process_file_buffered(node, max_size, check_binary)?
         } else {
-            self.stats.files_skipped_as_binary_due_to_probe += 1;
+            self.process_file_streaming(node, max_size, check_binary)?
+        };
+
+        if let Some((file_key, file_meta)) = cache_key {
+            self.pending_file_keys.push(file_key);
+            self.pending_file_metas.push(file_meta);
+            self.pending_fragment_presence.push(self.check_fragment_presence(found_any));
         }
 
         Ok(())
+    }
+
+    #[inline]
+    fn shrink_buffers(&mut self, max_size: usize) {
+        #[inline]
+        fn shrink_if_large(v: &mut Vec<u8>, threshold: usize, next_size: usize) {
+            if v.capacity() > threshold && v.capacity() > next_size * 4 {
+                *v = Vec::with_capacity(next_size);
+            }
+        }
+
+        shrink_if_large(&mut self.parser.file,   1 * 1024 * 1024, max_size);  // 1MB
+        shrink_if_large(&mut self.parser.dir,    1 * 1024 * 1024, 0);  // 1MB
+        shrink_if_large(&mut self.parser.chunk,  1 * 1024 * 1024, 0);  // 1MB - should stay at 512KB normally
+        shrink_if_large(&mut self.parser.scratch,  64 * 1024, 0);      // 64KB - extents are tiny
+
+        if let Some(carry) = &mut self.chunk_carry {
+            shrink_if_large(&mut carry.combine_buf, 64 * 1024, 0);     // 64KB - one line max
+            shrink_if_large(&mut carry.tail,        64 * 1024, 0);     // 64KB - one line max
+        }
+    }
+
+    #[inline]
+    fn process_file_buffered(
+        &mut self,
+        node: &F::Node,
+        max_size: usize,
+        check_binary: bool,
+    ) -> io::Result<bool> {
+        let is_binary = !self.fs.read_file_content(
+            &mut self.parser,
+            node,
+            max_size, BufKind::File, check_binary
+        )?;
+        if is_binary {
+            self.stats.files_skipped_as_binary_due_to_probe += 1;
+            return Ok(false);
+        }
+
+        self.stats.files_searched += 1;
+        self.stats.bytes_searched += self.parser.file.len();
+
+        self.find_and_print_matches()
+    }
+
+    #[inline(never)]
+    fn process_file_streaming(
+        &mut self,
+        node: &F::Node,
+        max_size: usize,
+        check_binary: bool,
+    ) -> io::Result<bool> {
+        let _span = tracy::span!("WorkerContext::process_file_streaming");
+
+        let mut carry = self.chunk_carry.take().unwrap_or_else(ChunkCarry::new);
+        carry.reset();
+
+        let Some(chunks) = self.fs.collect_file_chunks(
+            &mut self.parser.scratch,
+            node,
+            max_size,
+            check_binary,
+        )? else {
+            self.stats.files_skipped_as_binary_due_to_probe += 1;
+            self.chunk_carry = Some(carry);
+            return Ok(false);
+        };
+
+        let mut bytes_searched = 0usize;
+
+        for (disk_offset, len) in &chunks {
+            self.parser.chunk.resize(*len, 0);
+
+            let n = match self.fs.read_at_offset(&mut self.parser.chunk[..*len], *disk_offset) {
+                Ok(n) => n,
+                Err(_) => break,
+            };
+
+            if n == 0 { break; }
+            bytes_searched += n;
+
+            carry.combine_buf.clear();
+            carry.combine_buf.extend_from_slice(&carry.tail);
+            carry.combine_buf.extend_from_slice(&self.parser.chunk[..n]);
+            carry.tail.clear();
+
+            let combined = std::mem::take(&mut carry.combine_buf);
+            self.find_and_print_matches_in_chunk(&combined, &mut carry, false)?;
+            carry.combine_buf = combined;
+        }
+
+        // Flush final partial line (no trailing newline)
+        if !carry.tail.is_empty() {
+            let tail = std::mem::take(&mut carry.tail);
+            self.find_and_print_matches_in_chunk(&tail, &mut carry, true)?;
+            carry.tail = tail;
+            carry.tail.clear();
+        }
+
+        self.stats.files_searched += 1;
+        self.stats.bytes_searched += bytes_searched;
+
+        if carry.found_any {
+            self.stats.files_contained_matches += 1;
+        }
+
+        let found_any = carry.found_any;
+        self.chunk_carry = Some(carry);
+        Ok(found_any)
     }
 
     #[inline]
@@ -507,127 +681,58 @@ impl<F: RawFs, S: MatchSink> WorkerContext<'_, F, S> {
     }
 }
 
-// impl block for find_and_print_matches
-impl<F: RawFs, S: MatchSink> WorkerContext<'_, F, S> {
-    #[inline]
+// impl block for printng matches
+impl<F: RawFs, S: MatchSink> WorkerContext<'_, '_, F, S> {
     fn find_and_print_matches(&mut self) -> io::Result<bool> {
-        let _span = tracy::span!("find_and_print_matches_fast");
+        let _span = tracy::span!("find_and_print_matches");
 
-        let mut found_any = false;
         let buf = &self.parser.file;
         let buf_len = buf.len();
+        if buf_len == 0 { return Ok(false); }
 
-        if buf_len == 0 {
-            return Ok(false);
-        }
+        self.newlines_buffer.clear();
+        self.newlines_buffer.extend(memchr::memchr_iter(b'\n', buf).map(|i| i as u32));
 
         let should_print_color = should_enable_ansi_coloring();
 
-        let newlines: SmallVec<[usize; 512]> = memchr::memchr_iter(b'\n', buf).collect();
-
+        let mut found_any = false;
         let mut line_start = 0;
+        let mut line_num = 1u32;
 
-        let mut line_num = 1;
-        let mut line_num_buf = itoa::Buffer::new();
-
-        let mut newline_idx = 0;
-        loop {
-            let line_end = if newline_idx < newlines.len() {
-                newlines[newline_idx]
-            } else {
-                buf_len
-            };
-
+        for &newline_pos in self
+            .newlines_buffer
+            .iter()
+            .chain([&(buf_len as u32)])
+        {
+            let line_end = newline_pos as usize;
             let line = &buf[line_start..line_end];
-
             let mut iter = self.matcher.find_matches(line).peekable();
 
             if iter.peek().is_some() {
                 if !found_any {
-                    found_any = true;
+                    //
+                    // First match!!
+                    //
 
-                    let needed = 4096 + buf_len.min(32 * 1024);
+                    found_any = true;
+                    let needed = 4096 + buf_len.min(32 * 1024); // @Constant @tune
                     if self.parser.output.capacity() - self.parser.output.len() < needed {
                         self.parser.output.reserve(needed);
                     }
-
-                    if !self.cli.jump {
-                        if should_print_color {
-                            self.parser.output.extend_from_slice(COLOR_GREEN.as_bytes());
-                        }
-                        // @Cuntpaste from above
-                        {
-                            let root = self.cli.search_root_path.as_bytes();
-                            let ends_with_slash = root.last() == Some(&(MAIN_SEPARATOR as _));
-                            self.parser.output.extend_from_slice(root);
-                            if !ends_with_slash {
-                                self.parser.output.push(MAIN_SEPARATOR as _);
-                            }
-                            self.parser.output.extend_from_slice(&self.path);
-                        }
-                        if should_print_color {
-                            self.parser.output.extend_from_slice(COLOR_RESET.as_bytes());
-                        }
-                        self.parser.output.extend_from_slice(b":\n");
-                    }
+                    Self::write_file_header(&mut self.parser.output, self.cli, &self.path, should_print_color);
                 }
 
-                if self.cli.jump {
-                    if should_print_color {
-                        self.parser.output.extend_from_slice(COLOR_GREEN.as_bytes());
-                    }
+                Self::write_match_line(
+                    &mut self.parser.output,
+                    self.cli,
+                    &self.path,
+                    line,
+                    line_num,
+                    iter,
+                    should_print_color,
+                );
 
-                    {
-                        let root = self.cli.search_root_path.as_bytes();
-                        let ends_with_slash = root.last() == Some(&(MAIN_SEPARATOR as _));
-                        self.parser.output.extend_from_slice(root);
-                        if !ends_with_slash {
-                            self.parser.output.push(MAIN_SEPARATOR as _);
-                        }
-                        self.parser.output.extend_from_slice(&self.path);
-                    }
-
-                    if should_print_color {
-                        self.parser.output.extend_from_slice(COLOR_RESET.as_bytes());
-                    }
-
-                    self.parser.output.extend_from_slice(b":");
-                }
-
-                if should_print_color {
-                    self.parser.output.extend_from_slice(COLOR_CYAN.as_bytes());
-                }
-
-                let line_num_str = line_num_buf.format(line_num);
-                self.parser.output.extend_from_slice(line_num_str.as_bytes());
-                if should_print_color {
-                    self.parser.output.extend_from_slice(COLOR_RESET.as_bytes());
-                }
-                self.parser.output.extend_from_slice(b": ");
-
-                let display = truncate_utf8(line, 500);
-                let mut last = 0;
-
-                for (s, e) in iter {
-                    if s >= display.len() { break; }
-
-                    let e = e.min(display.len());
-
-                    self.parser.output.extend_from_slice(&display[last..s]);
-                    if should_print_color {
-                        self.parser.output.extend_from_slice(COLOR_RED.as_bytes());
-                    }
-                    self.parser.output.extend_from_slice(&display[s..e]);
-                    if should_print_color {
-                        self.parser.output.extend_from_slice(COLOR_RESET.as_bytes());
-                    }
-                    last = e;
-                }
-
-                self.parser.output.extend_from_slice(&display[last..]);
-                self.parser.output.push(b'\n');
-
-                if S::NEEDS_RANGES {
+                if S::STDOUT_NOP {  // @Memory
                     let ranges = self.matcher.find_matches(line)
                         .map(|(s, e)| (s as _, e as _))
                         .collect::<SmallVec<[_; 4]>>()
@@ -640,7 +745,6 @@ impl<F: RawFs, S: MatchSink> WorkerContext<'_, F, S> {
             if line_end >= buf_len { break }
             line_start = line_end + 1;
             line_num += 1;
-            newline_idx += 1;
         }
 
         if found_any {
@@ -649,10 +753,170 @@ impl<F: RawFs, S: MatchSink> WorkerContext<'_, F, S> {
 
         Ok(found_any)
     }
+
+    fn find_and_print_matches_in_chunk(
+        &mut self,
+        data: &[u8],
+        carry: &mut ChunkCarry,
+        is_last: bool
+    ) -> io::Result<()> {
+        let _span = tracy::span!("match_chunk");
+
+        if data.is_empty() { return Ok(()); }
+
+        let should_print_color = should_enable_ansi_coloring();
+
+        let process_until = if is_last {
+            data.len()
+        } else {
+            match memchr::memrchr(b'\n', data) {
+                Some(pos) => pos + 1,
+                None => {
+                    carry.tail.clear();
+                    carry.tail.extend_from_slice(data);
+                    return Ok(());
+                }
+            }
+        };
+
+        self.newlines_buffer.clear();
+        self.newlines_buffer.extend(memchr::memchr_iter(b'\n', data).map(|i| i as u32));
+
+        let data_len = data.len();
+        let mut line_start = 0usize;
+
+        for &newline_pos in self
+            .newlines_buffer
+            .iter()
+            .chain([&(process_until as u32)])
+        {
+            let line_end = newline_pos as usize;
+            let line = &data[line_start..line_end];
+            let mut iter = self.matcher.find_matches(line).peekable();
+
+            if iter.peek().is_some() {
+                if !carry.found_any {  // @Cutnpaste from find_and_print_matches
+                    //
+                    // First match!!
+                    //
+
+                    carry.found_any = true;
+                    let needed = 4096 + data_len.min(32 * 1024); // @Constant @tune
+                    if self.parser.output.capacity() - self.parser.output.len() < needed {
+                        self.parser.output.reserve(needed);
+                    }
+                    Self::write_file_header(&mut self.parser.output, self.cli, &self.path, should_print_color);
+                }
+
+                Self::write_match_line(
+                    &mut self.parser.output,
+                    self.cli,
+                    &self.path,
+                    line,
+                    carry.line_num,
+                    iter,
+                    should_print_color,
+                );
+
+                if S::STDOUT_NOP { // @Memory @Cutnpaste from find_and_print_matches
+                    let ranges = self.matcher.find_matches(line)
+                        .map(|(s, e)| (s as _, e as _))
+                        .collect::<SmallVec<[_; 4]>>()
+                        .into_boxed_slice();
+
+                    self.sink.push(self.path.as_ref(), carry.line_num as _, line, ranges);
+                }
+            }
+
+            if line_end >= process_until { break; }
+            line_start = line_end + 1;
+            carry.line_num += 1;
+        }
+
+        carry.tail.clear();
+        if !is_last && process_until < data.len() {
+            carry.tail.extend_from_slice(&data[process_until..]);
+        }
+
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn write_match_line(
+        output:            &mut BumpVec<u8>,
+        cli:               &Cli,
+        path:              &[u8],
+        line:              &[u8],
+        line_num:          u32,
+        matches:           impl Iterator<Item = (usize, usize)>,
+        should_print_color: bool,
+    ) {
+        if cli.jump {
+            if should_print_color { output.extend_from_slice(COLOR_GREEN.as_bytes()); }
+
+            let root = cli.search_root_path.as_bytes();
+            let ends_with_slash = root.last() == Some(&(MAIN_SEPARATOR as _));
+
+            output.extend_from_slice(root);
+            if !ends_with_slash { output.push(MAIN_SEPARATOR as _); }
+            output.extend_from_slice(path);
+
+            if should_print_color { output.extend_from_slice(COLOR_RESET.as_bytes()); }
+
+            output.extend_from_slice(b":");
+        }
+
+        if should_print_color { output.extend_from_slice(COLOR_CYAN.as_bytes()); }
+        output.extend_from_slice(itoa::Buffer::new().format(line_num).as_bytes());
+        if should_print_color { output.extend_from_slice(COLOR_RESET.as_bytes()); }
+
+        output.extend_from_slice(b": ");
+
+        let display = truncate_utf8(line, 500);
+        let mut last = 0;
+        for (s, e) in matches {
+            if s >= display.len() { break; }
+
+            let e = e.min(display.len());
+            output.extend_from_slice(&display[last..s]);
+
+            if should_print_color { output.extend_from_slice(COLOR_RED.as_bytes()); }
+            output.extend_from_slice(&display[s..e]);
+            if should_print_color { output.extend_from_slice(COLOR_RESET.as_bytes()); }
+
+            last = e;
+        }
+
+        output.extend_from_slice(&display[last..]);
+        output.push(b'\n');
+    }
+
+    #[inline(always)]
+    fn write_file_header(
+        output:            &mut BumpVec<u8>,
+        cli:               &Cli,
+        path:              &[u8],
+        should_print_color: bool,
+    ) {
+        if cli.jump { return; } // jump mode writes path per-line, not as a header
+
+        if should_print_color { output.extend_from_slice(COLOR_GREEN.as_bytes()); }
+
+        let root = cli.search_root_path.as_bytes();
+        let ends_with_slash = root.last() == Some(&(MAIN_SEPARATOR as _));
+
+        output.extend_from_slice(root);
+        if !ends_with_slash { output.push(MAIN_SEPARATOR as _); }
+        output.extend_from_slice(path);
+
+        if should_print_color { output.extend_from_slice(COLOR_RESET.as_bytes()); }
+
+        output.extend_from_slice(b":\n");
+    }
 }
 
 /// impl block of gitignore helper functions
-impl<F: RawFs, S: MatchSink> WorkerContext<'_, F, S> {
+impl<F: RawFs, S: MatchSink> WorkerContext<'_, '_, F, S> {
     #[inline]
     fn try_load_gitignore(&mut self, gi_file_id: FileId) -> Option<Gitignore> {
         let _span = tracy::span!("WorkerContext::try_load_gitignore");
@@ -676,7 +940,7 @@ impl<F: RawFs, S: MatchSink> WorkerContext<'_, F, S> {
     }
 }
 
-impl<F: RawFs, S: MatchSink> WorkerContext<'_, F, S> {
+impl<'a, 'output_arena, F: RawFs, S: MatchSink> WorkerContext<'a, 'output_arena, F, S> {
     pub fn start_worker_loop(
         mut self,
 
@@ -686,7 +950,7 @@ impl<F: RawFs, S: MatchSink> WorkerContext<'_, F, S> {
         injector: &Injector<WorkItem>,
         stealers: &[Stealer<WorkItem>],
         local_worker: &DequeWorker<WorkItem>,
-    ) -> WorkerResult {
+    ) -> WorkerResult<'output_arena> {
         self.init();
 
         let mut consecutive_steals = 0;

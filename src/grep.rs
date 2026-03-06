@@ -1,25 +1,19 @@
 use std::path::{MAIN_SEPARATOR, MAIN_SEPARATOR_STR};
-use std::sync::Arc;
-use std::io::{self, BufWriter};
+use std::io;
 use std::fs::{File, OpenOptions};
-use std::sync::atomic::{AtomicBool, AtomicUsize};
 
-use crossbeam_channel::unbounded;
-use crossbeam_deque::{Injector, Worker as DequeWorker};
+use bumpalo::Bump;
 
 use crate::apfs::{ApfsFs, ApfsVolume, APFS_NX_MAGIC};
 use crate::cli::Cli;
 use crate::matcher::Matcher;
 use crate::ntfs::NtfsFs;
 use crate::util::read_at_offset;
-use crate::{Result, Error, eprintln_red, tracy};
-use crate::path_buf::SmallPathBuf;
-use crate::stats::{AtomicStats, Stats};
+use crate::{Result, Error, tracy};
 use crate::platform::device_id;
-use crate::ignore::{Gitignore, GitignoreChain};
 use crate::cache::{CacheConfig, FragmentCache};
 use crate::parser::{BufKind, FileId, FileNode, Parser, RawFs};
-use crate::worker::{DirWork, MatchSink, NoSink, OutputWorker, WorkItem, WorkerContext, WorkerResult};
+use crate::worker::{MatchSink, NoSink};
 use crate::ext4::{
     Ext4Fs,
     EXT4_MAGIC_OFFSET,
@@ -68,147 +62,6 @@ impl<F: RawFs, S: MatchSink> RawGrepper<F, S> {
         Ok(RawGrepper { cli: cli.clone(), fs, matcher, cache, fragment_hashes, sink })
     }
 
-    pub fn search(
-        mut self,
-        root_file_id: FileId,
-        running: &AtomicBool,
-        root_gi: Option<Gitignore>,
-    ) -> io::Result<Stats> {
-        let fs = &self.fs;
-        let matcher = &self.matcher;
-        let stats = &AtomicStats::new();
-
-        let active_workers = &AtomicUsize::new(0);
-
-        let (output_tx, output_rx) = unbounded();
-
-        let injector = &Injector::new();
-        injector.push(WorkItem::Directory(DirWork {
-            file_id: root_file_id,
-            path_bytes: Arc::default(),
-            gitignore_chain: root_gi.map(GitignoreChain::from_root).unwrap_or_default(),
-            depth: 0,
-        }));
-
-        let threads = self.cli.threads.get();
-
-        let workers = (0..threads)
-            .map(|_| DequeWorker::new_lifo())
-            .collect::<Vec<_>>();
-
-        let stealers = workers
-            .iter()
-            .map(|w| w.stealer())
-            .collect::<Vec<_>>();
-
-        self.warmup_filesystem();
-
-        let num_cores = num_physical_cores_or(threads);
-
-        let (all_file_keys, all_file_metas, all_fragment_presence) = std::thread::scope(|s| {
-            let output_handle = s.spawn(move || {
-                //
-                // Pin output thread to last core (often an E-core on hybrid CPUs)
-                //
-                pin_thread_to_core(num_cores.saturating_sub(1));
-
-                OutputWorker {
-                    rx: output_rx,
-                    writer: BufWriter::with_capacity(128 * 1024, io::stdout()),
-                }.run();
-            });
-
-            let handles = workers.into_iter().enumerate().map(|(worker_id, local_worker)| {
-                let stealers = &stealers;
-                let output_tx = output_tx.clone();
-                let sink = self.sink.clone();
-                let cli = &self.cli;
-
-                let cache = self.cache.as_ref();
-                let fragment_hashes = &self.fragment_hashes;
-
-                s.spawn(move || {
-                    pin_thread_to_core(worker_id % num_cores);
-
-                    let worker = WorkerContext {
-                        cache,
-                        fragment_hashes,
-                        fs,
-                        matcher,
-                        cli,
-
-                        stats: Stats::default(),
-                        parser: Parser::default(),
-
-                        path: SmallPathBuf::default(),
-                        output_tx,
-                        worker_id: worker_id as _,
-
-                        sink,
-
-                        pending_file_keys: Vec::new(),
-                        pending_file_metas: Vec::new(),
-                        pending_fragment_presence: Vec::new(),
-                    };
-
-                    let WorkerResult {
-                        stats: worker_stats,
-                        file_keys,
-                        file_metas,
-                        fragment_presence,
-                        ..
-                    } = worker.start_worker_loop(
-                        running,
-                        active_workers,
-                        injector,
-                        stealers,
-                        &local_worker
-                    );
-
-                    worker_stats.merge_into(stats);
-
-                    (file_keys, file_metas, fragment_presence)
-                })
-            }).collect::<Vec<_>>();
-
-            let mut all_file_keys   = Vec::new();
-            let mut all_file_metas  = Vec::new();
-            let mut all_fragment_presence = Vec::new();
-
-            for handle in handles {
-                if let Ok((file_keys, file_metas, fragment_presence)) = handle.join() {
-                    all_file_keys.extend(file_keys);
-                    all_file_metas.extend(file_metas);
-                    all_fragment_presence.extend(fragment_presence);
-                }
-            }
-
-            drop(output_tx);
-            _ = output_handle.join();
-
-            (all_file_keys, all_file_metas, all_fragment_presence)
-        });
-
-        if let Some(cache) = &mut self.cache {
-            if let Err(e) = cache.merge_updates(
-                all_file_keys,
-                all_file_metas,
-                &self.fragment_hashes,
-                all_fragment_presence
-            ) {
-                eprintln_red!("error: failed to merge cache updates: {e}");
-            }
-        }
-
-        if let Some(cache) = &self.cache {
-            if let Err(e) = cache.save_to_disk() {
-                eprintln_red!("error: failed to save cache: {e}");
-            }
-        }
-
-        Ok(stats.to_stats())
-    }
-
     /// Resolve a path like "/usr/bin" or "etc" into a file ID.
     #[inline]
     pub fn try_resolve_path_to_file_id(&self, path: &str) -> io::Result<FileId> {
@@ -218,7 +71,8 @@ impl<F: RawFs, S: MatchSink> RawGrepper<F, S> {
             return Ok(self.fs.root_id());
         }
 
-        let mut parser = Parser::default();
+        let bump = Bump::new();
+        let mut parser = Parser::new(&bump);
         let mut file_id = self.fs.root_id();
 
         for part in path.split(MAIN_SEPARATOR).filter(|p| !p.is_empty()) {
@@ -245,17 +99,6 @@ impl<F: RawFs, S: MatchSink> RawGrepper<F, S> {
         }
 
         Ok(file_id)
-    }
-
-    /// Warm up filesystem metadata for faster traversal
-    #[inline]
-    fn warmup_filesystem(&self) {
-        let _span = tracy::span!("RawGrepper::warmup_filesystem");
-
-        // ...
-
-        // Give the async prefetch time to start
-        std::thread::yield_now();
     }
 }
 
@@ -404,63 +247,6 @@ pub fn make_matcher(cli: &Cli) -> Result<Matcher> {
     })
 }
 
-//
-// CPU affinity helpers - gdt-cpus has bugs on macOS, so we provide fallbacks
-//
-
-/// Get number of physical cores, falling back to provided default
-#[inline]
-fn num_physical_cores_or(fallback: usize) -> usize {
-    #[cfg(not(target_os = "macos"))]
-    {
-        gdt_cpus::num_physical_cores().unwrap_or(fallback)
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        // macOS: use sysctl to get physical core count
-        macos_num_physical_cores().unwrap_or(fallback)
-    }
-}
-
-/// Pin current thread to a specific core (best-effort, ignores failures)
-#[inline]
-fn pin_thread_to_core(core_id: usize) {
-    #[cfg(not(target_os = "macos"))]
-    {
-        _ = gdt_cpus::pin_thread_to_core(core_id);
-    }
-    #[cfg(target_os = "macos")]
-    {
-        // macOS doesn't support thread-to-core pinning via public APIs
-        // Thread affinity hints are handled by the kernel
-        _ = core_id;
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn macos_num_physical_cores() -> Option<usize> {
-    // sysctl hw.physicalcpu
-    let mut count: libc::c_int = 0;
-    let mut size = std::mem::size_of::<libc::c_int>();
-
-    let ret = unsafe {
-        libc::sysctlbyname(
-            c"hw.physicalcpu".as_ptr(),
-            &mut count as *mut _ as *mut libc::c_void,
-            &mut size,
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-
-    if ret == 0 && count > 0 {
-        Some(count as usize)
-    } else {
-        None
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FsType {
     Ext4, Apfs, Ntfs
@@ -503,20 +289,6 @@ pub enum AnyGrepper<S: MatchSink = NoSink> {
 }
 
 impl<S: MatchSink> AnyGrepper<S> {
-    #[inline]
-    pub fn search(
-        self,
-        root_file_id: FileId,
-        running: &AtomicBool,
-        root_gi: Option<Gitignore>,
-    ) -> io::Result<Stats> {
-        match self {
-            AnyGrepper::Ext4(g) => g.search(root_file_id, running, root_gi),
-            AnyGrepper::Apfs(g) => g.search(root_file_id, running, root_gi),
-            AnyGrepper::Ntfs(g) => g.search(root_file_id, running, root_gi),
-        }
-    }
-
     #[inline]
     pub fn try_resolve_path_to_file_id(&self, path: &str) -> io::Result<FileId> {
         match self {

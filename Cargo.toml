@@ -58,6 +58,7 @@ nohash-hasher = "0.2.0"
 parking_lot = "0.12.5"
 tracing             = "0.1"
 tracing-subscriber  = { version = "0.3", features = ["env-filter"] }
+bumpalo = { version = "3.20.2", features = ["collections"] }
 
 [target.'cfg(not(target_os = "macos"))'.dependencies]
 gdt-cpus = { version = "25", default-features = false }

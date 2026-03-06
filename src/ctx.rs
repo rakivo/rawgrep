@@ -4,11 +4,12 @@ use std::io::{self, BufWriter};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+use bumpalo::Bump;
 use parking_lot::{Condvar, Mutex, RwLock};
 
 use ::tracing::debug;
 use smallvec::SmallVec;
-use crossbeam_channel::{Sender, unbounded};
+use crossbeam_channel::{Receiver, Sender, unbounded};
 use crossbeam_deque::{Injector, Stealer, Worker as DequeWorker};
 
 use crate::error::Error;
@@ -32,7 +33,6 @@ struct CacheAccumulator {
 struct SearchJob<S: MatchSink> {
     grepper:   AnyGrepper<S>,
     stats:     AtomicStats,
-    output_tx: Sender<Vec<u8>>,
     device:    Box<str>,
     cache_acc: Mutex<CacheAccumulator>,
 }
@@ -49,6 +49,10 @@ pub struct RawGrepCtx<S: MatchSink> {
     active_workers: Arc<AtomicUsize>,
     wake:           Arc<(Mutex<bool>, Condvar)>,
     current_job:    Arc<RwLock<Option<Arc<SearchJob<S>>>>>,
+
+    output_tx:      Sender<&'static [u8]>,
+    flush_req_tx:   Sender<()>,
+    flush_ack_rx:   Arc<Mutex<Receiver<()>>>,
 }
 
 impl<S: MatchSink + 'static> RawGrepCtx<S> {
@@ -61,12 +65,28 @@ impl<S: MatchSink + 'static> RawGrepCtx<S> {
         let wake           = Arc::default();
         let job            = Arc::default();
 
+        let (output_tx, output_rx) = unbounded();
+        let (flush_req_tx, flush_req_rx) = unbounded();
+        let (flush_ack_tx, flush_ack_rx) = unbounded();
+
+        _ = std::thread::spawn(move || {
+            OutputWorker {
+                rx: output_rx,
+                flush_req_rx,
+                flush_ack_tx,
+                writer: BufWriter::with_capacity(128 * 1024, io::stdout()), // @Contant @Tune
+            }.run();
+        });
+
         let ctx = Self {
             injector,
             running,
             active_workers,
             wake,
             current_job: job,
+            output_tx,
+            flush_req_tx,
+            flush_ack_rx: Arc::new(Mutex::new(flush_ack_rx)),
         };
 
         let mut local_workers = Vec::with_capacity(num_threads);
@@ -77,17 +97,24 @@ impl<S: MatchSink + 'static> RawGrepCtx<S> {
             local_workers.push(w);
         }
 
+        let num_cores = crate::util::num_physical_cores_or(num_threads);
+
         let stealers = Arc::new(stealers);
         for (worker_id, local) in local_workers.into_iter().enumerate() {
             let ctx = ctx.clone();
             let stealers = stealers.clone();
 
             std::thread::spawn(move || {
+                let output_buffer_arena = Bump::new();
+
+                crate::util::pin_thread_to_core(worker_id % num_cores);
+
                 worker_thread_main(
                     worker_id as _,
                     ctx,
                     &stealers,
                     local,
+                    &output_buffer_arena
                 );
             });
         }
@@ -120,6 +147,10 @@ impl<S: MatchSink + 'static> RawGrepCtx<S> {
                 }
             }
         }
+
+        // Request flush and wait for ack
+        _ = self.flush_req_tx.send(());
+        _ = self.flush_ack_rx.lock().recv();
 
         self.current_job.read()
             .as_ref()
@@ -266,23 +297,11 @@ impl<S: MatchSink + 'static> RawGrepCtx<S> {
         //
         // Setup output channel and gitignore
         //
-        let (output_tx, output_rx) = unbounded::<Vec<u8>>();
         let root_gitignore = {
             let gi_path = search_root.join(".gitignore");
             ignore::build_gitignore_from_file(&gi_path.to_string_lossy())
         };
         debug!("[ctx] root_gitignore present={}", root_gitignore.is_some());
-
-        if config.pipe_to_stdout {
-            // Spawn output thread
-            std::thread::spawn(move || {  // @Memory
-                OutputWorker {
-                    rx:     output_rx,
-                    writer: BufWriter::with_capacity(128 * 1024, io::stdout()),
-                }.run();
-            });
-        }
-        debug!("[ctx] output thread spawned");
 
         //
         // Swap in new job
@@ -291,7 +310,6 @@ impl<S: MatchSink + 'static> RawGrepCtx<S> {
             let mut guard = self.current_job.write();
             *guard = Some(SearchJob {
                 grepper,
-                output_tx,
                 device:    device.clone(),
                 stats:     Default::default(),
                 cache_acc: Default::default(),
@@ -323,18 +341,17 @@ impl<S: MatchSink + 'static> RawGrepCtx<S> {
     }
 }
 
-fn dispatch_worker<F: RawFs, S: MatchSink>(
+fn dispatch_worker<'a, F: RawFs, S: MatchSink>(
     worker_id:      u16,
 
     g: &RawGrepper<F, S>,
     ctx: &RawGrepCtx<S>,
 
-    output_tx: Sender<Vec<u8>>,
-    parser: &mut Parser,
+    parser: Parser<'a>,
 
     stealers:       &[Stealer<WorkItem>],
     local:          &DequeWorker<WorkItem>,
-) -> WorkerResult {
+) -> WorkerResult<'a> {
     WorkerContext {
         worker_id,
         cache:            g.cache(),
@@ -343,10 +360,12 @@ fn dispatch_worker<F: RawFs, S: MatchSink>(
         matcher:          g.matcher(),
         cli:              g.cli(),
         sink:             g.sink.clone(),
-        output_tx:        output_tx.clone(),
+        output_tx:        ctx.output_tx.clone(),
         stats:            Stats::default(),
-        parser:           std::mem::take(parser),
+        parser:           parser,
         path:             SmallPathBuf::default(),
+        chunk_carry:               None,
+        newlines_buffer:           Vec::new(),
         pending_file_keys:         Vec::new(),
         pending_file_metas:        Vec::new(),
         pending_fragment_presence: Vec::new(),
@@ -364,12 +383,13 @@ fn worker_thread_main<S: MatchSink + 'static>(
     ctx:       RawGrepCtx<S>,
     stealers:  &[Stealer<WorkItem>],
     local:     DequeWorker<WorkItem>,
+    output_buffer_arena: &Bump
 ) {
     debug!("[ctx] worker {worker_id} started, waiting on condvar");
 
     // Parser buffers are owned by the thread and reused across searches,
     // saving allocations on every search restart.
-    let mut parser = Parser::default();
+    let mut parser = Parser::new(&output_buffer_arena);
     let mut search_n = 0u32;
 
     loop {
@@ -400,22 +420,10 @@ fn worker_thread_main<S: MatchSink + 'static>(
 
         debug!("[ctx] worker {worker_id} got job device={:?}", job.device);
 
-        let output_tx = job.output_tx.clone();
-
-        macro_rules! dispatch {
-            ($g:expr) => {
-                dispatch_worker(
-                    worker_id,
-                    $g, &ctx,
-                    output_tx, &mut parser,
-                    stealers, &local
-                )
-            };
-        }
         let result = match &job.grepper {
-            AnyGrepper::Ext4(g) => dispatch!(g),
-            AnyGrepper::Apfs(g) => dispatch!(g),
-            AnyGrepper::Ntfs(g) => dispatch!(g),
+            AnyGrepper::Ext4(g) => dispatch_worker(worker_id, g, &ctx, parser, stealers, &local),
+            AnyGrepper::Apfs(g) => dispatch_worker(worker_id, g, &ctx, parser, stealers, &local),
+            AnyGrepper::Ntfs(g) => dispatch_worker(worker_id, g, &ctx, parser, stealers, &local),
         };
 
         debug!(
