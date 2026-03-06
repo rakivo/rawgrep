@@ -1,3 +1,14 @@
+#[cfg(all(feature = "mimalloc", feature = "dhat"))]
+compile_error!("Cannot enable both `mimalloc` and `dhat` allocators - choose one!");
+
+#[cfg(all(feature = "mimalloc", not(feature = "dhat")))]
+#[global_allocator]
+static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+#[cfg(all(feature = "dhat", not(feature = "mimalloc")))]
+#[global_allocator]
+static ALLOC: dhat::Alloc = dhat::Alloc;
+
 use rawgrep::cli::Cli;
 use rawgrep::worker::NoSink;
 use rawgrep::{CursorHide, Error, RawGrepConfig, eprint_blue, eprint_green, eprintln_red};
