@@ -12,7 +12,7 @@
 
 ### Prerequisites
 
-- Linux system with ext4 filesystem
+- Linux (contribute to make rawgrep support Windows) system with ext4/ntfs filesystem
 - Rust toolchain (for building from source)
 - Root access or be able to set capabilities
 
@@ -41,7 +41,7 @@ rawgrep "search pattern"
 If you prefer not to use capabilities, just build and run with `sudo`:
 
 ```bash
-cargo build --release
+cargo build --profile=release-fast
 
 # Again, if you want maximum speed possible (requires nightly):
 # cargo +nightly build --profile=release-fast --target=<your_target> --features=use_nightly
@@ -126,7 +126,7 @@ sudo setcap -r ./target/release-fast/rawgrep
 
 ## Limitations (IMPORTANT)
 
-- **ext4 only:** Currently only supports ext4 filesystems, and most likely only Linux (didn't test that)
+- **ext4/ntfs only:** Currently only supports ext4/ntfs filesystems.
 
 ## Development
 
@@ -140,9 +140,8 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 
 ## Roadmap
 
-- [ ] Daemon mode with eBPF filesystem hooks for hot cache performance
+- [ ] Support for Windows. (Some physical partition stuff needs to get fixed on Windows, besides that everything should be already working)
 - [ ] Symlink support
-- [ ] Support for more filesystems (btrfs, maybe even NTFS/APFS)
 
 ## Emacs Integration
 
