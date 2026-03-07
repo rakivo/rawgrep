@@ -2,10 +2,47 @@
 
 **Grep at the speed of raw disk** - search text by reading data directly from raw block devices.
 
+## Benchmarks
+
+benchmark script: [`bench.sh`](bench.sh)
+```
+corpus: 674,283 files across mixed C/C++/Rust/Python projects
+pattern: `TODO` (literal)
+system: Intel i5-13400F, 16 threads, NVMe SSD, 16GB RAM (10GB free), Debian 6.12
+rawgrep 0.1.4 vs ripgrep 15.1.0
+```
+
+| scenario | rawgrep | ripgrep | speedup |
+|---|---|---|---|
+| cold cache + fragment cache | 1.26s ± 0.02s | 11.08s ± 0.50s | **8.8x** |
+| cold cache, no fragment cache | 6.24s ± 0.08s | 11.03s ± 0.97s | **1.8x** |
+| warm cache + fragment cache | 173ms ± 9ms | 436ms ± 45ms | **2.5x** |
+| warm cache, no fragment cache | 389ms ± 9ms | 454ms ± 73ms | 1.2x |
+
+fragment cache stores per-file search metadata to skip unchanged files on repeat searches.
+
+### Correctness notes
+
+`rawgrep` and `ripgrep` differ in which files they search by design:
+
+| | count |
+|---|---|
+| files matched by ripgrep only | 60 |
+| files matched by rawgrep only | 257 |
+
+**files ripgrep found that rawgrep missed:** mostly `.github/` yaml files, python venv files,
+and large test data files. these are gitignore/binary detection policy differences rather than missed matches.
+
+**files rawgrep found that ripgrep missed:** `.recording` files and other files ripgrep
+treats as binary. rawgrep searches these by default.
+
+no text file that ripgrep searched was missed by rawgrep.
+
 ## How is `rawgrep` so fast?
 
 - `rawgrep` reads files DIRECTLY from your partition, completely bypassing the filesystem.
-- `rawgrep` is cache-friendly and INSANELY memory efficient, simply streaming through your device and outputting the matches.
+- `rawgrep` is cache-friendly and insanely memory efficient, simply streaming through your device and outputting the matches.
+- `rawgrep` uses work-stealing parallel traversal to keep all CPU cores busy during directory scanning.
 - `rawgrep` uses a sophisticated fragment-based caching system (inspired by [nowgrep](https://github.com/asbott/nowgrep)) that learns which files can be skipped for repeated searches.
 
 ## Installation
@@ -141,6 +178,7 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 ## Roadmap
 
 - [ ] Support for Windows. (Some physical partition stuff needs to get fixed on Windows, besides that everything should be already working)
+- [ ] Support for OSX+APFS.
 - [ ] Symlink support
 
 ## Emacs Integration
@@ -175,7 +213,7 @@ A: Yeah.
 A: By default, rawgrep respects `.gitignore` and skips binary/large files. Use `-u` to ignore `.gitignore`, `-uu` to also search binaries, or `-uuu` to search everything. This matches ripgrep's behavior.
 
 **Q: Can I use this on other filesystems?**
-A: Currently only ext4 is supported. Support for other filesystems may be added in the future. (Motivate me with stars)
+A: Currently only ext4/ntfs is supported. Support for other filesystems may be added in the future. (Motivate me with stars)
 
 **Q: Will this damage my filesystem?**
 A: No. The tool only performs read operations. It cannot modify your filesystem.
