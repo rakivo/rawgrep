@@ -35,7 +35,7 @@ pub fn read_at_offset(file: &File, buf: &mut [u8], offset: u64) -> io::Result<us
         // Unaligned, probably never would happen but for @Robustness,
         // read into a sector-aligned temp buffer and copy out.
         let aligned_len = ((prefix + buf.len()) + SECTOR as usize - 1) & !(SECTOR as usize - 1);
-        let mut tmp = vec![0u8; aligned_len];
+        let mut tmp = vec![0u8; aligned_len];  // @Heap @Heap @Heap
         let n = file.seek_read(&mut tmp, aligned_offset)?;
 
         let available = n.saturating_sub(prefix);

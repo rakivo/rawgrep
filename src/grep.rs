@@ -172,11 +172,17 @@ impl<S: MatchSink> RawGrepper<NtfsFs, S> {
     }
 }
 
+#[inline]
+pub fn open_device(path: &str) -> io::Result<File> {
+    open_device_impl(path, false)
+}
+
 #[cfg(windows)]
 #[inline]
-fn open_device(path: &str) -> io::Result<File> {
+pub fn open_device_impl(path: &str, _uncached: bool) -> io::Result<File> {
     use std::os::windows::fs::OpenOptionsExt;
     use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_NO_BUFFERING;
+
     OpenOptions::new()
         .read(true)
         .share_mode(0x3) // FILE_SHARE_READ | FILE_SHARE_WRITE
@@ -186,48 +192,77 @@ fn open_device(path: &str) -> io::Result<File> {
 
 #[cfg(unix)]
 #[inline]
-fn open_device(path: &str) -> io::Result<File> {
-    OpenOptions::new()
-        .read(true)
-        .write(false)
-        .open(path)
+pub fn open_device_impl(path: &str, uncached: bool) -> io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut opts = OpenOptions::new();
+    opts.read(true).write(false);
+
+    if uncached {
+        opts.custom_flags(libc::O_DIRECT).open(path)
+    } else {
+        opts.open(path)
+    }
 }
 
 #[inline]
 pub fn open_device_and_detect_fs(device_path: &str) -> io::Result<(File, FsType)> {
-    //
-    // @Volatile
-    //
-    // I don't wanna force a sync of literally everything on the computer,
-    // cuz on some systems it might be completely detrimental to the speed of this tool.
-    //
-    // While correctness must be the top priority, speed should be at least the second top priority,
-    // hence I decided to instead do the `ioctl` call...
-    //
-    // Though, we'll see how reliable and cross-platform it is..
-    //
-    // {
-    //     let t = std::time::Instant::now();
-    //     unsafe { libc::sync(); }
-    //     eprintln!("sync: {:.2}ms", t.elapsed().as_secs_f64() * 1000.0);
-    // }
-    //
+    {
+        let t = std::time::Instant::now();
+        unsafe { libc::sync(); }
+        eprintln!("sync: {:.2}ms", t.elapsed().as_secs_f64() * 1000.0);
+    }
 
     let file = open_device(device_path)?;
 
-    #[cfg(target_os = "linux")] {
-        use std::os::unix::io::AsRawFd;
-        const BLKFLSBUF: libc::c_ulong = 0x1261;
-        unsafe { libc::ioctl(file.as_raw_fd(), BLKFLSBUF, 0) };
-        unsafe { libc::syncfs(file.as_raw_fd()); }
-    }
-    #[cfg(target_os = "macos")] {
-        // macOS has no syncfs() or BLKFLSBUF.
-        // F_FULLFSYNC flushes the volume containing the fd to physical storage,
-        // which is the closest equivalent for ensuring we read committed data.
-        use std::os::unix::io::AsRawFd;
-        unsafe { libc::fcntl(file.as_raw_fd(), libc::F_FULLFSYNC); }
-    }
+    //
+    // @Volatile
+    //
+    // We need to flush all the stale stuff from the VFS.
+    //
+    //
+    // And it turns out that `syncfs()` is not realiable for our case...
+    //
+    // Although, while calling `ioctl` with `BLKFLSBUF` is,
+    // it slows down our reads to oblivion, meaning there's no point..
+    //
+    // #[cfg(target_os = "linux")]
+    // {
+    //     use std::os::unix::io::AsRawFd;
+    //     const BLKFLSBUF: libc::c_ulong = 0x1261;
+    //     let ret = unsafe { libc::ioctl(file.as_raw_fd(), BLKFLSBUF, 0) };
+    //     if ret != 0 {
+    //         eprintln!("BLKFLSBUF failed: {}", io::Error::last_os_error());
+    //     }
+    // }
+    // #[cfg(target_os = "macos")] {
+    //     // macOS has no syncfs() or BLKFLSBUF.
+    //     // F_FULLFSYNC flushes the volume containing the fd to physical storage,
+    //     // which is the closest equivalent for ensuring we read committed data.
+    //     use std::os::unix::io::AsRawFd;
+    //     unsafe { libc::fcntl(file.as_raw_fd(), libc::F_FULLFSYNC); }
+    // }
+    //
+    //
+    // And by the way, having a separate handle for the device but with O_DIRECT,
+    // and doing aligned inode reads from there using `POSIX_FADV_DONTNEED`
+    // did not work as well. But maybe its because I misdiagnosed that the inodes
+    // parsing was the problem..
+    //
+    //
+    // In any way, `sync()` seems to work just fine for us, adding just
+    // few tens of milliseconds to the walltime...
+    //
+    // But even though this seems to be correct 100% of the time,
+    // fixing all the bugs we had regarding VFS staleness,
+    // I'm kinda disappointed with this approach.
+    //
+    // I truly want this program to decimate all other grep-like tools
+    // in walltime, proving that it's actually THE fastest one,
+    // but when there's still short-lived spilling allocations
+    // in medium to hot paths in this program, it doesn't really make sense
+    // to focus on that `sync()` stuff....
+    //
 
     // Read enough to cover both magic locations:
     // APFS at offset 32, ext4 superblock at offset 1024+56=1080 -> 2048 bytes is sufficient

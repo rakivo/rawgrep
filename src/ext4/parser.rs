@@ -2,7 +2,6 @@
 
 use crate::tracy;
 use crate::copy_data;
-use crate::util::read_at_offset;
 use crate::util::{likely, unlikely};
 use crate::worker::MAX_EXTENTS_UNTIL_SPILL;
 use crate::parser::{BufKind, FileId, FileNode, FileType, Parser, RawFs, binary_probe};
@@ -550,10 +549,5 @@ impl Ext4Fs {
         }
 
         Ok(())
-    }
-
-    #[inline]
-    fn read_at_offset(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
-        read_at_offset(&self.file, buf, offset)
     }
 }

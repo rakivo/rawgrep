@@ -105,8 +105,6 @@ impl<S: MatchSink + 'static> RawGrepCtx<S> {
             let stealers = stealers.clone();
 
             std::thread::spawn(move || {
-                let output_buffer_arena = Bump::new();
-
                 crate::util::pin_thread_to_core(worker_id % num_cores);
 
                 worker_thread_main(
@@ -114,7 +112,6 @@ impl<S: MatchSink + 'static> RawGrepCtx<S> {
                     ctx,
                     &stealers,
                     local,
-                    &output_buffer_arena
                 );
             });
         }
@@ -341,13 +338,16 @@ impl<S: MatchSink + 'static> RawGrepCtx<S> {
     }
 }
 
-fn dispatch_worker<'a, F: RawFs, S: MatchSink>(
+fn dispatch_worker<'a, 'b, F: RawFs, S: MatchSink>(
     worker_id:      u16,
 
     g: &RawGrepper<F, S>,
     ctx: &RawGrepCtx<S>,
 
     parser: Parser<'a>,
+    path_buf: SmallPathBuf,
+    newlines_scratch: Vec<u32>,
+    ranges_scratch: Vec<(u32, u32)>,
 
     stealers:       &[Stealer<WorkItem>],
     local:          &DequeWorker<WorkItem>,
@@ -363,9 +363,12 @@ fn dispatch_worker<'a, F: RawFs, S: MatchSink>(
         output_tx:        ctx.output_tx.clone(),
         stats:            Stats::default(),
         parser:           parser,
-        path:             SmallPathBuf::default(),
-        chunk_carry:               None,
-        newlines_buffer:           Vec::new(),
+        path_buf,
+        newlines_scratch,
+        ranges_scratch,
+
+        chunk_carry:      None,
+
         pending_file_keys:         Vec::new(),
         pending_file_metas:        Vec::new(),
         pending_fragment_presence: Vec::new(),
@@ -383,14 +386,19 @@ fn worker_thread_main<S: MatchSink + 'static>(
     ctx:       RawGrepCtx<S>,
     stealers:  &[Stealer<WorkItem>],
     local:     DequeWorker<WorkItem>,
-    output_buffer_arena: &Bump
 ) {
     debug!("[ctx] worker {worker_id} started, waiting on condvar");
+
+    let output_buffer_arena = Bump::new();
 
     // Parser buffers are owned by the thread and reused across searches,
     // saving allocations on every search restart.
     let mut parser = Parser::new(&output_buffer_arena);
-    let mut search_n = 0u32;
+    let mut path_buf = SmallPathBuf::new();
+    let mut newlines_scratch = Vec::new();
+    let mut ranges_scratch = Vec::new();
+
+    let mut search_count = 0u32;
 
     loop {
         //
@@ -403,8 +411,8 @@ fn worker_thread_main<S: MatchSink + 'static>(
             // Don't reset `ready` here - all workers need to see it true.
         }
 
-        search_n += 1;
-        debug!("[ctx] worker {worker_id} woke up for search #{search_n}");
+        search_count += 1;
+        debug!("[ctx] worker {worker_id} woke up for search #{search_count}");
 
         // Grab the current job
         let job = {
@@ -420,14 +428,31 @@ fn worker_thread_main<S: MatchSink + 'static>(
 
         debug!("[ctx] worker {worker_id} got job device={:?}", job.device);
 
+        //
+        // Reset the buffers
+        //
+        unsafe { path_buf.set_len(0); }
+        newlines_scratch.clear();
+        ranges_scratch.clear();
+
+        macro_rules! dispatch {
+            ($g:expr) => {
+                dispatch_worker(
+                    worker_id, $g, &ctx,
+                    parser, path_buf,
+                    newlines_scratch, ranges_scratch,
+                    stealers, &local
+                )
+            };
+        }
         let result = match &job.grepper {
-            AnyGrepper::Ext4(g) => dispatch_worker(worker_id, g, &ctx, parser, stealers, &local),
-            AnyGrepper::Apfs(g) => dispatch_worker(worker_id, g, &ctx, parser, stealers, &local),
-            AnyGrepper::Ntfs(g) => dispatch_worker(worker_id, g, &ctx, parser, stealers, &local),
+            AnyGrepper::Ext4(g) => dispatch!(g),
+            AnyGrepper::Apfs(g) => dispatch!(g),
+            AnyGrepper::Ntfs(g) => dispatch!(g),
         };
 
         debug!(
-            "[ctx] worker {worker_id} search #{search_n} done - \
+            "[ctx] worker {worker_id} search #{search_count} done - \
              files_encountered={} files_searched={} files_with_matches={}",
             result.stats.files_encountered,
             result.stats.files_searched,
@@ -435,9 +460,12 @@ fn worker_thread_main<S: MatchSink + 'static>(
         );
 
         parser = result.parser;
+        newlines_scratch = result.newlines_scratch;
+        ranges_scratch = result.ranges_scratch;
+        path_buf = result.path_buf;
         result.stats.merge_into(&job.stats);
 
-        // deposit cache data
+        // Deposit cache data
         {
             let mut acc = job.cache_acc.lock();
             acc.file_keys.extend(result.file_keys);

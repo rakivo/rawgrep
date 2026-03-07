@@ -74,6 +74,23 @@ pub struct DirWork {
     pub depth: u16
 }
 
+
+pub trait MatchSink: Send + Sync + Clone {
+    const STDOUT_NOP: bool;
+
+    fn push(&self, path: &[u8], line_num: u32, text: &[u8], ranges: &[(u32, u32)]);
+}
+
+#[derive(Copy, Clone)]
+pub struct NoSink;
+
+impl MatchSink for NoSink {
+    const STDOUT_NOP: bool = false;
+
+    #[inline(always)]
+    fn push(&self, _: &[u8], _: u32, _: &[u8], _: &[(u32, u32)]) {}
+}
+
 #[derive(Debug)]
 pub struct RawMatch {
     pub path:     Box<[u8]>,          // full file path
@@ -85,53 +102,50 @@ pub struct RawMatch {
 #[derive(Clone)]
 pub struct ChannelSink(pub Sender<RawMatch>);
 
-#[derive(Clone)]
-pub struct NoSink;
-
-pub trait MatchSink: Send + Sync + Clone {
-    const STDOUT_NOP: bool;
-
-    fn push(
-        &self,
-        path:   impl Into<Box<[u8]>>,
-        line_num: u32,
-        text:   impl Into<Box<[u8]>>,
-        ranges: impl Into<Box<[(u32, u32)]>>
-    );
-}
-
-impl MatchSink for NoSink {
-    const STDOUT_NOP: bool = false;
-
-    #[inline(always)]
-    fn push(
-        &self,
-        _: impl Into<Box<[u8]>>,
-        _: u32,
-        _: impl Into<Box<[u8]>>,
-        _: impl Into<Box<[(u32, u32)]>>
-    ) {}
-}
-
 impl MatchSink for ChannelSink {
     const STDOUT_NOP: bool = true;
 
     #[inline(always)]
     fn push(
         &self,
-        path:   impl Into<Box<[u8]>>,
+        path:   &[u8],
         line_num: u32,
-        text:   impl Into<Box<[u8]>>,
-        ranges: impl Into<Box<[(u32, u32)]>>
+        text:   &[u8],
+        ranges: &[(u32, u32)]
     ) {
         self.0.send(RawMatch {
             path:     path.into(),
-            line_num: line_num as u32,
+            line_num,
             text:     text.into(),
             ranges:   ranges.into(),
         }).ok();
     }
 }
+
+pub struct CallbackSink<F>(pub Arc<F>);
+
+impl<F> Clone for CallbackSink<F>
+where
+    F: Fn(&[u8], u32, &[u8], &[(u32, u32)]) + Send + Sync
+{
+    #[inline]
+    fn clone(&self) -> Self {
+        Self(Arc::clone(&self.0))
+    }
+}
+
+impl<F> MatchSink for CallbackSink<F>
+where
+    F: Fn(&[u8], u32, &[u8], &[(u32, u32)]) + Send + Sync
+{
+    const STDOUT_NOP: bool = true;
+
+    #[inline(always)]
+    fn push(&self, path: &[u8], line_num: u32, text: &[u8], ranges: &[(u32, u32)]) {
+        (self.0)(path, line_num, text, ranges);
+    }
+}
+
 
 pub struct OutputWorker {
     pub rx: Receiver<&'static [u8]>,
@@ -212,32 +226,38 @@ pub struct WorkerResult<'a> {
     pub file_keys: Vec<FileKey>,
     pub file_metas: Vec<FileMeta>,
 
+    pub path_buf: SmallPathBuf,
+    pub newlines_scratch: Vec<u32>,  // Reused across `find_and_print_matches` calls
+    pub ranges_scratch: Vec<(u32, u32)>,  // Reused across `find_and_print_matches` calls
+
     /// Per-fragment presence: fragment_presence[file_idx][frag_idx] = true if fragment is in file
     pub fragment_presence: Vec<SmallVec<[bool; 32]>>
 }
 
 pub struct WorkerContext<'a, 'output_arena, F: RawFs, S: MatchSink> {
-    pub chunk_carry: Option<ChunkCarry>,
-
     pub cache: Option<&'a FragmentCache>,
     pub fs: &'a F,
     pub fragment_hashes: &'a [u32],
     pub matcher: &'a Matcher,
     pub cli: &'a Cli,
-
-    pub stats: Stats,
     pub parser: Parser<'output_arena>,
-    pub newlines_buffer: Vec<u32>,  // Reused across `find_and_print_matches` calls
+    pub chunk_carry: Option<ChunkCarry>,
 
-    pub path: SmallPathBuf,
-    pub output_tx: Sender<&'static [u8]>,
-    pub worker_id: u16,
-
-    pub sink: S,
+    pub newlines_scratch: Vec<u32>,  // Reused across `find_and_print_matches` calls
+    pub ranges_scratch: Vec<(u32, u32)>,  // Reused across `find_and_print_matches` calls
 
     pub pending_file_keys: Vec<FileKey>,
     pub pending_file_metas: Vec<FileMeta>,
     pub pending_fragment_presence: Vec<SmallVec<[bool; 32]>>,
+
+    pub sink: S,
+    pub output_tx: Sender<&'static [u8]>,
+
+    pub path_buf: SmallPathBuf,
+
+    pub stats: Stats,
+
+    pub worker_id: u16,
 }
 
 impl<'a, 'output_arena, F: RawFs, S: MatchSink> WorkerContext<'a, 'output_arena, F, S> {
@@ -245,7 +265,7 @@ impl<'a, 'output_arena, F: RawFs, S: MatchSink> WorkerContext<'a, 'output_arena,
     fn init(&mut self) {
         let config = self.cli.get_buffer_config();
         self.parser.init(&config);
-        self.newlines_buffer.reserve(1024);  // 4KB @Tune @Constant
+        self.newlines_scratch.reserve(1024);  // 4KB @Tune @Constant
     }
 
     #[inline(always)]
@@ -254,6 +274,9 @@ impl<'a, 'output_arena, F: RawFs, S: MatchSink> WorkerContext<'a, 'output_arena,
         WorkerResult {
             stats: self.stats,
             parser: self.parser,
+            path_buf: self.path_buf,
+            ranges_scratch: self.ranges_scratch,
+            newlines_scratch: self.newlines_scratch,
             file_keys: self.pending_file_keys,
             file_metas: self.pending_file_metas,
             fragment_presence: self.pending_fragment_presence
@@ -295,8 +318,8 @@ impl<F: RawFs, S: MatchSink> WorkerContext<'_, '_, F, S> {
     ) -> io::Result<()> {
         let _span = tracy::span!("process_directory_with_stealing");
 
-        self.path.clear();
-        self.path.extend_from_slice(&work.path_bytes);
+        self.path_buf.clear();
+        self.path_buf.extend_from_slice(&work.path_bytes);
 
         let Ok(node) = self.fs.parse_node(work.file_id) else {
             return Ok(());
@@ -509,16 +532,16 @@ impl<F: RawFs, S: MatchSink> WorkerContext<'_, '_, F, S> {
         {
             let _span = tracy::span!("build full path");
 
-            self.path.clear();
-            self.path.extend_from_slice(parent_path);
+            self.path_buf.clear();
+            self.path_buf.extend_from_slice(parent_path);
             if likely(!parent_path.is_empty()) {
-                self.path.push(MAIN_SEPARATOR as _);
+                self.path_buf.push(MAIN_SEPARATOR as _);
             }
-            self.path.extend_from_slice(file_name);
+            self.path_buf.extend_from_slice(file_name);
         }
 
         if !self.cli.should_ignore_gitignore() && !gitignore_chain.is_empty() {
-            if gitignore_chain.is_ignored(self.path.as_ref(), false) {
+            if gitignore_chain.is_ignored(self.path_buf.as_ref(), false) {
                 self.stats.files_skipped_gitignore += 1;
                 return Ok(());
             }
@@ -557,26 +580,6 @@ impl<F: RawFs, S: MatchSink> WorkerContext<'_, '_, F, S> {
         }
 
         Ok(())
-    }
-
-    #[inline]
-    fn shrink_buffers(&mut self, max_size: usize) {
-        #[inline]
-        fn shrink_if_large(v: &mut Vec<u8>, threshold: usize, next_size: usize) {
-            if v.capacity() > threshold && v.capacity() > next_size * 4 {
-                *v = Vec::with_capacity(next_size);
-            }
-        }
-
-        shrink_if_large(&mut self.parser.file,   1 * 1024 * 1024, max_size);  // 1MB
-        shrink_if_large(&mut self.parser.dir,    1 * 1024 * 1024, 0);  // 1MB
-        shrink_if_large(&mut self.parser.chunk,  1 * 1024 * 1024, 0);  // 1MB - should stay at 512KB normally
-        shrink_if_large(&mut self.parser.scratch,  64 * 1024, 0);      // 64KB - extents are tiny
-
-        if let Some(carry) = &mut self.chunk_carry {
-            shrink_if_large(&mut carry.combine_buf, 64 * 1024, 0);     // 64KB - one line max
-            shrink_if_large(&mut carry.tail,        64 * 1024, 0);     // 64KB - one line max
-        }
     }
 
     #[inline]
@@ -690,8 +693,8 @@ impl<F: RawFs, S: MatchSink> WorkerContext<'_, '_, F, S> {
         let buf_len = buf.len();
         if buf_len == 0 { return Ok(false); }
 
-        self.newlines_buffer.clear();
-        self.newlines_buffer.extend(memchr::memchr_iter(b'\n', buf).map(|i| i as u32));
+        self.newlines_scratch.clear();
+        self.newlines_scratch.extend(memchr::memchr_iter(b'\n', buf).map(|i| i as u32));
 
         let should_print_color = should_enable_ansi_coloring();
 
@@ -700,45 +703,44 @@ impl<F: RawFs, S: MatchSink> WorkerContext<'_, '_, F, S> {
         let mut line_num = 1u32;
 
         for &newline_pos in self
-            .newlines_buffer
+            .newlines_scratch
             .iter()
             .chain([&(buf_len as u32)])
         {
             let line_end = newline_pos as usize;
             let line = &buf[line_start..line_end];
-            let mut iter = self.matcher.find_matches(line).peekable();
 
-            if iter.peek().is_some() {
+            self.ranges_scratch.clear();
+            self.ranges_scratch.extend(
+                self.matcher.find_matches(line).map(|(s, e)| (s as u32, e as u32))
+            );
+
+            if !self.ranges_scratch.is_empty() {
                 if !found_any {
                     //
                     // First match!!
                     //
 
                     found_any = true;
-                    let needed = 4096 + buf_len.min(32 * 1024); // @Constant @tune
+                    let needed = 4096 + buf_len.min(32 * 1024); // @Constant @Tune
                     if self.parser.output.capacity() - self.parser.output.len() < needed {
                         self.parser.output.reserve(needed);
                     }
-                    Self::write_file_header(&mut self.parser.output, self.cli, &self.path, should_print_color);
+                    Self::write_file_header(&mut self.parser.output, self.cli, &self.path_buf, should_print_color);
                 }
 
                 Self::write_match_line(
                     &mut self.parser.output,
                     self.cli,
-                    &self.path,
+                    &self.path_buf,
                     line,
                     line_num,
-                    iter,
+                    self.ranges_scratch.iter().copied(),
                     should_print_color,
                 );
 
                 if S::STDOUT_NOP {  // @Memory
-                    let ranges = self.matcher.find_matches(line)
-                        .map(|(s, e)| (s as _, e as _))
-                        .collect::<SmallVec<[_; 4]>>()
-                        .into_boxed_slice();
-
-                    self.sink.push(self.path.as_ref(), line_num as _, line, ranges);
+                    self.sink.push(self.path_buf.as_ref(), line_num as _, line, &self.ranges_scratch);
                 }
             }
 
@@ -779,22 +781,26 @@ impl<F: RawFs, S: MatchSink> WorkerContext<'_, '_, F, S> {
             }
         };
 
-        self.newlines_buffer.clear();
-        self.newlines_buffer.extend(memchr::memchr_iter(b'\n', data).map(|i| i as u32));
+        self.newlines_scratch.clear();
+        self.newlines_scratch.extend(memchr::memchr_iter(b'\n', data).map(|i| i as u32));
 
         let data_len = data.len();
         let mut line_start = 0usize;
 
         for &newline_pos in self
-            .newlines_buffer
+            .newlines_scratch
             .iter()
             .chain([&(process_until as u32)])
         {
             let line_end = newline_pos as usize;
             let line = &data[line_start..line_end];
-            let mut iter = self.matcher.find_matches(line).peekable();
 
-            if iter.peek().is_some() {
+            self.ranges_scratch.clear();
+            self.ranges_scratch.extend(
+                self.matcher.find_matches(line).map(|(s, e)| (s as u32, e as u32))
+            );
+
+            if !self.ranges_scratch.is_empty() {
                 if !carry.found_any {  // @Cutnpaste from find_and_print_matches
                     //
                     // First match!!
@@ -805,26 +811,21 @@ impl<F: RawFs, S: MatchSink> WorkerContext<'_, '_, F, S> {
                     if self.parser.output.capacity() - self.parser.output.len() < needed {
                         self.parser.output.reserve(needed);
                     }
-                    Self::write_file_header(&mut self.parser.output, self.cli, &self.path, should_print_color);
+                    Self::write_file_header(&mut self.parser.output, self.cli, &self.path_buf, should_print_color);
                 }
 
                 Self::write_match_line(
                     &mut self.parser.output,
                     self.cli,
-                    &self.path,
+                    &self.path_buf,
                     line,
                     carry.line_num,
-                    iter,
+                    self.ranges_scratch.iter().copied(),
                     should_print_color,
                 );
 
                 if S::STDOUT_NOP { // @Memory @Cutnpaste from find_and_print_matches
-                    let ranges = self.matcher.find_matches(line)
-                        .map(|(s, e)| (s as _, e as _))
-                        .collect::<SmallVec<[_; 4]>>()
-                        .into_boxed_slice();
-
-                    self.sink.push(self.path.as_ref(), carry.line_num as _, line, ranges);
+                    self.sink.push(self.path_buf.as_ref(), carry.line_num as _, line, &self.ranges_scratch);
                 }
             }
 
@@ -848,7 +849,7 @@ impl<F: RawFs, S: MatchSink> WorkerContext<'_, '_, F, S> {
         path:              &[u8],
         line:              &[u8],
         line_num:          u32,
-        matches:           impl Iterator<Item = (usize, usize)>,
+        matches:           impl Iterator<Item = (u32, u32)>,
         should_print_color: bool,
     ) {
         if cli.jump {
@@ -875,6 +876,9 @@ impl<F: RawFs, S: MatchSink> WorkerContext<'_, '_, F, S> {
         let display = truncate_utf8(line, 500);
         let mut last = 0;
         for (s, e) in matches {
+            let s = s as usize;
+            let e = e as usize;
+
             if s >= display.len() { break; }
 
             let e = e.min(display.len());

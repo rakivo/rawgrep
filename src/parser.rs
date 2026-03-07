@@ -65,6 +65,7 @@ pub trait RawFs: Sync + Send {
 
     fn device_file(&self) -> &File;
 
+    #[inline]
     fn read_at_offset(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
         crate::util::read_at_offset(self.device_file(), buf, offset)
     }
@@ -176,7 +177,7 @@ impl<'a> Parser<'a> {
 
         let mut file_count = 0;
         let mut dir_count = 0;
-        let mut entries = smallvec::SmallVec::new();
+        let mut entries = SmallVec::new();
 
         fs.with_directory_entries(
             &self.dir,
