@@ -5,25 +5,24 @@ use crate::{writeln_blue, writeln_green};
 
 #[derive(Default)]
 pub struct Stats {
-    pub files_searched: usize,
-    pub files_encountered: usize,
-    pub files_contained_matches: usize,
+    // Hot: Incremented almost every file
+    pub files_encountered: u32,
+    pub files_searched: u32,
+    pub bytes_searched: u64,
+    pub dirs_encountered: u32,
+    pub files_skipped_by_cache: u32,
 
-    pub bytes_searched: usize,
-
-    pub symlinks_followed: usize,
-    pub symlinks_broken: usize,
-
-    pub files_skipped_large: usize,
-    pub files_skipped_unreadable: usize,
-    pub files_skipped_as_binary_due_to_ext: usize,
-    pub files_skipped_as_binary_due_to_probe: usize,
-    pub files_skipped_gitignore: usize,
-    pub files_skipped_by_cache: usize,
-
-    pub dirs_skipped_common: usize,
-    pub dirs_skipped_gitignore: usize,
-    pub dirs_encountered: usize,
+    // Colder
+    pub files_contained_matches: u32,
+    pub files_skipped_large: u32,
+    pub files_skipped_as_binary_due_to_ext: u32,
+    pub files_skipped_as_binary_due_to_probe: u32,
+    pub files_skipped_gitignore: u32,
+    pub files_skipped_unreadable: u32,
+    pub dirs_skipped_common: u32,
+    pub dirs_skipped_gitignore: u32,
+    pub symlinks_followed: u32,
+    pub symlinks_broken: u32,
 }
 
 impl Display for Stats {
@@ -72,7 +71,7 @@ impl Display for Stats {
         writeln_blue!(f, "\nBytes Summary:")?;
         macro_rules! bytes_row {
             ($label:expr, $count:expr) => {
-                writeln!(f, "  {:<25} {:>12}", $label, $crate::util::format_bytes($count))?;
+                writeln!(f, "  {:<25} {:>12}", $label, $crate::util::format_bytes($count as _))?;
             };
         }
 
@@ -177,4 +176,3 @@ impl AtomicStats {
         }
     }
 }
-

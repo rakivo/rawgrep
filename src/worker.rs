@@ -219,45 +219,52 @@ impl ChunkCarry {
 }
 
 pub struct WorkerResult<'a> {
-    pub stats: Stats,
+    pub stats: Box<Stats>,
 
     pub parser: Parser<'a>,
 
     pub file_keys: Vec<FileKey>,
     pub file_metas: Vec<FileMeta>,
 
-    pub path_buf: SmallPathBuf,
+    pub path_buf: Box<SmallPathBuf>,
     pub newlines_scratch: Vec<u32>,  // Reused across `find_and_print_matches` calls
     pub ranges_scratch: Vec<(u32, u32)>,  // Reused across `find_and_print_matches` calls
 
-    /// Per-fragment presence: fragment_presence[file_idx][frag_idx] = true if fragment is in file
-    pub fragment_presence: Vec<SmallVec<[bool; 32]>>
+    /// Per-fragment presence: fragment_presence[file_idx * fragment_count..(file_idx + 1) * fragment_count][frag_idx] = true if fragment is in file
+    pub fragment_presence: Vec<bool>
 }
 
 pub struct WorkerContext<'a, 'output_arena, F: RawFs, S: MatchSink> {
-    pub cache: Option<&'a FragmentCache>,
-    pub fs: &'a F,
-    pub fragment_hashes: &'a [u32],
-    pub matcher: &'a Matcher,
-    pub cli: &'a Cli,
-    pub parser: Parser<'output_arena>,
-    pub chunk_carry: Option<ChunkCarry>,
+    pub fs: &'a F,                            // 0
+    pub cache: Option<&'a FragmentCache>,     // 8
+    pub fragment_hashes: &'a [u32],           // 16
+    pub matcher: &'a Matcher,                 // 32
+    pub cli: &'a Cli,                         // 40
 
-    pub newlines_scratch: Vec<u32>,  // Reused across `find_and_print_matches` calls
-    pub ranges_scratch: Vec<(u32, u32)>,  // Reused across `find_and_print_matches` calls
+    pub parser: Parser<'output_arena>,        // 48, spans lines 0-3
 
-    pub pending_file_keys: Vec<FileKey>,
-    pub pending_file_metas: Vec<FileMeta>,
-    pub pending_fragment_presence: Vec<SmallVec<[bool; 32]>>,
+    // =============== Cache line 4 ======================
 
-    pub sink: S,
-    pub output_tx: Sender<&'static [u8]>,
+    // Reused across `find_and_print_matches` calls
+    pub newlines_scratch: Vec<u32>,           // 224
+    pub ranges_scratch: Vec<(u32, u32)>,      // 248
 
-    pub path_buf: SmallPathBuf,
+    pub chunk_carry: Option<Box<ChunkCarry>>, // 272
 
-    pub stats: Stats,
+    // =============== Cache line 5 ======================
 
-    pub worker_id: u16,
+    pub pending_file_keys: Vec<FileKey>,      // 280
+    pub pending_file_metas: Vec<FileMeta>,    // 304
+    pub pending_fragment_presence: Vec<bool>, // 328
+
+    pub sink: S,                              // 352
+    pub output_tx: Sender<&'static [u8]>,     // 360
+
+    // =============== Cache line 6 ======================
+
+    pub path_buf: Box<SmallPathBuf>,          // 368
+    pub stats: Box<Stats>,                    // 376
+    pub worker_id: u16,                       // 384
 }
 
 impl<'a, 'output_arena, F: RawFs, S: MatchSink> WorkerContext<'a, 'output_arena, F, S> {
@@ -449,6 +456,8 @@ impl<F: RawFs, S: MatchSink> WorkerContext<'_, '_, F, S> {
             }
         }
 
+        self.fs.sort_entries(&mut file_entries);
+
         self.process_files(&file_entries, &work.path_bytes, &gitignore_chain)?;
 
         /// Decide how many subdirs to keep local vs push for stealing
@@ -574,9 +583,11 @@ impl<F: RawFs, S: MatchSink> WorkerContext<'_, '_, F, S> {
         };
 
         if let Some((file_key, file_meta)) = cache_key {
+            let presence = self.check_fragment_presence(found_any);
+
             self.pending_file_keys.push(file_key);
             self.pending_file_metas.push(file_meta);
-            self.pending_fragment_presence.push(self.check_fragment_presence(found_any));
+            self.pending_fragment_presence.extend_from_slice(&presence);
         }
 
         Ok(())
@@ -600,7 +611,7 @@ impl<F: RawFs, S: MatchSink> WorkerContext<'_, '_, F, S> {
         }
 
         self.stats.files_searched += 1;
-        self.stats.bytes_searched += self.parser.file.len();
+        self.stats.bytes_searched += self.parser.file.len() as u64;
 
         self.find_and_print_matches()
     }
@@ -614,11 +625,12 @@ impl<F: RawFs, S: MatchSink> WorkerContext<'_, '_, F, S> {
     ) -> io::Result<bool> {
         let _span = tracy::span!("WorkerContext::process_file_streaming");
 
-        let mut carry = self.chunk_carry.take().unwrap_or_else(ChunkCarry::new);
+        let mut carry = self.chunk_carry.take().unwrap_or_else(|| ChunkCarry::new().into());
         carry.reset();
 
         let Some(chunks) = self.fs.collect_file_chunks(
             &mut self.parser.scratch,
+            &mut self.parser.scratch2,
             node,
             max_size,
             check_binary,
@@ -660,7 +672,7 @@ impl<F: RawFs, S: MatchSink> WorkerContext<'_, '_, F, S> {
         }
 
         self.stats.files_searched += 1;
-        self.stats.bytes_searched += bytes_searched;
+        self.stats.bytes_searched += bytes_searched as u64;
 
         if carry.found_any {
             self.stats.files_contained_matches += 1;

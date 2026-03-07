@@ -1,5 +1,5 @@
 use std::path::{MAIN_SEPARATOR, MAIN_SEPARATOR_STR};
-use std::io;
+use std::io::{self, Seek};
 use std::fs::{File, OpenOptions};
 
 use bumpalo::Bump;
@@ -15,11 +15,7 @@ use crate::cache::{CacheConfig, FragmentCache};
 use crate::parser::{BufKind, FileId, FileNode, Parser, RawFs};
 use crate::worker::{MatchSink, NoSink};
 use crate::ext4::{
-    Ext4Fs,
-    EXT4_MAGIC_OFFSET,
-    EXT4_SUPERBLOCK_OFFSET,
-    EXT4_SUPERBLOCK_SIZE,
-    EXT4_SUPER_MAGIC,
+    EXT4_INODE_TABLE_OFFSET, EXT4_MAGIC_OFFSET, EXT4_SUPER_MAGIC, EXT4_SUPERBLOCK_OFFSET, EXT4_SUPERBLOCK_SIZE, Ext4Fs
 };
 
 pub struct RawGrepper<F: RawFs, S: MatchSink = NoSink> {
@@ -105,7 +101,7 @@ impl<F: RawFs, S: MatchSink> RawGrepper<F, S> {
 /// impl block for ext4-specific construction
 impl<S: MatchSink> RawGrepper<Ext4Fs, S> {
     #[inline]
-    pub fn new_ext4(cli: &Cli, _device_path: &str, file: File, sink: S) -> Result<AnyGrepper<S>> {
+    pub fn new_ext4(cli: &Cli, _device_path: &str, mut file: File, sink: S) -> Result<AnyGrepper<S>> {
         let mut sb_bytes = [0u8; EXT4_SUPERBLOCK_SIZE];
         read_at_offset(&file, &mut sb_bytes, EXT4_SUPERBLOCK_OFFSET)?;
 
@@ -123,10 +119,43 @@ impl<S: MatchSink> RawGrepper<Ext4Fs, S> {
 
         let sb = Ext4Fs::parse_superblock(&sb_bytes)?;
         let device_id = device_id(&file)?;
-        let file_size = file.metadata()?.len();
+        let file_size = file.seek(std::io::SeekFrom::End(0))?;
+        file.seek(std::io::SeekFrom::Start(0))?; // Just in case
         let max_block = file_size / sb.block_size as u64;
 
-        let fs = Ext4Fs { sb, device_id, max_block, file };
+        #[cfg(unix)]
+        unsafe {
+            use std::os::fd::AsRawFd;
+            libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_SEQUENTIAL);
+            libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_WILLNEED);
+        }
+
+        //
+        // Pre-cache inode table block offsets for all block groups
+        //
+
+        let num_blocks = max_block;
+        let num_groups = (num_blocks + sb.blocks_per_group as u64 - 1) / sb.blocks_per_group as u64;
+        let mut inode_table_blocks = Vec::with_capacity(num_groups as usize);
+        for group in 0..num_groups {
+            let bg_desc_offset = if sb.block_size == 1024 {
+                2048
+            } else {
+                sb.block_size as usize
+            } + (group as usize * sb.desc_size as usize);
+
+            let mut bg_desc_buf = [0u8; 64];
+            read_at_offset(&file, &mut bg_desc_buf[..sb.desc_size as usize], bg_desc_offset as u64)?;
+            let inode_table_block = u32::from_le_bytes([
+                bg_desc_buf[EXT4_INODE_TABLE_OFFSET + 0],
+                bg_desc_buf[EXT4_INODE_TABLE_OFFSET + 1],
+                bg_desc_buf[EXT4_INODE_TABLE_OFFSET + 2],
+                bg_desc_buf[EXT4_INODE_TABLE_OFFSET + 3],
+            ]);
+            inode_table_blocks.push(inode_table_block as u64);
+        }
+
+        let fs = Ext4Fs { sb, device_id, max_block, file, inode_table_blocks };
         Self::new_with_fs(cli, fs, sink).map(AnyGrepper::Ext4)
     }
 }

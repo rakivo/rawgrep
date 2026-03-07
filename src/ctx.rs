@@ -8,7 +8,6 @@ use bumpalo::Bump;
 use parking_lot::{Condvar, Mutex, RwLock};
 
 use ::tracing::debug;
-use smallvec::SmallVec;
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use crossbeam_deque::{Injector, Stealer, Worker as DequeWorker};
 
@@ -26,7 +25,7 @@ use crate::worker::{DirWork, MatchSink, OutputWorker, WorkItem, WorkerContext, W
 struct CacheAccumulator {
     file_keys:          Vec<FileKey>,
     file_metas:         Vec<FileMeta>,
-    fragment_presence:  Vec<SmallVec<[bool; 32]>>,
+    fragment_presence:  Vec<bool>,
 }
 
 /// Per-search data, swapped atomically between searches.
@@ -345,7 +344,7 @@ fn dispatch_worker<'a, 'b, F: RawFs, S: MatchSink>(
     ctx: &RawGrepCtx<S>,
 
     parser: Parser<'a>,
-    path_buf: SmallPathBuf,
+    path_buf: Box<SmallPathBuf>,
     newlines_scratch: Vec<u32>,
     ranges_scratch: Vec<(u32, u32)>,
 
@@ -361,7 +360,7 @@ fn dispatch_worker<'a, 'b, F: RawFs, S: MatchSink>(
         cli:              g.cli(),
         sink:             g.sink.clone(),
         output_tx:        ctx.output_tx.clone(),
-        stats:            Stats::default(),
+        stats:            Default::default(),
         parser:           parser,
         path_buf,
         newlines_scratch,
@@ -394,7 +393,7 @@ fn worker_thread_main<S: MatchSink + 'static>(
     // Parser buffers are owned by the thread and reused across searches,
     // saving allocations on every search restart.
     let mut parser = Parser::new(&output_buffer_arena);
-    let mut path_buf = SmallPathBuf::new();
+    let mut path_buf = Box::new(SmallPathBuf::new());
     let mut newlines_scratch = Vec::new();
     let mut ranges_scratch = Vec::new();
 

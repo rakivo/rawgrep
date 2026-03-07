@@ -79,6 +79,9 @@ pub trait RawFs: Sync + Send {
     /// Parse file node by ID
     fn parse_node(&self, file_id: FileId) -> io::Result<Self::Node>;
 
+    #[inline]
+    fn sort_entries(&self, _entries: &mut [(FileId, BufFatPtr)]) {}
+
     /// Read file content into buffer, returns false if binary detected
     fn read_file_content(
         &self,
@@ -92,6 +95,7 @@ pub trait RawFs: Sync + Send {
     fn collect_file_chunks(
         &self,
         _scratch: &mut Vec<u8>,
+        _scratch2: &mut Vec<u8>,
         _node: &Self::Node,
         _max_size: usize,
         _check_binary: bool,
@@ -117,14 +121,20 @@ pub struct DirScanResult<const N: usize = 64> {
 
 /// Filesystem-agnostic parser with reusable buffers
 pub struct Parser<'a> {
-    pub file: Vec<u8>,
-    pub dir: Vec<u8>,
-    pub gitignore: Vec<u8>,
-    pub chunk: Vec<u8>,
-    // Filesystem-specific scratch space (used by RawFs implementations)
-    pub scratch: Vec<u8>,
+    pub file: Vec<u8>,                      // 0
+    // Filesystem-specific scratch space
+    pub scratch: Vec<u8>,                   // 24
+    pub scratch2: Vec<u8>,                  // 48
 
-    pub output: BumpVec<'a, u8>,
+    // =============== Cache line ======================
+
+    pub dir: Vec<u8>,                       // 72
+    pub gitignore: Vec<u8>,                 // 96
+    pub output: BumpVec<'a, u8>,            // 120
+
+    // =============== Cache line ======================
+
+    pub chunk: Vec<u8>,
 }
 
 impl<'a> Parser<'a> {
@@ -136,6 +146,7 @@ impl<'a> Parser<'a> {
             gitignore: Vec::new(),
             output: BumpVec::new_in(bump),
             scratch: Vec::new(),
+            scratch2: Vec::new(),
             chunk: Vec::new()
         }
     }

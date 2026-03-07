@@ -1,10 +1,8 @@
 //! ext4 filesystem implementation of RawFs trait
 
 use crate::tracy;
-use crate::copy_data;
 use crate::util::{likely, unlikely};
-use crate::worker::MAX_EXTENTS_UNTIL_SPILL;
-use crate::parser::{BufKind, FileId, FileNode, FileType, Parser, RawFs, binary_probe};
+use crate::parser::{BufFatPtr, BufKind, FileId, FileNode, FileType, Parser, RawFs, binary_probe};
 use crate::worker::STREAMING_CHUNK_SIZE;
 
 use super::*;
@@ -21,6 +19,7 @@ pub struct Ext4Fs {
     pub sb: Ext4SuperBlock,
     pub device_id: u64,
     pub max_block: u64,
+    pub inode_table_blocks: Vec<u64>,
 }
 
 impl FileNode for Ext4Inode {
@@ -79,35 +78,12 @@ impl RawFs for Ext4Fs {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "Invalid inode number 0"));
         }
 
-        let group = (inode_num - 1) / self.sb.inodes_per_group;
-        let index = (inode_num - 1) % self.sb.inodes_per_group;
-
-        let bg_desc_offset = if self.sb.block_size == 1024 {
-            2048
-        } else {
-            self.sb.block_size as usize
-        } + (group as usize * self.sb.desc_size as usize);
-
-        let mut bg_desc_buf = [0u8; 64]; // desc_size is at most 64 bytes
-        let desc_size = self.sb.desc_size as usize;
-        self.read_at_offset(&mut bg_desc_buf[..desc_size], bg_desc_offset as u64)?;
-
-        let inode_table_block = u32::from_le_bytes([
-            bg_desc_buf[EXT4_INODE_TABLE_OFFSET + 0],
-            bg_desc_buf[EXT4_INODE_TABLE_OFFSET + 1],
-            bg_desc_buf[EXT4_INODE_TABLE_OFFSET + 2],
-            bg_desc_buf[EXT4_INODE_TABLE_OFFSET + 3],
-        ]);
-
-        let inode_offset = inode_table_block as usize *
-            self.sb.block_size as usize +
-            index as usize *
-            self.sb.inode_size as usize;
+        let inode_offset = self.inode_disk_offset(file_id);
 
         let mut inode_buf = [0u8; 512]; // inode_size is at most 512 bytes in practice
         let inode_size = self.sb.inode_size as usize;
         let to_read = inode_size.min(inode_buf.len());
-        self.read_at_offset(&mut inode_buf[..to_read], inode_offset as _)?;
+        self.read_at_offset(&mut inode_buf[..to_read], inode_offset as _)?;          // @Cache @Syscall
 
         let raw = bytemuck::try_from_bytes::<raw::Ext4Inode>(
             &inode_buf[..std::mem::size_of::<raw::Ext4Inode>().min(to_read)]
@@ -158,6 +134,11 @@ impl RawFs for Ext4Fs {
     }
 
     #[inline]
+    fn sort_entries(&self, entries: &mut [(FileId, BufFatPtr)]) {
+        entries.sort_unstable_by_key(|(file_id, _)| self.inode_disk_offset(*file_id));
+    }
+
+    #[inline]
     fn read_file_content(
         &self,
         parser: &mut Parser,
@@ -181,6 +162,7 @@ impl RawFs for Ext4Fs {
 
         let Some(chunks) = self.collect_file_chunks(
             &mut parser.scratch,
+            &mut parser.scratch2,
             node,
             size_to_read,
             check_binary,
@@ -206,6 +188,7 @@ impl RawFs for Ext4Fs {
     fn collect_file_chunks(
         &self,
         scratch: &mut Vec<u8>,
+        scratch2: &mut Vec<u8>, // For probe
         node: &Ext4Inode,
         max_size: usize,
         check_binary: bool,
@@ -220,22 +203,25 @@ impl RawFs for Ext4Fs {
             return Ok(Some(SmallVec::new()));
         }
 
+        scratch.clear();
+
+        scratch2.clear();
+        scratch2.resize(8192, 0); // @Cleanup
+        let probe_scratch: &mut [u8] = bytemuck::cast_slice_mut(scratch2);
+
         if node.flags & EXT4_EXTENTS_FL != 0 {
             //
             // Parse extents into scratch
             //
-
-            scratch.clear();
             let block_bytes = bytemuck::cast_slice(&node.blocks);
             self.parse_extent_node_into(scratch, block_bytes, 0)?;
 
-            let extents: SmallVec<[_; MAX_EXTENTS_UNTIL_SPILL]> = copy_data(Self::scratch_as_extents(scratch));
+            let extents = Self::scratch_as_extents(scratch);
 
             if check_binary {
                 // Binary probe
                 if let Some(first) = extents.first() {
-                    let mut probe = [0u8; 8192];  // ext4 block size is at most 8192 bytes
-                    let probe = &mut probe[..block_size as usize];
+                    let probe = &mut probe_scratch[..block_size as usize];
 
                     let offset = first.start * block_size;
                     if self.read_at_offset(probe, offset).is_err() {
@@ -250,7 +236,7 @@ impl RawFs for Ext4Fs {
             let mut chunks = SmallVec::new();
             let mut total = 0usize;
 
-            for extent in &extents {
+            for extent in extents {
                 if total >= max_size { break; }
                 let extent_bytes = extent.len as usize * block_size as usize;
                 let mut extent_offset = 0usize;
@@ -274,22 +260,18 @@ impl RawFs for Ext4Fs {
             // Direct blocks
             //
 
-            let blocks: SmallVec<[_; EXT4_BLOCK_POINTERS_COUNT]> = node
-                .blocks.iter()
-                .take(EXT4_BLOCK_POINTERS_COUNT)
-                .filter(|&&b| b != 0 && (b as u64) < self.max_block)
-                .map(|&b| b as u64)
-                .collect();
+            scratch.extend_from_slice(bytemuck::cast_slice(&node.blocks[..EXT4_BLOCK_POINTERS_COUNT]));
 
-            if blocks.is_empty() {
+            let blocks: &[u64] = bytemuck::cast_slice(scratch);
+
+            if blocks.iter().all(|&b| b == 0 || b >= self.max_block) {
                 return Ok(Some(SmallVec::new()));
             }
 
             if check_binary {
                 // Binary probe
-                if let Some(&first) = blocks.first() {
-                    let mut probe = [0u8; 8192];  // ext4 block size is at most 8192 bytes
-                    let probe = &mut probe[..block_size as usize];
+                if let Some(&first) = blocks.iter().find(|&&b| b != 0 && b < self.max_block) {
+                    let probe = &mut probe_scratch[..block_size as usize];
 
                     let to_read = (block_size as usize).min(probe.len());
                     let n = self.read_at_offset(&mut probe[..to_read], first * block_size).unwrap_or(0);
@@ -302,7 +284,8 @@ impl RawFs for Ext4Fs {
             let mut chunks = SmallVec::new();
             let mut total = 0usize;
 
-            for &block_num in &blocks {
+            for &block_num in blocks.iter() {
+                if block_num == 0 || block_num >= self.max_block { continue; }
                 if total >= max_size { break; }
 
                 let remaining = max_size - total;
@@ -375,6 +358,14 @@ impl RawFs for Ext4Fs {
 
 // ext4-specific helper methods
 impl Ext4Fs {
+    #[inline]
+    pub fn inode_disk_offset(&self, inode_num: u64) -> u64 {
+        let group = (inode_num - 1) / self.sb.inodes_per_group as u64;
+        let index = (inode_num - 1) % self.sb.inodes_per_group as u64;
+        self.inode_table_blocks[group as usize] * self.sb.block_size as u64
+            + index * self.sb.inode_size as u64
+    }
+
     /// Read inline data from inode's block array (max 60 bytes)
     #[inline]
     fn read_inline_data(

@@ -7,8 +7,6 @@ use std::io::{self};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use smallvec::SmallVec;
-
 const FILE_LOOKUP_EMPTY: u32 = u32::MAX;
 
 /// Uniquely identifies a file across reboots
@@ -1003,7 +1001,7 @@ impl<S: CacheStorage> FragmentCache<S> {
         file_keys: Vec<FileKey>,
         file_metas: Vec<FileMeta>,
         fragment_hashes: &[u32],
-        fragment_presence: Vec<SmallVec<[bool; 32]>>,
+        fragment_presence: Vec<bool>,
     ) -> io::Result<()> {
         if file_keys.is_empty() {
             return Ok(());
@@ -1018,6 +1016,7 @@ impl<S: CacheStorage> FragmentCache<S> {
         self.ensure_capacity(needed_capacity);
 
         let start = Instant::now();
+        let fragment_count = fragment_hashes.len();
 
         //
         //
@@ -1030,14 +1029,15 @@ impl<S: CacheStorage> FragmentCache<S> {
         // ------- Track the original num_files to know which files are new
         let original_num_files = self.num_files.load(Ordering::Relaxed) as usize;
 
-        for i in 0..file_keys.len() {
-            let file_key = file_keys[i];
-            let file_meta = file_metas[i];
-            let presence = &fragment_presence[i];
+        for file_idx in 0..file_keys.len() {
             let num_files = self.num_files.load(Ordering::Relaxed) as usize;
             if num_files >= self.file_capacity {
-                break; // at capacity (will grow on next merge if more files)
+                break; // At capacity (will grow on next merge if more files)
             }
+
+            let file_key = file_keys[file_idx];
+            let file_meta = file_metas[file_idx];
+            let presence = &fragment_presence[file_idx * fragment_count..(file_idx + 1) * fragment_count];
 
             // --------- Find or insert file
             let file_id = match self.lookup_file_id(file_key) {

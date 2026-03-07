@@ -90,6 +90,7 @@ impl RawFs for NtfsFs {
 
         let Some(chunks) = self.collect_file_chunks(
             &mut parser.scratch,
+            &mut parser.scratch2,
             node,
             size_to_read,
             check_binary,
@@ -115,7 +116,8 @@ impl RawFs for NtfsFs {
 
     fn collect_file_chunks(
         &self,
-        _scratch: &mut Vec<u8>,   // unused for NTFS cuz runlists are decoded inline
+        _scratch: &mut Vec<u8>,    // unused for NTFS cuz runlists are decoded inline
+        _scratch2: &mut Vec<u8>,   // unused for NTFS cuz runlists are decoded inline
         node: &NtfsNode,
         max_size: usize,
         check_binary: bool,
