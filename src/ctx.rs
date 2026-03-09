@@ -19,7 +19,7 @@ use crate::parser::{Parser, RawFs};
 use crate::cache::{FileKey, FileMeta};
 use crate::stats::{AtomicStats, Stats};
 use crate::grep::{AnyGrepper, FsType, RawGrepper, open_device_and_detect_fs};
-use crate::worker::{DirWork, MatchSink, OutputWorker, WorkItem, WorkerContext, WorkerResult};
+use crate::worker::{DirWork, FileWork, MatchSink, OutputWorker, WorkItem, WorkerContext, WorkerResult};
 
 #[derive(Default)]
 struct CacheAccumulator {
@@ -317,14 +317,25 @@ impl<S: MatchSink + 'static> RawGrepCtx<S> {
         // Push root work item and wake workers
         //
 
-        self.injector.push(WorkItem::Directory(DirWork {
-            depth: 0,
-            file_id:         root_file_id,
-            path_bytes:      Arc::default(),
-            gitignore_chain: root_gitignore
-                .map(crate::ignore::GitignoreChain::from_root)
-                .unwrap_or_default(),
-        }));
+        let work = if std::fs::metadata(&search_root).is_ok_and(|m| m.is_file()) {
+            WorkItem::File(FileWork {
+                file_id:         root_file_id,
+                path_bytes:      Arc::default(),
+                gitignore_chain: root_gitignore
+                    .map(crate::ignore::GitignoreChain::from_root)
+                    .unwrap_or_default(),
+            })
+        } else {
+            WorkItem::Directory(DirWork {
+                depth: 0,
+                file_id:         root_file_id,
+                path_bytes:      Arc::default(),
+                gitignore_chain: root_gitignore
+                    .map(crate::ignore::GitignoreChain::from_root)
+                    .unwrap_or_default(),
+            })
+        };
+        self.injector.push(work);
         debug!("[ctx] root work item pushed to injector");
 
         self.running.store(true, Ordering::SeqCst);

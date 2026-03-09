@@ -64,7 +64,14 @@ pub const MAX_EXTENTS_UNTIL_SPILL: usize = 64; // @Tune
 pub const __MAX_FILE_BYTE_SIZE: usize = 8 * 1024 * 1024; // @Tune
 
 pub enum WorkItem {
+    File(FileWork),
     Directory(DirWork)
+}
+
+pub struct FileWork {
+    pub file_id: FileId,
+    pub path_bytes: Arc<[u8]>,
+    pub gitignore_chain: GitignoreChain,
 }
 
 pub struct DirWork {
@@ -375,6 +382,32 @@ impl<F: RawFs, S: MatchSink> WorkerContext<'_, '_, F, S> {
         Ok(())
     }
 
+    #[inline]
+    pub fn dispatch_file(&mut self, work: FileWork) -> io::Result<()> {
+        let Ok(node) = self.fs.parse_node(work.file_id) else {
+            return Ok(());
+        };
+
+        let name_offset = work.path_bytes
+            .iter()
+            .rposition(|&b| b == MAIN_SEPARATOR as u8)
+            .map(|pos| pos + 1)
+            .unwrap_or(0);
+
+        let name_fat_ptr = BufFatPtr {
+            offset: name_offset as _,
+            kind: BufKind::File,
+            len: (work.path_bytes.len() - name_offset) as _,
+        };
+
+        self.path_buf.clear();
+        self.path_buf.extend_from_slice(&work.path_bytes);
+
+        self.process_file(&node, name_fat_ptr, &work.path_bytes, &work.gitignore_chain)?;
+
+        Ok(())
+    }
+
     fn process_directory(
         &mut self,
         work: DirWork,
@@ -613,7 +646,7 @@ impl<F: RawFs, S: MatchSink> WorkerContext<'_, '_, F, S> {
         self.stats.files_searched += 1;
         self.stats.bytes_searched += self.parser.file.len() as u64;
 
-        self.find_and_print_matches()
+        self.find_and_print_matches(node.is_dir())
     }
 
     #[inline(never)]
@@ -659,14 +692,14 @@ impl<F: RawFs, S: MatchSink> WorkerContext<'_, '_, F, S> {
             carry.tail.clear();
 
             let combined = std::mem::take(&mut carry.combine_buf);
-            self.find_and_print_matches_in_chunk(&combined, &mut carry, false)?;
+            self.find_and_print_matches_in_chunk(&combined, &mut carry, false, node.is_dir())?;
             carry.combine_buf = combined;
         }
 
         // Flush final partial line (no trailing newline)
         if !carry.tail.is_empty() {
             let tail = std::mem::take(&mut carry.tail);
-            self.find_and_print_matches_in_chunk(&tail, &mut carry, true)?;
+            self.find_and_print_matches_in_chunk(&tail, &mut carry, true, node.is_dir())?;
             carry.tail = tail;
             carry.tail.clear();
         }
@@ -698,7 +731,7 @@ impl<F: RawFs, S: MatchSink> WorkerContext<'_, '_, F, S> {
 
 // impl block for printng matches
 impl<F: RawFs, S: MatchSink> WorkerContext<'_, '_, F, S> {
-    fn find_and_print_matches(&mut self) -> io::Result<bool> {
+    fn find_and_print_matches(&mut self, is_dir: bool) -> io::Result<bool> {
         let _span = tracy::span!("find_and_print_matches");
 
         let buf = &self.parser.file;
@@ -738,7 +771,7 @@ impl<F: RawFs, S: MatchSink> WorkerContext<'_, '_, F, S> {
                     if self.parser.output.capacity() - self.parser.output.len() < needed {
                         self.parser.output.reserve(needed);
                     }
-                    Self::write_file_header(&mut self.parser.output, self.cli, &self.path_buf, should_print_color);
+                    Self::write_file_header(&mut self.parser.output, self.cli, &self.path_buf, should_print_color, is_dir);
                 }
 
                 Self::write_match_line(
@@ -772,7 +805,8 @@ impl<F: RawFs, S: MatchSink> WorkerContext<'_, '_, F, S> {
         &mut self,
         data: &[u8],
         carry: &mut ChunkCarry,
-        is_last: bool
+        is_last: bool,
+        is_dir: bool
     ) -> io::Result<()> {
         let _span = tracy::span!("match_chunk");
 
@@ -823,7 +857,7 @@ impl<F: RawFs, S: MatchSink> WorkerContext<'_, '_, F, S> {
                     if self.parser.output.capacity() - self.parser.output.len() < needed {
                         self.parser.output.reserve(needed);
                     }
-                    Self::write_file_header(&mut self.parser.output, self.cli, &self.path_buf, should_print_color);
+                    Self::write_file_header(&mut self.parser.output, self.cli, &self.path_buf, should_print_color, is_dir);
                 }
 
                 Self::write_match_line(
@@ -913,6 +947,7 @@ impl<F: RawFs, S: MatchSink> WorkerContext<'_, '_, F, S> {
         cli:               &Cli,
         path:              &[u8],
         should_print_color: bool,
+        is_dir: bool
     ) {
         if cli.jump { return; } // jump mode writes path per-line, not as a header
 
@@ -922,7 +957,7 @@ impl<F: RawFs, S: MatchSink> WorkerContext<'_, '_, F, S> {
         let ends_with_slash = root.last() == Some(&(MAIN_SEPARATOR as _));
 
         output.extend_from_slice(root);
-        if !ends_with_slash { output.push(MAIN_SEPARATOR as _); }
+        if is_dir && !ends_with_slash { output.push(MAIN_SEPARATOR as _); }
         output.extend_from_slice(path);
 
         if should_print_color { output.extend_from_slice(COLOR_RESET.as_bytes()); }
@@ -996,6 +1031,10 @@ impl<'a, 'output_arena, F: RawFs, S: MatchSink> WorkerContext<'a, 'output_arena,
                                 local_worker,
                                 injector,
                             );
+                        }
+
+                        WorkItem::File(file_work) => {
+                            _ = self.dispatch_file(file_work);
                         }
                     }
 
