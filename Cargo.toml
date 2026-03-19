@@ -14,7 +14,7 @@ build = "build.rs"
 rust-version = "1.85.1"
 
 [features]
-default = ["dep:mimalloc", "full"]
+default = ["mimalloc", "full"]
 use_nightly = []
 
 # profiling
