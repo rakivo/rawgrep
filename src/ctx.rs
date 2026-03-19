@@ -348,7 +348,8 @@ impl<S: MatchSink + 'static> RawGrepCtx<S> {
     }
 }
 
-fn dispatch_worker<'a, 'b, F: RawFs, S: MatchSink>(
+#[allow(clippy::too_many_arguments)] // @Cleanup
+fn dispatch_worker<'a, F: RawFs, S: MatchSink>(
     worker_id:      u16,
 
     g: &RawGrepper<F, S>,
@@ -372,7 +373,7 @@ fn dispatch_worker<'a, 'b, F: RawFs, S: MatchSink>(
         sink:             g.sink.clone(),
         output_tx:        ctx.output_tx.clone(),
         stats:            Default::default(),
-        parser:           parser,
+        parser,
         path_buf,
         newlines_scratch,
         ranges_scratch,

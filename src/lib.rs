@@ -5,7 +5,9 @@
     clippy::identity_op,
     clippy::collapsible_if,
     clippy::module_inception,
-    clippy::only_used_in_recursion
+    clippy::new_without_default,
+    clippy::only_used_in_recursion,
+    clippy::doc_overindented_list_items,
 )]
 
 #[cfg(all(feature = "small", feature = "full"))]

@@ -182,7 +182,7 @@ impl OutputWorker {
                 recv(self.flush_req_rx) -> _ => {
                     // Drain remaining output first
                     for buf in self.rx.try_iter() {
-                        _ = self.writer.write_all(&buf);
+                        _ = self.writer.write_all(buf);
                     }
 
                     _ = self.writer.flush();
@@ -308,7 +308,9 @@ impl<'a, 'output_arena, F: RawFs, S: MatchSink> WorkerContext<'a, 'output_arena,
             return;
         }
 
-        _ = self.output_tx.send(unsafe { core::mem::transmute(self.parser.output.as_slice()) });
+        _ = self.output_tx.send(unsafe {  // @Cleanup
+            core::mem::transmute::<&[u8], &[u8]>(self.parser.output.as_slice())
+        });
         self.parser.output.clear();
     }
 

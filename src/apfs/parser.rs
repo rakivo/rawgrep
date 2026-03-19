@@ -399,7 +399,7 @@ impl ApfsFs {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "Block too small for btree node"));
         }
         bytemuck::try_from_bytes::<raw::BtreeNodePhys>(&block[..sz])
-            .map(|r| *r)
+            .copied()
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Corrupt btree node header"))
     }
 

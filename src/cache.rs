@@ -1329,7 +1329,6 @@ impl<S: CacheStorage> FragmentCache<S> {
 mod tests {
     use super::*;
     use proptest::prelude::*;
-    use smallvec::SmallVec;
 
     // --- Helpers --------------------------------------------------------------
 
@@ -1413,7 +1412,7 @@ mod tests {
             vec![key(42)],
             vec![meta(1234, 5678)],
             &[hash],
-            vec![SmallVec::from_slice(&[false])],
+            vec![false],
         ).unwrap();
 
         assert!(cache.can_skip_file(key(42), meta(1234, 5678), &[hash]));
@@ -1428,7 +1427,7 @@ mod tests {
             vec![key(1)],
             vec![meta(1, 1)],
             &[hash],
-            vec![SmallVec::from_slice(&[true])],
+            vec![true],
         ).unwrap();
 
         assert!(!cache.can_skip_file(key(1), meta(1, 1), &[hash]));
@@ -1441,9 +1440,7 @@ mod tests {
 
         let file_keys:  Vec<FileKey>  = (0..500).map(key).collect();
         let file_metas: Vec<FileMeta> = (0..500).map(|i| meta(i, i as u64)).collect();
-        let presences: Vec<SmallVec<[bool; 32]>> = (0..500)
-            .map(|_| SmallVec::from_slice(&[false]))
-            .collect();
+        let presences: Vec<bool> = (0..500).map(|_| false).collect();
 
         cache.merge_updates(file_keys.clone(), file_metas.clone(), &[hash], presences).unwrap();
 
@@ -1466,14 +1463,14 @@ mod tests {
         let hashes: Vec<u32> = (0..4).map(|i| i as u32 * 0x1111).collect();
         cache.merge_updates(
             vec![k], vec![m], &hashes,
-            vec![SmallVec::from_slice(&[false, false, false, false])],
+            vec![false, false, false, false],
         ).unwrap();
 
         // 5th fragment evicts slot 0
         let new_hash = 0xDEAD_DEAD_u32;
         cache.merge_updates(
             vec![k], vec![m], &[new_hash],
-            vec![SmallVec::from_slice(&[false])],
+            vec![false],
         ).unwrap();
 
         // evicted fragment -> unknown -> cannot skip
@@ -1491,9 +1488,9 @@ mod tests {
             let k = key(round as u64);
             let m = meta(round as i64, round as u64);
             let hashes: Vec<u32> = (0..MAX).map(|i| round * 100 + i as u32).collect();
-            let presence: SmallVec<[bool; 32]> = hashes.iter().map(|_| false).collect();
+            let presence: Vec<bool> = hashes.iter().map(|_| false).collect();
 
-            cache.merge_updates(vec![k], vec![m], &hashes, vec![presence]).unwrap();
+            cache.merge_updates(vec![k], vec![m], &hashes, presence).unwrap();
         }
 
         let _ = cache.memory_usage(); // just assert no corruption
@@ -1513,8 +1510,7 @@ mod tests {
             let m = meta(1, 1);
 
             for _ in 0..num_rounds {
-                let presence: Vec<SmallVec<[bool; 32]>> =
-                    vec![hashes.iter().map(|_| false).collect()];
+                let presence: Vec<bool> = hashes.iter().map(|_| false).collect();
                 cache.merge_updates(vec![k], vec![m], &hashes, presence).unwrap();
             }
 
@@ -1531,8 +1527,7 @@ mod tests {
 
             let keys:   Vec<FileKey>  = (0..num_files).map(|i| key(seed ^ i as u64)).collect();
             let metas:  Vec<FileMeta> = (0..num_files).map(|i| meta(i as i64, i as u64)).collect();
-            let presences: Vec<SmallVec<[bool; 32]>> =
-                (0..num_files).map(|_| SmallVec::from_slice(&[false])).collect();
+            let presences: Vec<bool> = (0..num_files).map(|_| false).collect();
 
             cache.merge_updates(keys.clone(), metas.clone(), &[hash], presences).unwrap();
 
@@ -1592,7 +1587,7 @@ mod tests {
             let mut cache = FragmentCache::new(&config).unwrap();
             cache.merge_updates(
                 vec![k], vec![m], &[hash],
-                vec![SmallVec::from_slice(&[false])],
+                vec![false],
             ).unwrap();
             cache.save_to_disk().unwrap();
         }
@@ -1620,8 +1615,8 @@ mod tests {
 
             {
                 let mut cache = FragmentCache::new(&config).unwrap();
-                let presence: SmallVec<[bool; 32]> = hashes.iter().map(|_| false).collect();
-                cache.merge_updates(vec![k], vec![m], &hashes, vec![presence]).unwrap();
+                let presence: Vec<bool> = hashes.iter().map(|_| false).collect();
+                cache.merge_updates(vec![k], vec![m], &hashes, presence).unwrap();
                 cache.save_to_disk().unwrap();
             }
 
@@ -1653,7 +1648,7 @@ mod tests {
             let mut cache = FragmentCache::new(&config).unwrap();
             cache.merge_updates(
                 vec![k1], vec![m1], &[hash1],
-                vec![SmallVec::from_slice(&[false])],
+                vec![false],
             ).unwrap();
             cache.save_to_disk().unwrap();
         }
@@ -1667,7 +1662,7 @@ mod tests {
             let m2    = meta(2, 2);
             cache.merge_updates(
                 vec![k2], vec![m2], &[hash2],
-                vec![SmallVec::from_slice(&[false])],
+                vec![false],
             ).unwrap();
 
             assert!(cache.can_skip_file(k1, m1, &[hash1]), "old file lost after CoW");
@@ -1687,7 +1682,7 @@ mod tests {
         let mut cache = FragmentCache::new_in_memory(64, 64);
         cache.merge_updates(
             vec![k], vec![m], &[hash],
-            vec![SmallVec::from_slice(&[true])], // PRESENT
+            vec![true], // PRESENT
         ).unwrap();
 
         assert!(!cache.can_skip_file(k, m, &[hash]),
@@ -1708,7 +1703,7 @@ mod tests {
         // First scan: absent
         cache.merge_updates(
             vec![k], vec![m1], &[hash],
-            vec![SmallVec::from_slice(&[false])],
+            vec![false],
         ).unwrap();
 
         assert!(cache.can_skip_file(k, m1, &[hash]), "should be skippable after absent");
@@ -1716,7 +1711,7 @@ mod tests {
         // Second scan: present (file was modified)
         cache.merge_updates(
             vec![k], vec![m2], &[hash],
-            vec![SmallVec::from_slice(&[true])],
+            vec![true],
         ).unwrap();
 
         assert!(!cache.can_skip_file(k, m2, &[hash]),
@@ -1737,7 +1732,7 @@ mod tests {
         // Register file with fragment A present
         cache.merge_updates(
             vec![k], vec![m], &[hash_a],
-            vec![SmallVec::from_slice(&[true])],
+            vec![true],
         ).unwrap();
 
         assert!(!cache.can_skip_file(k, m, &[hash_a]),
@@ -1747,7 +1742,7 @@ mod tests {
         // This changes num_fragments and potentially bits_per_file_u64
         cache.merge_updates(
             vec![key(99)], vec![meta(99, 99)], &[hash_b],
-            vec![SmallVec::from_slice(&[false])],
+            vec![false],
         ).unwrap();
 
         // File 1 still has fragment A present - must NOT be skippable
@@ -1765,21 +1760,21 @@ mod tests {
 
         // Fill 63 fragments as absent to push indices to boundary
         let filler: Vec<u32> = (0u32..63).map(|i| i * 7 + 1).collect();
-        let filler_presence: SmallVec<[bool; 32]> = filler.iter().map(|_| false).collect();
-        cache.merge_updates(vec![k], vec![m], &filler, vec![filler_presence]).unwrap();
+        let filler_presence: Vec<bool> = filler.iter().map(|_| false).collect();
+        cache.merge_updates(vec![k], vec![m], &filler, filler_presence).unwrap();
 
         // Fragment at index 63 (last bit of first u64) - present
         let hash_63 = 0xBEEF_0063_u32;
         cache.merge_updates(
             vec![k], vec![m], &[hash_63],
-            vec![SmallVec::from_slice(&[true])],
+            vec![true],
         ).unwrap();
 
         // Fragment at index 64 (first bit of second u64) - present
         let hash_64 = 0xBEEF_0064_u32;
         cache.merge_updates(
             vec![k], vec![m], &[hash_64],
-            vec![SmallVec::from_slice(&[true])],
+            vec![true],
         ).unwrap();
 
         assert!(!cache.can_skip_file(k, m, &[hash_63]),
@@ -1800,8 +1795,7 @@ mod tests {
         let keys:   Vec<FileKey>  = (0..file_count).map(|i| key(i as u64)).collect();
         let metas:  Vec<FileMeta> = (0..file_count).map(|i| meta(i as i64, i as u64)).collect();
         // All files have fragment present
-        let presences: Vec<SmallVec<[bool; 32]>> =
-            (0..file_count).map(|_| SmallVec::from_slice(&[true])).collect();
+        let presences: Vec<bool> = (0..file_count).map(|_| true).collect();
 
         cache.merge_updates(keys.clone(), metas.clone(), &[hash], presences).unwrap();
 
@@ -1826,7 +1820,7 @@ mod tests {
         // Register target file with target fragment PRESENT
         cache.merge_updates(
             vec![target_key], vec![target_meta], &[target_hash],
-            vec![SmallVec::from_slice(&[true])],
+            vec![true],
         ).unwrap();
 
         // Now flood with other fragments to force ring buffer eviction of target_hash's slot
@@ -1836,7 +1830,7 @@ mod tests {
             let filler_meta = meta(i as i64, i as u64);
             cache.merge_updates(
                 vec![filler_key], vec![filler_meta], &[filler_hash],
-                vec![SmallVec::from_slice(&[false])],
+                vec![false],
             ).unwrap();
         }
 
@@ -1865,7 +1859,7 @@ mod tests {
         let mut cache = FragmentCache::new_in_memory(64, 64);
         cache.merge_updates(
             vec![k], vec![m], &[hash_a, hash_b, hash_c],
-            vec![SmallVec::from_slice(&[false, true, false])], // A absent, B present, C absent
+            vec![false, true, false], // A absent, B present, C absent
         ).unwrap();
 
         // A is absent -> can_skip returns true (skip because A definitely not in file)
@@ -1912,9 +1906,7 @@ mod tests {
                 })
                 .collect();
 
-            let presences: Vec<SmallVec<[bool; 32]>> = presence_table.iter()
-                .map(|p| p.iter().copied().collect())
-                .collect();
+            let presences: Vec<bool> = presence_table.iter().flat_map(|p| p.iter().copied()).collect();
 
             cache.merge_updates(keys.clone(), metas.clone(), &hashes, presences).unwrap();
 
@@ -1954,8 +1946,7 @@ mod tests {
 
                 // Alternate: even rounds present, odd rounds absent
                 let present = round % 2 == 0;
-                let presences: Vec<SmallVec<[bool; 32]>> =
-                    vec![round_hashes.iter().map(|_| present).collect()];
+                let presences: Vec<bool> = round_hashes.iter().map(|_| present).collect();
 
                 cache.merge_updates(vec![k], vec![m], &round_hashes, presences).unwrap();
 
@@ -1996,8 +1987,7 @@ mod tests {
 
         // Register all files with a known present fragment
         let anchor_hash = 0xA1C4_0000_u32;
-        let anchor_presence: Vec<SmallVec<[bool; 32]>> =
-            (0..num_files).map(|_| SmallVec::from_slice(&[true])).collect();
+        let anchor_presence: Vec<bool> = (0..num_files).map(|_| true).collect();
         cache.merge_updates(keys.clone(), metas.clone(), &[anchor_hash], anchor_presence).unwrap();
 
         // Add fragments one at a time, crossing the 64-boundary
@@ -2009,7 +1999,7 @@ mod tests {
             let filler_meta = meta(1000 + i as i64, 1000 + i as u64);
             cache.merge_updates(
                 vec![filler_key], vec![filler_meta], &[filler_hash],
-                vec![SmallVec::from_slice(&[false])],
+                vec![false],
             ).unwrap();
 
             // After every addition, all original files must still report anchor present
@@ -2043,7 +2033,7 @@ mod tests {
                 let filler_meta = meta(i as i64, i as u64);
                 cache.merge_updates(
                     vec![filler_key], vec![filler_meta], &[h],
-                    vec![SmallVec::from_slice(&[false])],
+                    vec![false],
                 ).unwrap();
             }
 
@@ -2051,8 +2041,7 @@ mod tests {
             for offset in [0u32, 1, 2, 3] {
                 let h = 0xBEEF_0000u32.wrapping_add(boundary as u32).wrapping_add(offset);
                 present_hashes.push(h);
-                let presences: Vec<SmallVec<[bool; 32]>> =
-                    (0..num_files).map(|_| SmallVec::from_slice(&[true])).collect();
+                let presences: Vec<bool> = (0..num_files).map(|_| true).collect();
                 cache.merge_updates(keys.clone(), metas.clone(), &[h], presences).unwrap();
 
                 // Immediately verify all previously-added present hashes still not skippable
@@ -2085,7 +2074,7 @@ mod tests {
             let h = 0x1000u32.wrapping_add(step.wrapping_mul(7919)); // prime multiplier
             let present = step % 3 != 0; // every 3rd file has it absent
 
-            let presences = vec![SmallVec::from_slice(&[present])];
+            let presences = vec![present];
             cache.merge_updates(vec![k], vec![m], &[h], presences).unwrap();
             ground_truth.push((k, m, h, present));
 
@@ -2114,7 +2103,7 @@ mod tests {
         let hash_a = 0xAAAA_u32;
         cache.merge_updates(
             vec![k], vec![m], &[hash_a],
-            vec![SmallVec::from_slice(&[true])],
+            vec![true],
         ).unwrap();
 
         // Push num_fragments past 64 using other files
@@ -2124,7 +2113,7 @@ mod tests {
             let fh = 0xF000u32.wrapping_add(i);
             cache.merge_updates(
                 vec![fk], vec![fm], &[fh],
-                vec![SmallVec::from_slice(&[false])],
+                vec![false],
             ).unwrap();
         }
 
@@ -2132,7 +2121,7 @@ mod tests {
         let hash_b = 0xBBBB_u32;
         cache.merge_updates(
             vec![k], vec![m], &[hash_a, hash_b],
-            vec![SmallVec::from_slice(&[true, true])],
+            vec![true, true],
         ).unwrap();
 
         assert!(!cache.can_skip_file(k, m, &[hash_a]),
@@ -2175,10 +2164,10 @@ mod tests {
                     .collect();
 
                 // Each file's presence is determined by its bit in present_mask
-                let presences: Vec<SmallVec<[bool; 32]>> = (0..num_files)
-                    .map(|fi| {
+                let presences: Vec<bool> = (0..num_files)
+                    .flat_map(|fi| {
                         let present = (present_mask >> (fi % 32)) & 1 == 1;
-                        hashes.iter().map(|_| present).collect()
+                        hashes.iter().map(move |_| present)
                     })
                     .collect();
 
@@ -2225,7 +2214,7 @@ mod tests {
                 let fh = 0xDEAD_0000u32.wrapping_add(seed as u32).wrapping_add(i);
                 cache.merge_updates(
                     vec![fk], vec![fm], &[fh],
-                    vec![SmallVec::from_slice(&[false])],
+                    vec![false],
                 ).unwrap();
             }
 
@@ -2238,16 +2227,16 @@ mod tests {
             let hash_62 = 0xB062u32.wrapping_add(seed as u32);
             let before_keys:  Vec<FileKey>  = (0..files_before_boundary).map(|i| key(200 + i as u64)).collect();
             let before_metas: Vec<FileMeta> = (0..files_before_boundary).map(|i| meta(200 + i as i64, 200)).collect();
-            let before_presences: Vec<SmallVec<[bool; 32]>> =
-                (0..files_before_boundary).map(|_| SmallVec::from_slice(&[true])).collect();
+            let before_presences: Vec<bool> =
+                (0..files_before_boundary).map(|_| true).collect();
             cache.merge_updates(before_keys.clone(), before_metas.clone(), &[hash_62], before_presences).unwrap();
 
             // This pushes num_fragments to 63. Now add hash at index 63 (crosses u64 boundary)
             let hash_63 = 0xB063u32.wrapping_add(seed as u32);
             let after_keys:  Vec<FileKey>  = (0..files_after_boundary).map(|i| key(300 + i as u64)).collect();
             let after_metas: Vec<FileMeta> = (0..files_after_boundary).map(|i| meta(300 + i as i64, 300)).collect();
-            let after_presences: Vec<SmallVec<[bool; 32]>> =
-                (0..files_after_boundary).map(|_| SmallVec::from_slice(&[true])).collect();
+            let after_presences: Vec<bool> =
+                (0..files_after_boundary).map(|_| true).collect();
             cache.merge_updates(after_keys.clone(), after_metas.clone(), &[hash_63], after_presences).unwrap();
 
             // Verify before-boundary files still not skippable on hash_62
@@ -2280,7 +2269,7 @@ mod tests {
         let mut cache = FragmentCache::new_in_memory(64, 64);
         cache.merge_updates(
             vec![k], vec![m], &[hash],
-            vec![SmallVec::from_slice(&[false])], // explicitly absent
+            vec![false], // explicitly absent
         ).unwrap();
 
         assert!(cache.can_skip_file(k, m, &[hash]),
@@ -2295,8 +2284,8 @@ mod tests {
         let num_files = 10usize;
         let keys:  Vec<FileKey>  = (0..num_files).map(|i| key(i as u64)).collect();
         let metas: Vec<FileMeta> = (0..num_files).map(|i| meta(i as i64, i as u64)).collect();
-        let presences: Vec<SmallVec<[bool; 32]>> = (0..num_files)
-            .map(|i| SmallVec::from_slice(&[i % 2 == 0])) // even=present, odd=absent
+        let presences: Vec<bool> = (0..num_files)
+            .map(|i| i % 2 == 0) // even=present, odd=absent
             .collect();
 
         let mut cache = FragmentCache::new_in_memory(64, 64);
@@ -2326,7 +2315,7 @@ mod tests {
         let mut cache = FragmentCache::new_in_memory(64, 64);
         cache.merge_updates(
             vec![k], vec![m], &[hash_a, hash_b, hash_c],
-            vec![SmallVec::from_slice(&[true, false, true])],
+            vec![true, false, true],
         ).unwrap();
 
         assert!(!cache.can_skip_file(k, m, &[hash_a]), "A is present, must not skip");
@@ -2353,8 +2342,8 @@ mod tests {
         let keys:  Vec<FileKey>  = (0..num_files).map(|i| key(i as u64)).collect();
         let metas: Vec<FileMeta> = (0..num_files).map(|i| meta(i as i64, i as u64)).collect();
         // All absent
-        let presences: Vec<SmallVec<[bool; 32]>> =
-            (0..num_files).map(|_| SmallVec::from_slice(&[false])).collect();
+        let presences: Vec<bool> =
+            (0..num_files).map(|_| false).collect();
 
         cache.merge_updates(keys.clone(), metas.clone(), &[hash], presences).unwrap();
 
@@ -2376,7 +2365,7 @@ mod tests {
 
         cache.merge_updates(
             vec![k], vec![m], &[hash],
-            vec![SmallVec::from_slice(&[false])],
+            vec![false],
         ).unwrap();
 
         assert!(cache.can_skip_file(k, m, &[hash]), "absent before boundary crossing");
@@ -2388,7 +2377,7 @@ mod tests {
             let fh = 0xF000_0000u32.wrapping_add(i);
             cache.merge_updates(
                 vec![fk], vec![fm], &[fh],
-                vec![SmallVec::from_slice(&[false])],
+                vec![false],
             ).unwrap();
         }
 
@@ -2417,7 +2406,7 @@ mod tests {
                     .wrapping_add(i);
                 cache.merge_updates(
                     vec![fk], vec![fm], &[fh],
-                    vec![SmallVec::from_slice(&[false])],
+                    vec![false],
                 ).unwrap();
             }
 
@@ -2426,7 +2415,7 @@ mod tests {
                 .wrapping_add(target_idx as u32);
             cache.merge_updates(
                 vec![k], vec![m], &[target_hash],
-                vec![SmallVec::from_slice(&[false])],
+                vec![false],
             ).unwrap();
 
             assert!(
@@ -2448,7 +2437,7 @@ mod tests {
 
         cache.merge_updates(
             vec![k], vec![m], &[hash],
-            vec![SmallVec::from_slice(&[false])],
+            vec![false],
         ).unwrap();
 
         assert!(cache.can_skip_file(k, m, &[hash]), "absent after first registration");
@@ -2456,7 +2445,7 @@ mod tests {
         // Re-register same file, same meta, same fragment absent
         cache.merge_updates(
             vec![k], vec![m], &[hash],
-            vec![SmallVec::from_slice(&[false])],
+            vec![false],
         ).unwrap();
 
         assert!(cache.can_skip_file(k, m, &[hash]),
@@ -2477,8 +2466,8 @@ mod tests {
         cache.merge_updates(
             vec![ka, kb], vec![ma, mb], &[hash],
             vec![
-                SmallVec::from_slice(&[false]), // A: absent
-                SmallVec::from_slice(&[true]),  // B: present
+                false, // A: absent
+                true,  // B: present
             ],
         ).unwrap();
 
@@ -2499,7 +2488,7 @@ mod tests {
         let mut cache = FragmentCache::new_in_memory(64, 64);
         cache.merge_updates(
             vec![k], vec![m], &[hash_prev, hash_mid, hash_next],
-            vec![SmallVec::from_slice(&[true, false, true])], // mid absent
+            vec![true, false, true], // mid absent
         ).unwrap();
 
         assert!(!cache.can_skip_file(k, m, &[hash_prev]), "prev present, must not skip");
@@ -2532,8 +2521,8 @@ mod tests {
                      .collect())
                 .collect();
 
-            let presences: Vec<SmallVec<[bool; 32]>> = presence_table.iter()
-                .map(|p| p.iter().copied().collect())
+            let presences: Vec<bool> = presence_table.iter()
+                .flat_map(|p| p.iter().copied())
                 .collect();
 
             cache.merge_updates(keys.clone(), metas.clone(), &hashes, presences).unwrap();
@@ -2580,10 +2569,10 @@ mod tests {
                     .collect();
 
                 // Alternate absent/present per file based on round parity
-                let presences: Vec<SmallVec<[bool; 32]>> = (0..num_files)
-                    .map(|fi| {
+                let presences: Vec<bool> = (0..num_files)
+                    .flat_map(|fi| {
                         let present = (round + fi) % 2 == 0;
-                        hashes.iter().map(|_| present).collect()
+                        hashes.iter().map(move |_| present)
                     })
                     .collect();
 

@@ -131,7 +131,7 @@ impl Matcher {
             )
         })?;
 
-        Ok(Matcher::Regex { re, pattern: pattern.to_owned().into() })
+        Ok(Matcher::Regex { re, pattern: pattern.to_owned() })
     }
 
     #[inline(always)]

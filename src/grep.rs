@@ -135,7 +135,7 @@ impl<S: MatchSink> RawGrepper<Ext4Fs, S> {
         //
 
         let num_blocks = max_block;
-        let num_groups = (num_blocks + sb.blocks_per_group as u64 - 1) / sb.blocks_per_group as u64;
+        let num_groups = num_blocks.div_ceil(sb.blocks_per_group as u64);
         let mut inode_table_blocks = Vec::with_capacity(num_groups as usize);
         for group in 0..num_groups {
             let bg_desc_offset = if sb.block_size == 1024 {

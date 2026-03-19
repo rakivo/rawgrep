@@ -227,7 +227,7 @@ impl RawFs for Ext4Fs {
                     if self.read_at_offset(probe, offset).is_err() {
                         return Ok(Some(SmallVec::new())); // unreadable
                     }
-                    if binary_probe(&probe, file_size) {
+                    if binary_probe(probe, file_size) {
                         return Ok(None);                  // binary
                     }
                 }
@@ -534,7 +534,7 @@ impl Ext4Fs {
 
                 let offset = child_block * self.sb.block_size as u64;
                 if self.read_at_offset(probe, offset).is_ok() {
-                    self.parse_extent_node_into(scratch, &probe, level + 1)?;
+                    self.parse_extent_node_into(scratch, probe, level + 1)?;
                 }
             }
         }

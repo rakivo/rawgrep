@@ -43,8 +43,8 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Error::InvalidPattern(p) => {
-                write!(f, "invalid pattern '{p}'\n")?;
-                write!(f, "tip: test your regex with `grep -E` or a regex tester before running\n")?;
+                writeln!(f, "invalid pattern '{p}'")?;
+                writeln!(f, "tip: test your regex with `grep -E` or a regex tester before running")?;
                 write!(f, "patterns must be valid regex or a literal/alternation extractable form")
             }
             Error::PathNotFound { path, source } => {
