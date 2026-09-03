@@ -1,3 +1,5 @@
+#!/usr/bin/env bash
+
 #
 # If you're looking at this, just know that yes, I AI generated this benchmark,
 # I don't have that amount of patience to go through every little detail
@@ -6,7 +8,6 @@
 # But! It honestly looks like it works just fine. So, what's the matter anyway?
 #
 
-#!/usr/bin/env bash
 set -uo pipefail
 
 PATTERN="TODO"
