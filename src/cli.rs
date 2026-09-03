@@ -1,8 +1,7 @@
-use std::path::Path;
 use std::sync::OnceLock;
 use std::num::NonZeroUsize;
 
-use clap::Parser;
+use bpaf::Bpaf;
 
 pub static SHOULD_ENABLE_ANSI_COLORING: OnceLock<bool> = OnceLock::new();
 
@@ -37,30 +36,16 @@ pub struct BufferConfig {
 // TODO(#21): add --files-with-matches / --files-without-match
 // TODO(#22): add --json output mode for integration tools later
 // TODO(#23): add --stats-extended (per-file timings, cache hit/miss)
-#[derive(Parser, Clone)]
-#[command(
-    name = "rawgrep",
-    about = "Grep at the speed of raw disk",
-    long_about = None,
-    version = "0.1.5",
-    arg_required_else_help = true,
-    override_usage = "<PATTERN> [PATH ...]"
-)]
+#[derive(Bpaf, Clone)]
+#[bpaf(options, version("0.1.6"))]
+/// Grep at the speed of raw disk
 pub struct Cli {
-    /// Pattern to search for (supports regex syntax)
-    #[arg(value_name = "PATTERN")]
-    pub pattern: Box<str>,
-
-    /// Directory path to search in
-    #[arg(value_name = "PATH", default_value = ".")]
-    pub search_root_path: Box<str>,
-
     /// Block device to read from (auto-detected if not specified)
-    #[arg(short, long, value_name = "DEVICE")]
-    pub device: Option<Box<str>>,
+    #[bpaf(short, long, argument("DEVICE"))]
+    pub device: Option<String>,
 
     /// Print statistics at the end
-    #[arg(short, long)]
+    #[bpaf(short, long)]
     pub stats: bool,
 
     /// Reduce filtering (can be repeated)
@@ -68,73 +53,84 @@ pub struct Cli {
     /// -u: disable size filtering
     /// -uu: also disable .gitignore filtering
     /// -uuu: disable all filtering, including  binary file filtering (by extension, probe)
-    #[arg(short = 'u', long = "unrestricted", action = clap::ArgAction::Count)]
+    #[bpaf(short('u'), long("unrestricted"), req_flag(()), many, map(|v| v.len() as u8))]
     pub unrestricted: u8,
 
     /// Don't respect .gitignore files
-    #[arg(long = "no-ignore", conflicts_with = "unrestricted")]
+    #[bpaf(long("no-ignore"))]
     pub no_ignore: bool,
 
     /// Search binary files (don't skip them)
-    #[arg(long = "binary", conflicts_with = "unrestricted")]
+    #[bpaf(long)]
     pub binary: bool,
 
     /// Search large files and large directories (don't skip them)
     /// Default FILE_MAX_SIZE is 8 MB and DIRECTORY_MAX_SIZE is 16 MB
-    #[arg(long, conflicts_with = "unrestricted")]
+    #[bpaf(long)]
     pub large: bool,
 
     /// Disable all filtering (search everything)
     ///
     /// Equivalent to -uuu or --no-ignore --binary --hidden
-    #[arg(short = 'a', long = "all", conflicts_with = "unrestricted")]
+    #[bpaf(short('a'), long("all"))]
     pub all: bool,
 
     /// Disable colored output (force plain text)
-    #[arg(long = "no-color")]
+    #[bpaf(long("no-color"))]
     pub no_color: bool,
 
     /// Print matches in conventional jumpable format (for VIM, EMACS, etc)
-    #[arg(short, long)]
+    #[bpaf(short, long)]
     pub jump: bool,
 
     /// Force `Matcher` to use literal search even if there's regex stuff in the pattern
-    #[arg(short, long = "force-literal")]
+    #[bpaf(short, long("force-literal"))]
     pub force_literal: bool,
 
     /// Number of worker threads to use
     ///
     /// Defaults to number of logical CPUs. Use fewer to reduce load,
     /// or increase to oversubscribe the machine.
-    #[arg(
-        short = 't',
-        long = "threads",
-        default_value_t = std::thread::available_parallelism()
-            .unwrap_or(unsafe { NonZeroUsize::new_unchecked(1) })
+    #[bpaf(
+        short('t'),
+        long("threads"),
+        argument("THREADS"),
+        fallback(
+            std::thread::available_parallelism()
+                .unwrap_or(unsafe { NonZeroUsize::new_unchecked(1) })
+        )
     )]
     pub threads: NonZeroUsize,
 
     /// Disable fragment cache
-    #[arg(long = "no-cache")]
+    #[bpaf(long("no-cache"))]
     pub no_cache: bool,
 
     /// Fragment cache memory budget in MB (default: 100)
-    #[arg(long = "cache-size", default_value = "100", value_name = "MB")]
+    #[bpaf(long("cache-size"), argument("MB"), fallback(100))]
     pub cache_size_mb: usize,
 
     /// Cache directory (default: ~/.cache/rawgrep/)
-    #[arg(long = "cache-dir", value_name = "DIR")]
-    pub cache_dir: Option<Box<Path>>,
+    #[bpaf(long("cache-dir"), argument("DIR"))]
+    pub cache_dir: Option<std::path::PathBuf>,
 
     /// Ignore existing cache and rebuild from scratch
-    #[arg(long = "rebuild-cache")]
+    #[bpaf(long("rebuild-cache"))]
     pub rebuild_cache: bool,
+
+    /// Pattern to search for (supports regex syntax)
+    #[bpaf(positional("PATTERN"))]
+    pub pattern: String,
+
+    /// Directory path to search in
+    #[bpaf(positional("PATH"), fallback(".".into()))]
+    pub search_root_path: String,
 }
 
 impl Cli {
     #[inline(always)]
     pub fn parse() -> Self {
-        let cli = <Self as Parser>::parse();
+        let cli = cli().run();
 
         _ = SHOULD_ENABLE_ANSI_COLORING.set(!cli.no_color);
 

@@ -12,6 +12,7 @@ use bumpalo::Bump;
 use smallvec::SmallVec;
 use bumpalo::collections::Vec as BumpVec;
 
+#[repr(u8)]
 #[derive(Copy, Clone)]
 pub enum BufKind {
     Dir,
@@ -122,20 +123,21 @@ pub struct DirScanResult<const N: usize = 64> {
 
 /// Filesystem-agnostic parser with reusable buffers
 pub struct Parser<'a> {
-    pub file: Vec<u8>,                      // 0
+    pub file:      Vec<u8>,                // 0
+
     // Filesystem-specific scratch space
-    pub scratch: Vec<u8>,                   // 24
-    pub scratch2: Vec<u8>,                  // 48
+    pub scratch:   Vec<u8>,                // 24
+    pub scratch2:  Vec<u8>,                // 48
 
     // =============== Cache line ======================
 
-    pub dir: Vec<u8>,                       // 72
-    pub gitignore: Vec<u8>,                 // 96
-    pub output: BumpVec<'a, u8>,            // 120
+    pub dir:       Vec<u8>,                // 72
+    pub gitignore: Vec<u8>,                // 96
+    pub output:    BumpVec<'a, u8>,        // 120
 
     // =============== Cache line ======================
 
-    pub chunk: Vec<u8>,
+    pub chunk:     Vec<u8>,
 }
 
 impl<'a> Parser<'a> {

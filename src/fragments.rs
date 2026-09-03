@@ -34,7 +34,6 @@
 //! - Similar to Bloom filters but with explicit tracking
 
 use nohash_hasher::IntSet;
-use smallvec::{smallvec, SmallVec};
 
 /// Hash a 4-byte fragment to u32.
 #[inline(always)]
@@ -72,7 +71,7 @@ pub const fn stride_heuristic(buf_len: usize) -> usize {
 
 /// Extract fragment hashes from a search pattern.
 #[inline]
-pub fn extract_pattern_fragments(pattern: &[u8]) -> Vec<u32> {
+pub fn extract_pattern_fragments(pattern: &[u8]) -> Vec<u32> {  // @Memory @Speed: This function is called pretty much ONCE in the whole program, so it's probably fine to allocate here.
     if pattern.len() < 4 {
         return Vec::new();
     }
@@ -96,56 +95,55 @@ pub fn extract_pattern_fragments(pattern: &[u8]) -> Vec<u32> {
 
 /// Returns a SmallVec where `result[i]` is true if `fragment_hashes[i]` was found in the buffer.
 #[inline]
-pub fn check_fragment_presence(buf: &[u8], fragment_hashes: &[u32]) -> SmallVec<[bool; 32]> {
+pub fn check_fragment_presence(buf: &[u8], fragment_hashes: &[u32], fragment_presence_scratch: &mut Vec<u64>) {
     let num_frags = fragment_hashes.len();
 
     if num_frags == 0 {
-        return SmallVec::new();
+        return;
     }
 
     if buf.len() < 4 {
-        return smallvec![false; num_frags];
+        return;
     }
 
     #[cfg(target_arch = "x86_64")] {
         if is_x86_feature_detected!("avx2") && buf.len() >= 32 {
-            return unsafe { check_fragment_presence_avx2(buf, fragment_hashes) };
+            return unsafe { check_fragment_presence_avx2(buf, fragment_hashes, fragment_presence_scratch) };
         }
     }
 
     #[cfg(target_arch = "aarch64")] {
         if std::arch::is_aarch64_feature_detected!("neon") && buf.len() >= 16 {
-            return unsafe { check_fragment_presence_neon(buf, fragment_hashes) };
+            return unsafe { check_fragment_presence_neon(buf, fragment_hashes, fragment_presence_scratch) };
         }
     }
 
-    check_fragment_presence_scalar(buf, fragment_hashes)
+    check_fragment_presence_scalar(buf, fragment_hashes, fragment_presence_scratch)
 }
 
 /// Scalar fallback for fragment presence checking
 #[inline]
-fn check_fragment_presence_scalar(buf: &[u8], fragment_hashes: &[u32]) -> SmallVec<[bool; 32]> {
+fn check_fragment_presence_scalar(buf: &[u8], fragment_hashes: &[u32], fragment_presence_scratch: &mut Vec<u64>) {
     let num_frags = fragment_hashes.len();
     let stride = stride_heuristic(buf.len());
 
     // Build a set of pattern fragment hashes for O(1) lookup
     let pattern_frag_set = fragment_hashes.iter().copied().collect::<IntSet<_>>();
 
-    let mut found: SmallVec<[bool; 32]> = smallvec![false; num_frags];
     let mut found_count = 0;
 
     let mut i = 0;
     while i + 4 <= buf.len() {
-        let hash = hash_fragment([buf[i], buf[i + 1], buf[i + 2], buf[i + 3]]);
+        let hash = hash_fragment([buf[i], buf[i+1], buf[i+2], buf[i+3]]);
 
         if pattern_frag_set.contains(&hash) {
             for (idx, &frag_hash) in fragment_hashes.iter().enumerate() {
-                if frag_hash == hash && !found[idx] {
-                    found[idx] = true;
-                    found_count += 1;
-
-                    if found_count == num_frags {
-                        return found;
+                if frag_hash == hash {
+                    let (word, bit) = (idx / 64, 1u64 << (idx % 64));
+                    if fragment_presence_scratch[word] & bit == 0 {
+                        fragment_presence_scratch[word] |= bit;
+                        found_count += 1;
+                        if found_count == num_frags { return; }
                     }
 
                     break;
@@ -155,36 +153,112 @@ fn check_fragment_presence_scalar(buf: &[u8], fragment_hashes: &[u32]) -> SmallV
 
         i += stride;
     }
-
-    found
 }
 
-/// AVX2-optimized fragment presence checking (x86_64).
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-#[allow(unsafe_op_in_unsafe_fn)]
-unsafe fn check_fragment_presence_avx2(buf: &[u8], fragment_hashes: &[u32]) -> SmallVec<[bool; 32]> {
-    use std::arch::x86_64::*;
+macro_rules! impl_fragment_presence_scanner {
+    (
+        fn_name: $fn_name:ident,
+        cfg: $cfg_arch:literal,
+        feature: $feature:literal,
+        min_stride: $min_stride:expr,
+        hashes_ty: $hashes_ty:ty,
+        window_load: |$data_ptr:ident| $load_block:block,
+        splat: |$scalar:ident| $splat_block:block,
+        any_match: |$ha:ident, $hb:ident| $match_block:block,
+    ) => {
+        #[cfg(target_arch = $cfg_arch)]
+        #[target_feature(enable = $feature)]
+        #[allow(unsafe_op_in_unsafe_fn)]
+        unsafe fn $fn_name(buf: &[u8], fragment_hashes: &[u32], fragment_presence_scratch: &mut Vec<u64>) {
+            let num_frags = fragment_hashes.len();
+            let stride = stride_heuristic(buf.len()).max($min_stride);
+            let buf_len = buf.len();
 
-    let num_frags = fragment_hashes.len();
-    let stride = stride_heuristic(buf.len()).max(8); // at least 8 for AVX2
-    let mut found = smallvec![false; num_frags];
-    let mut found_mask: u32 = 0;
-    let all_found_mask: u32 = (1u32 << num_frags) - 1;
+            if crate::util::likely(num_frags <= 64) {
+                //
+                // Fast path: register-only bitmask
+                //
 
-    //
-    // Hash multiplier constant: 0x9e3779b9 (golden ratio)
-    //
-    let hash_mult = _mm256_set1_epi32(0x9e3779b9_u32 as i32);
+                let mut found_mask: u64 = 0;
+                let all_found_mask: u64 = if num_frags == 64 { u64::MAX } else { (1u64 << num_frags) - 1 };
 
-    let buf_len = buf.len();
-    let mut offset = 0;
+                let mut offset = 0;
+                while offset + (12 - 1) <= buf_len {
+                    let $data_ptr = buf.as_ptr().add(offset);
+                    let hashes: $hashes_ty = $load_block;
 
-    //
-    // Process 8 overlapping windows at a time
-    //
-    while offset + (12 - 1) <= buf_len {
-        let data_ptr = buf.as_ptr().add(offset);
+                    for (frag_idx, &frag_hash) in fragment_hashes.iter().enumerate() {
+                        let bit = 1u64 << frag_idx;
+                        if found_mask & bit != 0 {
+                            continue;
+                        }
+
+                        let $scalar = frag_hash;
+                        let pattern: $hashes_ty = $splat_block;
+                        let $ha = hashes;
+                        let $hb = pattern;
+                        if $match_block {
+                            found_mask |= bit;
+                        }
+                    }
+
+                    if found_mask == all_found_mask {
+                        break;
+                    }
+
+                    offset += stride;
+                }
+
+                fragment_presence_scratch[0] = found_mask;
+            } else {
+                //
+                // Fallback: >64 fragments, can't fit a register mask
+                //
+
+                let mut remaining = num_frags;
+
+                let mut offset = 0;
+                while offset + (12 - 1) <= buf_len {
+                    let $data_ptr = buf.as_ptr().add(offset);
+                    let hashes: $hashes_ty = $load_block;
+
+                    for (frag_idx, &frag_hash) in fragment_hashes.iter().enumerate() {
+                        debug_assert!(frag_idx < fragment_presence_scratch.len());
+
+                        if *fragment_presence_scratch.get_unchecked(frag_idx / 64) & (1u64 << (frag_idx % 64)) != 0 {
+                            continue;
+                        }
+
+                        let $scalar = frag_hash;
+                        let pattern: $hashes_ty = $splat_block;
+                        let $ha = hashes;
+                        let $hb = pattern;
+                        if $match_block {
+                            *fragment_presence_scratch.get_unchecked_mut(frag_idx / 64) |= 1u64 << (frag_idx % 64);
+                            remaining -= 1;
+                        }
+                    }
+
+                    if remaining == 0 {
+                        break;
+                    }
+
+                    offset += stride;
+                }
+            }
+        }
+    };
+}
+
+impl_fragment_presence_scanner! {
+    fn_name: check_fragment_presence_avx2,
+    cfg: "x86_64",
+    feature: "avx2",
+    min_stride: 8,
+    hashes_ty: std::arch::x86_64::__m256i,
+
+    window_load: |data_ptr| {
+        use std::arch::x86_64::*;
         let w0 = (data_ptr.add(0) as *const u32).read_unaligned();
         let w1 = (data_ptr.add(1) as *const u32).read_unaligned();
         let w2 = (data_ptr.add(2) as *const u32).read_unaligned();
@@ -193,114 +267,51 @@ unsafe fn check_fragment_presence_avx2(buf: &[u8], fragment_hashes: &[u32]) -> S
         let w5 = (data_ptr.add(5) as *const u32).read_unaligned();
         let w6 = (data_ptr.add(6) as *const u32).read_unaligned();
         let w7 = (data_ptr.add(7) as *const u32).read_unaligned();
-
         let windows = _mm256_set_epi32(
             w7 as i32, w6 as i32, w5 as i32, w4 as i32,
-            w3 as i32, w2 as i32, w1 as i32, w0 as i32
+            w3 as i32, w2 as i32, w1 as i32, w0 as i32,
         );
 
-        let hashes = _mm256_mullo_epi32(windows, hash_mult);
+        // Hash multiplier constant: 0x9e3779b9 (golden ratio).
+        // Let's pray LLVM's LICM hoists this broadcast out the loop.
+        _mm256_mullo_epi32(windows, _mm256_set1_epi32(0x9e3779b9_u32 as i32))
+    },
 
-        //
-        // Compare against each pattern hash
-        //
-        for (frag_idx, &frag_hash) in fragment_hashes.iter().enumerate() {
-            if found_mask & (1 << frag_idx) != 0 {
-                continue;
-            }
+    splat: |scalar| {
+        std::arch::x86_64::_mm256_set1_epi32(scalar as i32)
+    },
 
-            let pattern_hash = _mm256_set1_epi32(frag_hash as i32);
-            let cmp = _mm256_cmpeq_epi32(hashes, pattern_hash);
-            let mask = _mm256_movemask_epi8(cmp);
-
-            if mask != 0 {
-                found[frag_idx] = true;
-                found_mask |= 1 << frag_idx;
-
-                if found_mask == all_found_mask {
-                    return found;
-                }
-            }
-        }
-
-        offset += stride;
-    }
-
-    found
+    any_match: |a, b| {
+        use std::arch::x86_64::*;
+        _mm256_movemask_epi8(_mm256_cmpeq_epi32(a, b)) != 0
+    },
 }
 
-/// NEON-optimized fragment presence checking (ARM64).
-#[cfg(target_arch = "aarch64")]
-#[target_feature(enable = "neon")]
-#[allow(unsafe_op_in_unsafe_fn)]
-unsafe fn check_fragment_presence_neon(buf: &[u8], fragment_hashes: &[u32]) -> SmallVec<[bool; 32]> {
-    use std::arch::aarch64::*;
+impl_fragment_presence_scanner! {
+    fn_name: check_fragment_presence_neon,
+    cfg: "aarch64",
+    feature: "neon",
+    min_stride: 4,
+    hashes_ty: std::arch::aarch64::uint32x4_t,
 
-    let num_frags = fragment_hashes.len();
-    let stride = stride_heuristic(buf.len()).max(4); // At least 4 for NEON
-    let mut found: SmallVec<[bool; 32]> = smallvec![false; num_frags];
-    let mut found_mask: u32 = 0;
-    let all_found_mask: u32 = (1u32 << num_frags) - 1;
-
-    //
-    // Hash multiplier constant: 0x9e3779b9 (golden ratio)
-    //
-    let hash_mult = vdupq_n_u32(0x9e3779b9);
-
-    let buf_len = buf.len();
-    let mut offset = 0;
-
-    //
-    // Process 4 overlapping windows at a time
-    //
-    while offset + 7 <= buf_len {
-        let data_ptr = buf.as_ptr().add(offset);
-
-        //
-        // Load 4 overlapping 4-byte windows
-        //
+    window_load: |data_ptr| {
+        use std::arch::aarch64::*;
         let w0 = (data_ptr.add(0) as *const u32).read_unaligned();
         let w1 = (data_ptr.add(1) as *const u32).read_unaligned();
         let w2 = (data_ptr.add(2) as *const u32).read_unaligned();
         let w3 = (data_ptr.add(3) as *const u32).read_unaligned();
-
-        //
-        // Pack into NEON register
         let windows = vld1q_u32([w0, w1, w2, w3].as_ptr());
+        vmulq_u32(windows, vdupq_n_u32(0x9e3779b9))
+    },
 
-        //
-        // Compute hashes: hash = window * 0x9e3779b9
-        //
-        let hashes = vmulq_u32(windows, hash_mult);
+    splat: |scalar| {
+        std::arch::aarch64::vdupq_n_u32(scalar)
+    },
 
-        //
-        // Compare against each pattern hash
-        //
-        for (frag_idx, &frag_hash) in fragment_hashes.iter().enumerate() {
-            if found_mask & (1 << frag_idx) != 0 {
-                continue;
-            }
-
-            let pattern_hash = vdupq_n_u32(frag_hash);
-            let cmp = vceqq_u32(hashes, pattern_hash);
-
-            //
-            // Check if any lane matched (vmaxvq_u32 returns max of all lanes)
-            //
-            if vmaxvq_u32(cmp) != 0 {
-                found[frag_idx] = true;
-                found_mask |= 1 << frag_idx;
-
-                if found_mask == all_found_mask {
-                    return found;
-                }
-            }
-        }
-
-        offset += stride;
-    }
-
-    found
+    any_match: |a, b| {
+        use std::arch::aarch64::*;
+        vmaxvq_u32(vceqq_u32(a, b)) != 0
+    },
 }
 
 #[cfg(test)]
@@ -336,20 +347,25 @@ mod tests {
     fn test_check_fragment_presence_found() {
         let buf = b"hello world test";
         let pattern_frags = extract_pattern_fragments(b"hello");
-        let found = check_fragment_presence(buf, &pattern_frags);
+        let words_per_file = (pattern_frags.len() + 63) / 64;
+        let mut found = vec![0u64; words_per_file];
+        check_fragment_presence(buf, &pattern_frags, &mut found);
 
         // "hello" fragments should be found in "hello world test"
-        assert!(found.iter().all(|&x| x));
+        let full_mask = if pattern_frags.len() % 64 == 0 { u64::MAX } else { (1u64 << (pattern_frags.len() % 64)) - 1 };
+        assert_eq!(found[0] & full_mask, full_mask);
     }
 
     #[test]
     fn test_check_fragment_presence_not_found() {
         let buf = b"hello world test";
         let pattern_frags = extract_pattern_fragments(b"xyzzy");
-        let found = check_fragment_presence(buf, &pattern_frags);
+        let words_per_file = (pattern_frags.len() + 63) / 64;
+        let mut found = vec![0u64; words_per_file];
+        check_fragment_presence(buf, &pattern_frags, &mut found);
 
         // "xyzzy" fragments should NOT be found
-        assert!(found.iter().all(|&x| !x));
+        assert!(found.iter().all(|&w| w == 0));
     }
 
     #[test]

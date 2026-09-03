@@ -35,7 +35,7 @@ impl<F: RawFs, S: MatchSink> RawGrepper<F, S> {
 
         let cache = if !cli.no_cache && !fragment_hashes.is_empty() {
             let mut config = CacheConfig::from_memory_mb(cli.cache_size_mb);
-            config.cache_dir = cli.cache_dir.clone();
+            config.cache_dir = cli.cache_dir.clone().map(Into::into);
             config.ignore_cache = cli.rebuild_cache;
 
             match FragmentCache::new(&config) {
@@ -306,7 +306,7 @@ pub fn open_device_and_detect_fs(device_path: &str) -> io::Result<(File, FsType)
 #[inline]
 pub fn make_matcher(cli: &Cli) -> Result<Matcher> {
     Matcher::new(cli).map_err(|e| match e.kind() {
-        io::ErrorKind::InvalidInput => Error::InvalidPattern(cli.pattern.clone()),
+        io::ErrorKind::InvalidInput => Error::InvalidPattern(cli.pattern.clone().into_boxed_str()),
         _ => Error::Io(e),
     })
 }

@@ -15,17 +15,17 @@ use crate::error::Error;
 use crate::RawGrepConfig;
 use crate::path_buf::SmallPathBuf;
 use crate::{cli, ignore, platform};
-use crate::parser::{Parser, RawFs};
+use crate::parser::Parser;
 use crate::cache::{FileKey, FileMeta};
 use crate::stats::{AtomicStats, Stats};
 use crate::grep::{AnyGrepper, FsType, RawGrepper, open_device_and_detect_fs};
-use crate::worker::{DirWork, FileWork, MatchSink, OutputWorker, WorkItem, WorkerContext, WorkerResult};
+use crate::worker::{DirWork, FileWork, MatchSink, OutputWorker, WorkItem, WorkerContext, PathArena, FileEntryArena, SubdirsArena, FragmentPresenceBits};
 
 #[derive(Default)]
 struct CacheAccumulator {
     file_keys:          Vec<FileKey>,
     file_metas:         Vec<FileMeta>,
-    fragment_presence:  Vec<bool>,
+    fragment_presence:  Vec<u64>,
 }
 
 /// Per-search data, swapped atomically between searches.
@@ -46,7 +46,7 @@ pub struct RawGrepCtx<S: MatchSink> {
     injector:       Arc<Injector<WorkItem>>,
     running:        Arc<AtomicBool>,
     active_workers: Arc<AtomicUsize>,
-    wake:           Arc<(Mutex<bool>, Condvar)>,
+    wake:           Arc<(Mutex<u64>, Condvar)>,
     current_job:    Arc<RwLock<Option<Arc<SearchJob<S>>>>>,
 
     output_tx:      Sender<&'static [u8]>,
@@ -320,7 +320,6 @@ impl<S: MatchSink + 'static> RawGrepCtx<S> {
         let work = if std::fs::metadata(&search_root).is_ok_and(|m| m.is_file()) {
             WorkItem::File(FileWork {
                 file_id:         root_file_id,
-                path_bytes:      Arc::default(),
                 gitignore_chain: root_gitignore
                     .map(crate::ignore::GitignoreChain::from_root)
                     .unwrap_or_default(),
@@ -340,56 +339,15 @@ impl<S: MatchSink + 'static> RawGrepCtx<S> {
 
         self.running.store(true, Ordering::SeqCst);
         let (lock, cvar) = &*self.wake;
-        *lock.lock() = true;
+        {
+            let mut _gen = lock.lock();
+            *_gen = _gen.wrapping_add(1);
+        }
         cvar.notify_all();
         debug!("[ctx] running=true, all workers notified");
 
         Ok(())
     }
-}
-
-#[allow(clippy::too_many_arguments)] // @Cleanup
-fn dispatch_worker<'a, F: RawFs, S: MatchSink>(
-    worker_id:      u16,
-
-    g: &RawGrepper<F, S>,
-    ctx: &RawGrepCtx<S>,
-
-    parser: Parser<'a>,
-    path_buf: Box<SmallPathBuf>,
-    newlines_scratch: Vec<u32>,
-    ranges_scratch: Vec<(u32, u32)>,
-
-    stealers:       &[Stealer<WorkItem>],
-    local:          &DequeWorker<WorkItem>,
-) -> WorkerResult<'a> {
-    WorkerContext {
-        worker_id,
-        cache:            g.cache(),
-        fragment_hashes:  g.fragment_hashes(),
-        fs:               g.fs(),
-        matcher:          g.matcher(),
-        cli:              g.cli(),
-        sink:             g.sink.clone(),
-        output_tx:        ctx.output_tx.clone(),
-        stats:            Default::default(),
-        parser,
-        path_buf,
-        newlines_scratch,
-        ranges_scratch,
-
-        chunk_carry:      None,
-
-        pending_file_keys:         Vec::new(),
-        pending_file_metas:        Vec::new(),
-        pending_fragment_presence: Vec::new(),
-    }.start_worker_loop(
-        &ctx.running,
-        &ctx.active_workers,
-        &ctx.injector,
-        stealers,
-        local,
-    )
 }
 
 fn worker_thread_main<S: MatchSink + 'static>(
@@ -404,22 +362,34 @@ fn worker_thread_main<S: MatchSink + 'static>(
 
     // Parser buffers are owned by the thread and reused across searches,
     // saving allocations on every search restart.
-    let mut parser = Parser::new(&output_buffer_arena);
-    let mut path_buf = Box::new(SmallPathBuf::new());
-    let mut newlines_scratch = Vec::new();
-    let mut ranges_scratch = Vec::new();
+    let mut parser                    = Parser::new(&output_buffer_arena);
+    let mut path_buf                  = Box::new(SmallPathBuf::new());
+    let mut swap_path_buf             = Box::new(SmallPathBuf::new());
+    let mut newlines_scratch          = Vec::new();
+    let mut ranges_scratch            = Vec::new();
+    let mut fragment_presence_scratch = Vec::new();
+    let mut path_arena                = PathArena::new();
+    let mut file_entries_arena        = FileEntryArena::new();
+    let mut subdirs_arena             = SubdirsArena::new();
+
+    let mut file_keys                 = Vec::new();
+    let mut file_metas                = Vec::new();
+    let mut fragment_presence         = FragmentPresenceBits::default();
 
     let mut search_count = 0u32;
+    let mut last_gen     = 0u64;
 
     loop {
         //
-        // Sleep until a search is ready
+        // Sleep until a new search is ready
         //
         {
             let (lock, cvar) = ctx.wake.as_ref();
-            let mut ready = lock.lock();
-            cvar.wait(&mut ready);
-            // Don't reset `ready` here - all workers need to see it true.
+            let mut _gen = lock.lock();
+            while *_gen == last_gen {
+                cvar.wait(&mut _gen);
+            }
+            last_gen = *_gen;
         }
 
         search_count += 1;
@@ -443,16 +413,50 @@ fn worker_thread_main<S: MatchSink + 'static>(
         // Reset the buffers
         //
         unsafe { path_buf.set_len(0); }
+        unsafe { swap_path_buf.set_len(0); }
         newlines_scratch.clear();
         ranges_scratch.clear();
+        subdirs_arena.clear();
+        path_arena.clear();
+        if fragment_presence_scratch.is_empty() {
+            let fragment_hash_count = job.grepper.fragment_hashes().len();
+            fragment_presence_scratch.resize((fragment_hash_count + 63) / 64, 0);
+            fragment_presence = FragmentPresenceBits::new(fragment_hash_count);
+        }
 
         macro_rules! dispatch {
             ($g:expr) => {
-                dispatch_worker(
-                    worker_id, $g, &ctx,
-                    parser, path_buf,
-                    newlines_scratch, ranges_scratch,
-                    stealers, &local
+                WorkerContext {
+                    worker_id,
+                    cache:            $g.cache(),
+                    fragment_hashes:  $g.fragment_hashes(),
+                    fs:               $g.fs(),
+                    matcher:          $g.matcher(),
+                    cli:              $g.cli(),
+                    sink:             $g.sink.clone(),
+                    output_tx:        ctx.output_tx.clone(),
+                    stats:            Default::default(),
+                    parser,
+                    path_buf,
+                    subdirs_arena,
+                    newlines_scratch,
+                    ranges_scratch,
+                    path_arena,
+                    file_entries_arena,
+                    swap_path_buf,
+                    fragment_presence_scratch,
+
+                    chunk_carry:      None, // @Memory: Cache this as well.
+
+                    pending_file_keys: file_keys,
+                    pending_file_metas: file_metas,
+                    pending_fragment_presence: fragment_presence
+                }.start_worker_loop(
+                    &ctx.running,
+                    &ctx.active_workers,
+                    &ctx.injector,
+                    stealers,
+                    &local,
                 )
             };
         }
@@ -471,25 +475,26 @@ fn worker_thread_main<S: MatchSink + 'static>(
         );
 
         parser = result.parser;
+        file_entries_arena = result.file_entries_arena;
+        subdirs_arena = result.subdirs_arena;
+        path_arena = result.path_arena;
         newlines_scratch = result.newlines_scratch;
         ranges_scratch = result.ranges_scratch;
+        fragment_presence_scratch = result.fragment_presence_scratch;
         path_buf = result.path_buf;
+        swap_path_buf = result.swap_path_buf;
         result.stats.merge_into(&job.stats);
 
         // Deposit cache data
         {
             let mut acc = job.cache_acc.lock();
-            acc.file_keys.extend(result.file_keys);
-            acc.file_metas.extend(result.file_metas);
-            acc.fragment_presence.extend(result.fragment_presence);
-        }
+            acc.file_keys.extend_from_slice(&result.file_keys);
+            acc.file_metas.extend_from_slice(&result.file_metas);
+            acc.fragment_presence.extend_from_slice(&result.fragment_presence.words);
 
-        //
-        // Reset wake flag when this worker's loop exits
-        //
-        let (lock, _) = ctx.wake.as_ref();
-        if let Some(mut ready) = lock.try_lock() {
-            *ready = false;
+            file_keys = result.file_keys;
+            file_metas = result.file_metas;
+            fragment_presence = result.fragment_presence;
         }
     }
 }

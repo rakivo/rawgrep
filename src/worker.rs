@@ -25,7 +25,6 @@ use crate::{
     COLOR_RESET
 };
 
-use std::mem;
 use std::ops::Not;
 use std::path::MAIN_SEPARATOR;
 use std::sync::Arc;
@@ -33,7 +32,6 @@ use std::time::Duration;
 use std::io::{self, BufWriter, Write};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use smallvec::{smallvec, SmallVec};
 use bumpalo::collections::Vec as BumpVec;
 use crossbeam_channel::{Receiver, Sender};
 use crossbeam_deque::{Injector, Steal, Stealer};
@@ -70,7 +68,6 @@ pub enum WorkItem {
 
 pub struct FileWork {
     pub file_id: FileId,
-    pub path_bytes: Arc<[u8]>,
     pub gitignore_chain: GitignoreChain,
 }
 
@@ -80,7 +77,6 @@ pub struct DirWork {
     pub gitignore_chain: GitignoreChain,
     pub depth: u16
 }
-
 
 pub trait MatchSink: Send + Sync + Clone {
     const STDOUT_NOP: bool;
@@ -153,7 +149,6 @@ where
     }
 }
 
-
 pub struct OutputWorker {
     pub rx: Receiver<&'static [u8]>,
     pub flush_req_rx: Receiver<()>,
@@ -200,8 +195,10 @@ pub struct ChunkCarry {
     /// Incomplete last line carried from previous chunk
     pub tail: Vec<u8>,
     pub combine_buf: Vec<u8>,
+
     /// Any matches was found so far in this file
     pub found_any: bool,
+
     /// Line number counter across chunks
     pub line_num: u32,
 }
@@ -225,53 +222,174 @@ impl ChunkCarry {
     }
 }
 
+pub type FileEntryArena = Vec<(FileId, BufFatPtr)>;
+pub type SubdirsArena   = Vec<PendingSubdir>;
+
+#[repr(transparent)]
+pub struct PathArena {
+    buf: Vec<u8>,
+}
+
+impl PathArena {
+    #[inline(always)]
+    pub fn new() -> Self {
+        Self { buf: Vec::with_capacity(64 * 1024) }
+    }
+
+    #[inline(always)]
+    fn len(&self) -> u32 {
+        self.buf.len() as u32
+    }
+
+    #[inline(always)]
+    pub fn clear(&mut self) {
+        self.buf.clear();
+    }
+
+    #[inline(always)]
+    fn truncate(&mut self, len: u32) {
+        self.buf.truncate(len as usize);
+    }
+
+    #[inline(always)]
+    fn push_path(&mut self, parent: &[u8], needs_slash: bool, name: &[u8]) -> (u32, u32) {
+        let start = self.buf.len() as u32;
+
+        self.buf.extend_from_slice(parent);
+        if needs_slash {
+            self.buf.push(MAIN_SEPARATOR as u8);
+        }
+        self.buf.extend_from_slice(name);
+
+        (start, self.buf.len() as u32)
+    }
+
+    #[inline(always)]
+    fn slice(&self, start: u32, end: u32) -> &[u8] {
+        &self.buf[start as usize..end as usize]
+    }
+}
+
+#[derive(Copy, Clone)]
+pub struct PendingSubdir {
+    file_id:    FileId,
+    path_start: u32,
+    path_end:   u32,
+    depth:      u16,
+}
+
+/// Bitset of fragment presence, row-major: row `i` = fragments found in file `i`.
+/// Row width is `words_per_file` u64s.
+/// (almost always 1, since fragment_count is typically single digits to low dozens).
+#[derive(Default)]
+pub struct FragmentPresenceBits {
+    pub words:          Vec<u64>,
+    pub words_per_file: usize,
+    pub fragment_count: usize,
+}
+
+impl FragmentPresenceBits {
+    #[inline]
+    pub fn new(fragment_count: usize) -> Self {
+        Self {
+            words: Vec::new(),
+            words_per_file: (fragment_count + 63) / 64,
+            fragment_count,
+        }
+    }
+
+    #[inline]
+    pub fn full_mask(&self) -> u64 {
+        let rem = self.fragment_count % 64;
+        if self.words_per_file == 0 { 0 }
+        else if rem == 0            { u64::MAX }
+        else                        { (1u64 << rem) - 1 }
+    }
+
+    #[inline]
+    pub fn push_all_fragments_present(&mut self) {
+        for w in 0..self.words_per_file {
+            self.words.push(if w + 1 == self.words_per_file { self.full_mask() } else { u64::MAX });
+        }
+    }
+
+    #[inline]
+    pub fn push_row(&mut self, row: &[u64]) {
+        debug_assert_eq!(row.len(), self.words_per_file);
+        self.words.extend_from_slice(row);
+    }
+
+    #[inline]
+    pub fn row(&self, file_idx: usize) -> &[u64] {
+        let s = file_idx * self.words_per_file;
+        &self.words[s..s + self.words_per_file]
+    }
+
+    #[inline]
+    pub fn get(&self, file_idx: usize, frag_idx: usize) -> bool {
+        self.row(file_idx)[frag_idx / 64] & (1 << (frag_idx % 64)) != 0
+    }
+}
+
 pub struct WorkerResult<'a> {
     pub stats: Box<Stats>,
 
     pub parser: Parser<'a>,
 
-    pub file_keys: Vec<FileKey>,
+    pub file_keys:  Vec<FileKey>,
     pub file_metas: Vec<FileMeta>,
 
-    pub path_buf: Box<SmallPathBuf>,
-    pub newlines_scratch: Vec<u32>,  // Reused across `find_and_print_matches` calls
-    pub ranges_scratch: Vec<(u32, u32)>,  // Reused across `find_and_print_matches` calls
+    pub path_buf:      Box<SmallPathBuf>,
+    pub swap_path_buf: Box<SmallPathBuf>,
 
-    /// Per-fragment presence: fragment_presence[file_idx * fragment_count..(file_idx + 1) * fragment_count][frag_idx] = true if fragment is in file
-    pub fragment_presence: Vec<bool>
+    // Reused across `find_and_print_matches` calls
+    pub          newlines_scratch: Vec<u32>,
+    pub            ranges_scratch: Vec<(u32, u32)>,
+    pub fragment_presence_scratch: Vec<u64>,
+
+    pub         path_arena: PathArena,
+    pub file_entries_arena: FileEntryArena,
+    pub      subdirs_arena: SubdirsArena,
+
+    pub fragment_presence:  FragmentPresenceBits,
 }
 
 pub struct WorkerContext<'a, 'output_arena, F: RawFs, S: MatchSink> {
-    pub fs: &'a F,                            // 0
-    pub cache: Option<&'a FragmentCache>,     // 8
-    pub fragment_hashes: &'a [u32],           // 16
-    pub matcher: &'a Matcher,                 // 32
-    pub cli: &'a Cli,                         // 40
+    // ----- Setup-once
+    pub fs:              &'a F,
+    pub cache:    Option<&'a FragmentCache>,
+    pub fragment_hashes: &'a [u32],
+    pub matcher:         &'a Matcher,
+    pub cli:             &'a Cli,
 
-    pub parser: Parser<'output_arena>,        // 48, spans lines 0-3
+    pub parser: Parser<'output_arena>,
 
-    // =============== Cache line 4 ======================
+    // ----- Hot
+    pub         path_arena: PathArena,          // 24
+    pub file_entries_arena: FileEntryArena,     // 24
+    pub      subdirs_arena: SubdirsArena,       // 24
 
-    // Reused across `find_and_print_matches` calls
-    pub newlines_scratch: Vec<u32>,           // 224
-    pub ranges_scratch: Vec<(u32, u32)>,      // 248
+    pub      path_buf:      Box<SmallPathBuf>,  // 8
+    pub swap_path_buf:      Box<SmallPathBuf>,  // 8
 
-    pub chunk_carry: Option<Box<ChunkCarry>>, // 272
+    pub stats:              Box<Stats>,         // 8
 
-    // =============== Cache line 5 ======================
+    // ----- Warm
+    pub          newlines_scratch: Vec<u32>,
+    pub            ranges_scratch: Vec<(u32, u32)>,
+    pub fragment_presence_scratch: Vec<u64>,
 
-    pub pending_file_keys: Vec<FileKey>,      // 280
-    pub pending_file_metas: Vec<FileMeta>,    // 304
-    pub pending_fragment_presence: Vec<bool>, // 328
+    pub chunk_carry:               Option<Box<ChunkCarry>>,
 
-    pub sink: S,                              // 352
-    pub output_tx: Sender<&'static [u8]>,     // 360
+    pub pending_file_keys:         Vec<FileKey>,
+    pub pending_file_metas:        Vec<FileMeta>,
+    pub pending_fragment_presence: FragmentPresenceBits,
 
-    // =============== Cache line 6 ======================
+    pub worker_id:                 u16,
 
-    pub path_buf: Box<SmallPathBuf>,          // 368
-    pub stats: Box<Stats>,                    // 376
-    pub worker_id: u16,                       // 384
+    // ----- Cold / output plumbing ----
+    pub sink: S,
+    pub output_tx: Sender<&'static [u8]>,
 }
 
 impl<'a, 'output_arena, F: RawFs, S: MatchSink> WorkerContext<'a, 'output_arena, F, S> {
@@ -288,10 +406,15 @@ impl<'a, 'output_arena, F: RawFs, S: MatchSink> WorkerContext<'a, 'output_arena,
         WorkerResult {
             stats: self.stats,
             parser: self.parser,
+            path_arena: self.path_arena,
+            file_entries_arena: self.file_entries_arena,
             path_buf: self.path_buf,
+            swap_path_buf: self.swap_path_buf,
+            subdirs_arena: self.subdirs_arena,
             ranges_scratch: self.ranges_scratch,
             newlines_scratch: self.newlines_scratch,
             file_keys: self.pending_file_keys,
+            fragment_presence_scratch: self.fragment_presence_scratch,
             file_metas: self.pending_file_metas,
             fragment_presence: self.pending_fragment_presence
         }
@@ -328,16 +451,62 @@ impl<'a, 'output_arena, F: RawFs, S: MatchSink> WorkerContext<'a, 'output_arena,
 impl<F: RawFs, S: MatchSink> WorkerContext<'_, '_, F, S> {
     pub fn dispatch_directory(
         &mut self,
-        mut work: DirWork,
+        work: DirWork,
+        local: &DequeWorker<WorkItem>,
+        injector: &Injector<WorkItem>,
+    ) -> io::Result<()> {
+        let mark = self.path_arena.len();
+        let (start, end) = self.path_arena.push_path(&[], false, &work.path_bytes);
+
+        let result = self.dispatch_directory_bytes(
+            work.file_id, start, end, &work.gitignore_chain, work.depth, local, injector,
+        );
+
+        //
+        // Everything pushed under this subtree either got copied out into its
+        // own Arc (for queued work) or is no longer needed (fully processed locally).
+        //
+        // Safe to reclaim the whole thing now that the top-level
+        // call has returned.
+        //
+        self.path_arena.truncate(mark);
+
+        result
+    }
+
+    #[inline]
+    pub fn dispatch_file(&mut self, work: FileWork) -> io::Result<()> {
+        let Ok(node) = self.fs.parse_node(work.file_id) else {
+            return Ok(());
+        };
+
+        let name_fat_ptr = BufFatPtr {
+            offset: 0,
+            len: 0,
+            kind: BufKind::File,
+        };
+
+        self.process_file(&node, name_fat_ptr, &[], &work.gitignore_chain)?;
+
+        Ok(())
+    }
+
+    pub fn dispatch_directory_bytes(
+        &mut self,
+        file_id: u64,
+        path_start: u32,
+        path_end: u32,
+        gitignore_chain: &GitignoreChain,
+        depth: u16,
         local: &DequeWorker<WorkItem>,
         injector: &Injector<WorkItem>,
     ) -> io::Result<()> {
         let _span = tracy::span!("process_directory_with_stealing");
 
         self.path_buf.clear();
-        self.path_buf.extend_from_slice(&work.path_bytes);
+        self.path_buf.extend_from_slice(self.path_arena.slice(path_start, path_end));
 
-        let Ok(node) = self.fs.parse_node(work.file_id) else {
+        let Ok(node) = self.fs.parse_node(file_id) else {
             return Ok(());
         };
 
@@ -345,12 +514,13 @@ impl<F: RawFs, S: MatchSink> WorkerContext<'_, '_, F, S> {
             return Ok(());
         }
 
-        if likely(!work.path_bytes.is_empty()) {
-            let last_segment = work.path_bytes
+        if likely(path_end > path_start) {
+            let bytes = self.path_arena.slice(path_start, path_end);
+            let last_segment = bytes
                 .iter()
                 .rposition(|&b| b == MAIN_SEPARATOR as _)
-                .map(|pos| &work.path_bytes[pos + 1..])
-                .unwrap_or(&work.path_bytes);
+                .map(|pos| &bytes[pos + 1..])
+                .unwrap_or(bytes);
 
             if is_common_skip_dir(last_segment) {
                 self.stats.dirs_skipped_common += 1;
@@ -362,57 +532,22 @@ impl<F: RawFs, S: MatchSink> WorkerContext<'_, '_, F, S> {
         self.fs.read_file_content(&mut self.parser, &node, dir_size, BufKind::Dir, false)?;
         self.stats.dirs_encountered += 1;
 
-        let gitignore_chain = self.cli.should_ignore_gitignore().not().then(|| {
-            self.find_gitignore_file_id_in_buf(BufKind::Dir).and_then(|gi_file_id|
-                self.try_load_gitignore(gi_file_id)
-            ).map(|gi| {
-                let old_gi = mem::take(&mut work.gitignore_chain);
-                old_gi.with_gitignore(work.depth, gi)
-            })
-        }).flatten().unwrap_or_else(|| work.gitignore_chain.clone());
+        let new_gitignore_chain = self.cli.should_ignore_gitignore().not().then(|| {
+            self.find_gitignore_file_id_in_buf(BufKind::Dir)
+                .and_then(|gi_file_id| self.try_load_gitignore(gi_file_id))
+                .map(|gi| gitignore_chain.clone().with_gitignore(depth, gi))
+        }).flatten().unwrap_or_else(|| gitignore_chain.clone());
 
         let scan = self.parser.scan_directory_entries(self.fs);
 
-        self.process_directory(
-            work,
-            gitignore_chain,
-            &scan.entries,
-            local,
-            injector,
-        )?;
-
-        Ok(())
-    }
-
-    #[inline]
-    pub fn dispatch_file(&mut self, work: FileWork) -> io::Result<()> {
-        let Ok(node) = self.fs.parse_node(work.file_id) else {
-            return Ok(());
-        };
-
-        let name_offset = work.path_bytes
-            .iter()
-            .rposition(|&b| b == MAIN_SEPARATOR as u8)
-            .map(|pos| pos + 1)
-            .unwrap_or(0);
-
-        let name_fat_ptr = BufFatPtr {
-            offset: name_offset as _,
-            kind: BufKind::File,
-            len: (work.path_bytes.len() - name_offset) as _,
-        };
-
-        self.path_buf.clear();
-        self.path_buf.extend_from_slice(&work.path_bytes);
-
-        self.process_file(&node, name_fat_ptr, &work.path_bytes, &work.gitignore_chain)?;
+        self.process_directory(depth, new_gitignore_chain, &scan.entries, local, injector)?;
 
         Ok(())
     }
 
     fn process_directory(
         &mut self,
-        work: DirWork,
+        depth: u16,
         gitignore_chain: GitignoreChain,
         entries: &[ParsedEntry<FileId>],
         local: &DequeWorker<WorkItem>,
@@ -420,11 +555,11 @@ impl<F: RawFs, S: MatchSink> WorkerContext<'_, '_, F, S> {
     ) -> io::Result<()> {
         let _span = tracy::span!("process_small_directory_with_entries");
 
-        let mut subdirs = SmallVec::<[DirWork; 16]>::new();
-        let needs_slash = !work.path_bytes.is_empty();
-        let parent_path_len = work.path_bytes.len();
+        let needs_slash = !self.path_buf.is_empty();
 
-        let mut file_entries: SmallVec<[_; 64]> = SmallVec::new();
+        let subdir_mark = self.subdirs_arena.len();
+        let   file_mark = self.file_entries_arena.len();
+        let   path_mark = self.path_arena.len();
 
         for entry in entries {
             let name_bytes = unsafe {
@@ -435,16 +570,17 @@ impl<F: RawFs, S: MatchSink> WorkerContext<'_, '_, F, S> {
 
             let ft = match entry.file_type {
                 FileType::Other => {
-                    // Unknown - parse node to get type
+                    //
+                    // Unknown - parse node to get the type...
+                    //
+
                     let Ok(child_node) = self.fs.parse_node(entry.file_id) else {
-                        continue;
+                        continue
                     };
-                    if child_node.is_dir() {
-                        FileType::Dir
-                    } else {
-                        FileType::File
-                    }
+
+                    if child_node.is_dir() { FileType::Dir } else { FileType::File }
                 }
+
                 x => x
             };
 
@@ -454,33 +590,26 @@ impl<F: RawFs, S: MatchSink> WorkerContext<'_, '_, F, S> {
                         continue;
                     }
 
-                    let mut child_path: SmallVec<[u8; 512]> = SmallVec::new();
-                    child_path.reserve_exact(
-                        parent_path_len + needs_slash as usize + entry.name_len as usize
-                    );
-                    child_path.extend_from_slice(&work.path_bytes);
-                    if needs_slash {
-                        child_path.push(MAIN_SEPARATOR as _);
-                    }
-                    child_path.extend_from_slice(name_bytes);
+                    let (start, end) = self.path_arena.push_path(&self.path_buf, needs_slash, name_bytes);
 
                     if !self.cli.should_ignore_gitignore() && !gitignore_chain.is_empty() {
-                        if gitignore_chain.is_ignored(&child_path, true) {
+                        if gitignore_chain.is_ignored(self.path_arena.slice(start, end), true) {
                             self.stats.dirs_skipped_gitignore += 1;
+                            self.path_arena.truncate(start);
                             continue;
                         }
                     }
 
-                    subdirs.push(DirWork {
+                    self.subdirs_arena.push(PendingSubdir {
                         file_id: entry.file_id,
-                        path_bytes: crate::util::smallvec_into_arc_slice_noshrink(child_path),
-                        gitignore_chain: gitignore_chain.clone(),
-                        depth: work.depth + 1,
+                        path_start: start,
+                        path_end: end,
+                        depth: depth + 1,
                     });
                 }
 
                 FileType::File => {
-                    file_entries.push((entry.file_id, BufFatPtr {
+                    self.file_entries_arena.push((entry.file_id, BufFatPtr {
                         offset: entry.name_offset as _,
                         kind: BufKind::Dir,
                         len: entry.name_len as _
@@ -491,50 +620,89 @@ impl<F: RawFs, S: MatchSink> WorkerContext<'_, '_, F, S> {
             }
         }
 
-        self.fs.sort_entries(&mut file_entries);
+        self.fs.sort_entries(&mut self.file_entries_arena[file_mark..]);
 
-        self.process_files(&file_entries, &work.path_bytes, &gitignore_chain)?;
+        let path_buf = std::mem::replace(&mut self.path_buf, std::mem::take(&mut self.swap_path_buf));
+        let file_result = self.process_files(file_mark, self.file_entries_arena.len(), &path_buf, &gitignore_chain);
 
-        /// Decide how many subdirs to keep local vs push for stealing
+        self.swap_path_buf = std::mem::replace(&mut self.path_buf, path_buf);
+        self.file_entries_arena.truncate(file_mark);
+
+        //
+        // Don't propagate yet -- subdirs still need to be queued/dispatched and
+        // both arenas still need truncating regardless of whether file
+        // processing in this directory succeeded.
+        //
+        let mut first_err = file_result.err();
+
+        // Decide how many subdirs to keep local vs push for stealing
         #[inline]
         fn work_distribution_strategy(depth: u16, subdir_count: usize) -> usize {
-            if subdir_count == 0 {
-                return 0;
-            }
-
+            if subdir_count == 0 { return 0; }
             match depth {
                 0..=1 => 1,
                 2..=3 => subdir_count.min(2),
                 4..=6 => subdir_count.min(4),
-                _ => subdir_count.min(8),
+                _     => subdir_count.min(8),
             }
         }
 
-        let keep_local = work_distribution_strategy(work.depth, subdirs.len());
-        for subdir in subdirs.drain(keep_local..).rev() {
-            local.push(WorkItem::Directory(subdir));
+        let n = self.subdirs_arena.len() - subdir_mark;
+        let keep_local = work_distribution_strategy(depth, n);
+        let queue_start = subdir_mark + keep_local;
+        let queue_end = self.subdirs_arena.len();
+
+        //
+        // Tail -> queued
+        //
+
+        for i in (queue_start..queue_end).rev() {
+            let p = *unsafe { self.subdirs_arena.get_unchecked(i) };
+            local.push(WorkItem::Directory(DirWork {
+                file_id: p.file_id,
+                path_bytes: Arc::from(self.path_arena.slice(p.path_start, p.path_end)),
+                gitignore_chain: gitignore_chain.clone(),
+                depth: p.depth,
+            }));
         }
 
-        for subdir in subdirs {
-            self.dispatch_directory(subdir, local, injector)?;
+        //
+        // Head -> dispatched locally
+        //
+
+        for i in subdir_mark..queue_start {
+            let p = *unsafe { self.subdirs_arena.get_unchecked(i) };
+            if let Err(e) = self.dispatch_directory_bytes(
+                p.file_id,
+                p.path_start,
+                p.path_end,
+                &gitignore_chain,
+                p.depth,
+                local,
+                injector,
+            ) {
+                first_err.get_or_insert(e);
+            }
         }
 
-        Ok(())
+        self.subdirs_arena.truncate(subdir_mark);
+        self.path_arena.truncate(path_mark);
+
+        if let Some(e) = first_err { Err(e) } else { Ok(()) }
     }
 
     fn process_files(
         &mut self,
-        files: &[(FileId, BufFatPtr)],
+        start_files: usize,
+        end_files: usize,
         parent_path: &[u8],
         gitignore_chain: &GitignoreChain,
     ) -> io::Result<()> {
-        if files.is_empty() {
-            return Ok(());
-        }
-
         let _span = tracy::span!("process_files");
 
-        for &(file_id, name_fat_ptr) in files {
+        for i in start_files..end_files {
+            let (file_id, name_fat_ptr) = *unsafe { self.file_entries_arena.get_unchecked(i) };
+
             let Ok(node) = self.fs.parse_node(file_id) else {
                 continue;
             };
@@ -618,11 +786,15 @@ impl<F: RawFs, S: MatchSink> WorkerContext<'_, '_, F, S> {
         };
 
         if let Some((file_key, file_meta)) = cache_key {
-            let presence = self.check_fragment_presence(found_any);
-
             self.pending_file_keys.push(file_key);
             self.pending_file_metas.push(file_meta);
-            self.pending_fragment_presence.extend_from_slice(&presence);
+
+            if found_any {
+                self.pending_fragment_presence.push_all_fragments_present();
+            } else {
+                self.check_fragment_presence();
+                self.pending_fragment_presence.push_row(&self.fragment_presence_scratch);
+            }
         }
 
         Ok(())
@@ -648,7 +820,7 @@ impl<F: RawFs, S: MatchSink> WorkerContext<'_, '_, F, S> {
         self.stats.files_searched += 1;
         self.stats.bytes_searched += self.parser.file.len() as u64;
 
-        self.find_and_print_matches(node.is_dir())
+        self.find_and_print_matches()
     }
 
     #[inline(never)]
@@ -694,14 +866,14 @@ impl<F: RawFs, S: MatchSink> WorkerContext<'_, '_, F, S> {
             carry.tail.clear();
 
             let combined = std::mem::take(&mut carry.combine_buf);
-            self.find_and_print_matches_in_chunk(&combined, &mut carry, false, node.is_dir())?;
+            self.find_and_print_matches_in_chunk(&combined, &mut carry, false)?;
             carry.combine_buf = combined;
         }
 
         // Flush final partial line (no trailing newline)
         if !carry.tail.is_empty() {
             let tail = std::mem::take(&mut carry.tail);
-            self.find_and_print_matches_in_chunk(&tail, &mut carry, true, node.is_dir())?;
+            self.find_and_print_matches_in_chunk(&tail, &mut carry, true)?;
             carry.tail = tail;
             carry.tail.clear();
         }
@@ -719,21 +891,27 @@ impl<F: RawFs, S: MatchSink> WorkerContext<'_, '_, F, S> {
     }
 
     #[inline]
-    fn check_fragment_presence(&self, had_matches: bool) -> SmallVec<[bool; 32]> {
+    fn check_fragment_presence(&mut self) {
         let _span = tracy::span!("check_fragment_presence");
 
-        // ----- Fast path: if pattern matched, all pattern fragments must be present
-        if had_matches {
-            return smallvec![true; self.fragment_hashes.len()];
+        // Reset all presence to false
+        unsafe {
+            std::ptr::write_bytes(
+                self.fragment_presence_scratch.as_mut_ptr(),
+                0,
+                self.fragment_presence_scratch.len()
+            );
         }
 
-        crate::fragments::check_fragment_presence(&self.parser.file, self.fragment_hashes)
+        crate::fragments::check_fragment_presence(
+            &self.parser.file, self.fragment_hashes, &mut self.fragment_presence_scratch
+        );
     }
 }
 
 // impl block for printng matches
 impl<F: RawFs, S: MatchSink> WorkerContext<'_, '_, F, S> {
-    fn find_and_print_matches(&mut self, is_dir: bool) -> io::Result<bool> {
+    fn find_and_print_matches(&mut self) -> io::Result<bool> {
         let _span = tracy::span!("find_and_print_matches");
 
         let buf = &self.parser.file;
@@ -773,7 +951,7 @@ impl<F: RawFs, S: MatchSink> WorkerContext<'_, '_, F, S> {
                     if self.parser.output.capacity() - self.parser.output.len() < needed {
                         self.parser.output.reserve(needed);
                     }
-                    Self::write_file_header(&mut self.parser.output, self.cli, &self.path_buf, should_print_color, is_dir);
+                    Self::write_file_header(&mut self.parser.output, self.cli, &self.path_buf, should_print_color);
                 }
 
                 Self::write_match_line(
@@ -808,7 +986,6 @@ impl<F: RawFs, S: MatchSink> WorkerContext<'_, '_, F, S> {
         data: &[u8],
         carry: &mut ChunkCarry,
         is_last: bool,
-        is_dir: bool
     ) -> io::Result<()> {
         let _span = tracy::span!("match_chunk");
 
@@ -859,7 +1036,7 @@ impl<F: RawFs, S: MatchSink> WorkerContext<'_, '_, F, S> {
                     if self.parser.output.capacity() - self.parser.output.len() < needed {
                         self.parser.output.reserve(needed);
                     }
-                    Self::write_file_header(&mut self.parser.output, self.cli, &self.path_buf, should_print_color, is_dir);
+                    Self::write_file_header(&mut self.parser.output, self.cli, &self.path_buf, should_print_color);
                 }
 
                 Self::write_match_line(
@@ -949,7 +1126,6 @@ impl<F: RawFs, S: MatchSink> WorkerContext<'_, '_, F, S> {
         cli:               &Cli,
         path:              &[u8],
         should_print_color: bool,
-        is_dir: bool
     ) {
         if cli.jump { return; } // jump mode writes path per-line, not as a header
 
@@ -959,7 +1135,7 @@ impl<F: RawFs, S: MatchSink> WorkerContext<'_, '_, F, S> {
         let ends_with_slash = root.last() == Some(&(MAIN_SEPARATOR as _));
 
         output.extend_from_slice(root);
-        if is_dir && !ends_with_slash { output.push(MAIN_SEPARATOR as _); }
+        if !ends_with_slash { output.push(MAIN_SEPARATOR as _); }
         output.extend_from_slice(path);
 
         if should_print_color { output.extend_from_slice(COLOR_RESET.as_bytes()); }

@@ -38,16 +38,12 @@ pub mod platform;
 
 #[cfg(feature = "small")]
 pub(crate) extern crate regex_tiny as regex;
-#[cfg(feature = "small")]
-pub(crate) extern crate clap_tiny as clap;
 
 pub use tracing;
 pub use crossbeam_channel;
 
 #[cfg(not(feature = "small"))]
 pub(crate) extern crate regex_full as regex;
-#[cfg(not(feature = "small"))]
-pub(crate) extern crate clap_full as clap;
 
 pub use error::Error;
 pub type Result<T> = std::result::Result<T, Error>;
@@ -165,9 +161,9 @@ impl RawGrepConfig {
     #[inline]
     pub fn from_cli(c: cli::Cli) -> Self {
         RawGrepConfig {
-            pattern:          c.pattern,
-            search_root_path: c.search_root_path,
-            device:           c.device,
+            pattern:          c.pattern.into_boxed_str(),
+            search_root_path: c.search_root_path.into_boxed_str(),
+            device:           c.device.map(Into::into),
             no_ignore:        c.no_ignore,
             binary:           c.binary,
             large:            c.large,
@@ -180,7 +176,7 @@ impl RawGrepConfig {
             threads:          c.threads,
             no_cache:         c.no_cache,
             cache_size_mb:    c.cache_size_mb,
-            cache_dir:        c.cache_dir,
+            cache_dir:        c.cache_dir.map(Into::into),
             rebuild_cache:    c.rebuild_cache,
         }
     }
@@ -188,9 +184,9 @@ impl RawGrepConfig {
     #[inline]
     pub fn to_cli(&self) -> cli::Cli {
         cli::Cli {
-            pattern:          self.pattern.clone(),
-            search_root_path: self.search_root_path.clone(),
-            device:           self.device.clone(),
+            pattern:          self.pattern.clone().into_string(),
+            search_root_path: self.search_root_path.clone().into_string(),
+            device:           self.device.clone().map(String::from),
             no_ignore:        self.no_ignore,
             binary:           self.binary,
             large:            self.large,
@@ -203,7 +199,7 @@ impl RawGrepConfig {
             threads:          self.threads,
             no_cache:         self.no_cache,
             cache_size_mb:    self.cache_size_mb,
-            cache_dir:        self.cache_dir.clone(),
+            cache_dir:        self.cache_dir.clone().map(std::path::PathBuf::from),
             rebuild_cache:    self.rebuild_cache,
         }
     }

@@ -1,6 +1,6 @@
 [package]
 name = "rawgrep"
-version = "0.1.5"
+version = "0.1.6"
 edition = "2024"
 authors = ["Mark Tyrkba <marktyrkba456@gmail.com>"]
 readme = "README.md"
@@ -30,21 +30,21 @@ dhat = ["dep:dhat"]
 #        -Z build-std=std,panic_abort \
 #        -Z build-std-features= \
 #         --profile=release-fast --target=x86_64-unknown-linux-gnu --no-default-features --features=use_nightly,small,mimalloc
-small = ["regex-tiny", "clap-tiny"]
+small = ["regex-tiny"]
 
-full  = ["regex-full", "clap-full"]
+full  = ["regex-full"]
+
+only_log_errors = ["tracing/max_level_error", "tracing/release_max_level_error"]
+only_log_errors_in_release = ["tracing/release_max_level_error"]
 
 [dependencies]
 regex-full = { package="regex", version="1", default-features=false, features=["std", "perf"], optional=true }
 regex-tiny = { package="regex", version="1", default-features=false, optional=true }
 
-clap-full  = { package="clap", version="4.5", default-features=false, features=["std", "help", "derive"], optional=true }
-clap-tiny  = { package="clap", version="4.5", default-features=false, features=["std", "derive"], optional=true }
-
 aho-corasick = { version = "1.1.4", default-features = false }
 smallvec = { version = "1.15.1", features = ["const_generics"] }
 mimalloc = { version = "=0.1.47", optional = true }
-ctrlc = { version = "3.5.1", default-features = false }
+ctrlc = { version = "3.5.2", default-features = false }
 memchr = { version = "2.7.6", default-features = false, features = ["std"] }
 libc = { version = "0.2.177", default-features = false }
 tracy-client = { version = "0.17.3", default-features = false }
@@ -56,12 +56,14 @@ bytemuck = { version = "1.24", features = ["derive"] }
 dhat = { version = "0.3.3", default-features = false, optional = true }
 nohash-hasher = "0.2.0"
 parking_lot = "0.12.5"
-tracing             = "0.1"
-tracing-subscriber  = { version = "0.3", features = ["env-filter"] }
 bumpalo = { version = "3.20.2", features = ["collections"] }
 
+tracing             = "0.1"
+tracing-subscriber  = { version = "0.3", features = ["env-filter"] }
+bpaf = { version = "0.9.27", features = ["derive"] }
+
 [target.'cfg(not(target_os = "macos"))'.dependencies]
-gdt-cpus = { version = "25", default-features = false }
+gdt-cpus = { version = "0.2606.1", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
@@ -78,6 +80,9 @@ tempfile = "3"
 
 [build-dependencies]
 rustc_version = "0.2"
+
+[profile.release]
+debug = 1
 
 [profile.release-debug]
 inherits = "release"
