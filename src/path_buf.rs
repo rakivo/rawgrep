@@ -8,7 +8,7 @@ pub struct SmallPathBuf<const N: usize = 0x100> {
 
 impl<const N: usize> Default for SmallPathBuf<N> {
     fn default() -> Self {
-        Self::new()
+        Self { buf: SmallVec::new() }
     }
 }
 
