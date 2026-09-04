@@ -46,13 +46,8 @@ impl<F: RawFs, S: MatchSink> RawGrepper<F, S> {
             config.ignore_cache = cli.rebuild_cache;
 
             match FragmentCache::new(&config) {
-                Ok(mut cache) => {
-                    for &frag_hash in &fragment_hashes {
-                        cache.add_pattern_fragment(frag_hash);
-                    }
+                Ok(cache) => Some(cache),
 
-                    Some(cache)
-                }
                 Err(e) => {
                     eprintln!("Warning: Failed to initialize cache: {e}");
                     None
@@ -387,6 +382,11 @@ impl<F: RawFs, S: MatchSink> RawGrepper<F, S> {
     }
 
     #[inline]
+    pub fn fragment_hashes_and_cache_mut(&mut self) -> (&[u32], Option<&mut FragmentCache>) {
+        (&self.fragment_hashes, self.cache.as_mut())
+    }
+
+    #[inline]
     pub fn selected_fragment_hash_len(&self) -> FragmentLen {
         self.selected_fragment_hash_len
     }
@@ -459,6 +459,15 @@ impl<S: MatchSink> AnyGrepper<S> {
             AnyGrepper::Ext4(g) => g.cache_mut(),
             AnyGrepper::Apfs(g) => g.cache_mut(),
             AnyGrepper::Ntfs(g) => g.cache_mut(),
+        }
+    }
+
+    #[inline]
+    pub fn fragment_hashes_and_cache_mut(&mut self) -> (&[u32], Option<&mut FragmentCache>) {
+        match self {
+            AnyGrepper::Ext4(g) => g.fragment_hashes_and_cache_mut(),
+            AnyGrepper::Apfs(g) => g.fragment_hashes_and_cache_mut(),
+            AnyGrepper::Ntfs(g) => g.fragment_hashes_and_cache_mut(),
         }
     }
 }

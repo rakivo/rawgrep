@@ -1277,18 +1277,6 @@ impl<S: CacheStorage> FragmentCache<S> {
         Ok(())
     }
 
-    /// Add pattern fragment to cache (called during initialization)
-    #[inline]
-    pub fn add_pattern_fragment(&mut self, frag_hash: u32) {
-        // Cache hit must NEVER TRIGGER COW.
-        if self.find_fragment_index(frag_hash).is_some() {
-            return;
-        }
-
-        self.ensure_owned();
-        self.add_fragment(frag_hash);
-    }
-
     /// Add fragment to ring buffer (returns index)
     /// NOTE: Caller must call ensure_owned() first!
     fn add_fragment(&mut self, frag_hash: u32) -> usize {

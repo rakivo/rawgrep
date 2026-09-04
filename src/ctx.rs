@@ -187,15 +187,15 @@ impl<S: MatchSink + 'static> RawGrepCtx<S> {
             return;
         };
 
-        let fragment_hashes = job.grepper.fragment_hashes().to_owned();  // @Clone
-
         let mut acc = job.cache_acc.lock();
         let file_keys         = std::mem::take(&mut acc.file_keys);
         let file_metas        = std::mem::take(&mut acc.file_metas);
         let fragment_presence = std::mem::take(&mut acc.fragment_presence);
 
-        if let Some(cache) = &mut job.grepper.cache_mut() {
-            _ = cache.merge_updates(file_keys, file_metas, &fragment_hashes, fragment_presence);
+        let (fragment_hashes, cache) = job.grepper.fragment_hashes_and_cache_mut();
+
+        if let Some(cache) = cache {
+            _ = cache.merge_updates(file_keys, file_metas, fragment_hashes, fragment_presence);
             _ = cache.save_to_disk();
 
             debug!("[ctx] successfully saved cache");
