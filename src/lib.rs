@@ -50,6 +50,7 @@ pub(crate) extern crate regex_full as regex;
 pub use error::Error;
 pub type Result<T> = std::result::Result<T, Error>;
 pub use stats::Stats;
+pub use cache::CacheStats;
 pub use grep::RawGrepper;
 pub use ctx::RawGrepCtx;
 
@@ -220,7 +221,7 @@ pub fn run<S: MatchSink + 'static>(
     config: RawGrepConfig,
     running: Arc<AtomicBool>,
     sink: S,
-) -> Result<Stats> {
+) -> Result<(Stats, Option<CacheStats>)> {
     run_with_inspect(config, running, sink, |_, _, _, _| {})
 }
 
@@ -230,7 +231,7 @@ pub fn run_with_inspect<S: MatchSink + 'static>(
     running: Arc<AtomicBool>,
     sink: S,
     inspect_before_search: impl FnOnce(&Path, &str, FsType, &str) // (search root, device, fs, pattern)
-) -> Result<Stats> {
+) -> Result<(Stats, Option<CacheStats>)> {
     let threads = config.threads.get();
     let mut ctx = RawGrepCtx::new(threads, running);
     ctx.search(config, sink, inspect_before_search)?;

@@ -8,6 +8,7 @@ use crate::apfs::{ApfsFs, ApfsVolume, APFS_NX_MAGIC};
 use crate::cli::Cli;
 use crate::matcher::Matcher;
 use crate::ntfs::NtfsFs;
+use crate::fragments::FragmentLen;
 use crate::util::read_at_offset;
 use crate::{Result, Error, tracy};
 use crate::platform::device_id;
@@ -24,6 +25,7 @@ pub struct RawGrepper<F: RawFs, S: MatchSink = NoSink> {
     matcher: Matcher,
     cache: Option<FragmentCache>,
     fragment_hashes: Vec<u32>,
+    selected_fragment_hash_len: FragmentLen,
     pub sink: S
 }
 
@@ -31,7 +33,12 @@ pub struct RawGrepper<F: RawFs, S: MatchSink = NoSink> {
 impl<F: RawFs, S: MatchSink> RawGrepper<F, S> {
     pub fn new_with_fs(cli: &Cli, fs: F, sink: S) -> Result<Self> {
         let matcher = make_matcher(cli)?;
-        let fragment_hashes = matcher.extract_fragment_hashes();
+
+        // `None` means the pattern is too short for any window to be useful -- treat that the same as "no fragments".
+        let (fragment_hashes, selected_fragment_hash_len) = match matcher.extract_fragment_hashes() {
+            Some((hashes, fragment_len)) => (hashes, FragmentLen::from_fragment_len(fragment_len)),
+            None => (Vec::new(), FragmentLen::Four),
+        };
 
         let cache = if !cli.no_cache && !fragment_hashes.is_empty() {
             let mut config = CacheConfig::from_memory_mb(cli.cache_size_mb);
@@ -55,7 +62,7 @@ impl<F: RawFs, S: MatchSink> RawGrepper<F, S> {
             None
         };
 
-        Ok(RawGrepper { cli: cli.clone(), fs, matcher, cache, fragment_hashes, sink })
+        Ok(RawGrepper { cli: cli.clone(), fs, matcher, cache, fragment_hashes, sink, selected_fragment_hash_len })
     }
 
     /// Resolve a path like "/usr/bin" or "etc" into a file ID.
@@ -380,6 +387,11 @@ impl<F: RawFs, S: MatchSink> RawGrepper<F, S> {
     }
 
     #[inline]
+    pub fn selected_fragment_hash_len(&self) -> FragmentLen {
+        self.selected_fragment_hash_len
+    }
+
+    #[inline]
     pub fn fragment_hashes(&self) -> &[u32] {
         &self.fragment_hashes
     }
@@ -420,6 +432,15 @@ impl<S: MatchSink> AnyGrepper<S> {
             AnyGrepper::Ext4(g) => g.fragment_hashes(),
             AnyGrepper::Apfs(g) => g.fragment_hashes(),
             AnyGrepper::Ntfs(g) => g.fragment_hashes(),
+        }
+    }
+
+    #[inline]
+    pub fn selected_fragment_hash_len(&self) -> FragmentLen {
+        match self {
+            AnyGrepper::Ext4(g) => g.selected_fragment_hash_len(),
+            AnyGrepper::Apfs(g) => g.selected_fragment_hash_len(),
+            AnyGrepper::Ntfs(g) => g.selected_fragment_hash_len(),
         }
     }
 

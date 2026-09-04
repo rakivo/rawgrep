@@ -10,6 +10,7 @@ use crate::ignore::{Gitignore, GitignoreChain};
 use crate::matcher::Matcher;
 use crate::binary::is_binary_ext;
 use crate::path_buf::SmallPathBuf;
+use crate::fragments::FragmentLen;
 use crate::stats::Stats;
 use crate::stdout::RawStdout;
 use crate::parser::{BufFatPtr, BufKind, FileId, FileNode, FileType, ParsedEntry, Parser, RawFs};
@@ -381,6 +382,7 @@ pub struct WorkerCtx<'a, 'output_arena, F: RawFs, S: MatchSink> {
     pub fragment_hashes: &'a [u32],
     pub matcher:         &'a Matcher,
     pub cli:             &'a Cli,
+    pub selected_fragment_hash_len: FragmentLen,
 
     pub parser: Parser<'output_arena>,
 
@@ -925,7 +927,10 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, '_, F, S> {
         }
 
         crate::fragments::check_fragment_presence(
-            &self.parser.file, self.fragment_hashes, &mut self.fragment_presence_scratch
+            &self.parser.file,
+            self.fragment_hashes,
+            &mut self.fragment_presence_scratch,
+            self.selected_fragment_hash_len.as_usize()
         );
     }
 }

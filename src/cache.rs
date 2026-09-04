@@ -1,9 +1,11 @@
 #![allow(clippy::needless_range_loop)]
 
+use crate::writeln_blue;
 use crate::util::{likely, unlikely};
 
 use std::time::Instant;
 use std::io::{self};
+use std::fmt::Display;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -51,9 +53,51 @@ impl FileMeta {
 
 #[derive(Debug, Default)]
 pub struct CacheStats {
+    pub hits: u32,
+    pub misses: u32,
+    pub invalidations: u32,
+}
+
+#[derive(Debug, Default)]
+pub struct AtomicCacheStats {
     pub hits: AtomicU32,
     pub misses: AtomicU32,
     pub invalidations: AtomicU32,
+}
+
+impl AtomicCacheStats {
+    pub fn to_cache_stats(&self) -> CacheStats {
+        CacheStats {
+            hits: self.hits.load(Ordering::Relaxed),
+            misses: self.misses.load(Ordering::Relaxed),
+            invalidations: self.invalidations.load(Ordering::Relaxed),
+        }
+    }
+}
+
+impl Display for CacheStats {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let total_lookups = self.hits + self.misses;
+
+        writeln_blue!(f, "Cache Summary:")?;
+
+        macro_rules! cache_row {
+            ($label:expr, $count:expr) => {
+                let pct = if total_lookups == 0 { 0.0 } else { ($count as f64 / total_lookups as f64) * 100.0 };
+                writeln!(f, "  {:<25} {:>8} ({:>5.1}%)", $label, $count, pct)?;
+            };
+        }
+
+        cache_row!("Total lookups", total_lookups);
+        cache_row!("Hits", self.hits);
+        cache_row!("Misses", self.misses);
+
+        if self.invalidations > 0 {
+            writeln!(f, "  {:<25} {:>8}", "Invalidations", self.invalidations)?;
+        }
+
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -381,7 +425,7 @@ pub struct FragmentCache<S: CacheStorage = DiskStorage> {
 
     file_lookup: Box<[AtomicU32]>, // open-addressed hash table
 
-    stats: CacheStats,
+    pub stats: AtomicCacheStats,
 
     storage: S,
 
@@ -530,7 +574,7 @@ impl<S: CacheStorage> FragmentCache<S> {
             owned_file_metas: Some(owned_file_metas),
             owned_file_bitsets: Some(owned_file_bitsets),
             file_lookup,
-            stats: CacheStats::default(),
+            stats: AtomicCacheStats::default(),
             storage
         })
     }
@@ -913,7 +957,7 @@ impl<S: CacheStorage> FragmentCache<S> {
             owned_file_metas:      None,
             owned_file_bitsets:    None,
             file_lookup,
-            stats: CacheStats::default(),
+            stats: AtomicCacheStats::default(),
             storage
         })
     }

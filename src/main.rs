@@ -43,9 +43,12 @@ fn main() -> io::Result<()> {
             eprintln_red!("'{pattern}'");
         }
     ) {
-        Ok(stats) => {
+        Ok((stats, cache_stats)) => {
             if show_stats {
                 eprintln!("{stats}");
+                if let Some(cache_stats) = cache_stats {
+                    eprintln!("{cache_stats}");
+                }
             }
 
             Ok(())

@@ -17,7 +17,7 @@ use crate::path_buf::SmallPathBuf;
 use crate::stdout::RawStdout;
 use crate::{cli, ignore, platform};
 use crate::parser::Parser;
-use crate::cache::{FileKey, FileMeta};
+use crate::cache::{FileKey, FileMeta, CacheStats};
 use crate::stats::{AtomicStats, Stats};
 use crate::grep::{AnyGrepper, FsType, RawGrepper, open_device_and_detect_fs};
 use crate::worker::{DirWork, FileWork, MatchSink, OutputWorker, WorkItem, WorkerCtx, PathArena, FileEntryArena, SubdirsArena, FragmentPresenceBits, OUTPUTTER_FLUSH_BATCH, OutputMessage};
@@ -142,7 +142,7 @@ impl<S: MatchSink + 'static> RawGrepCtx<S> {
     }
 
     #[inline]
-    pub fn wait(&mut self) -> Stats {
+    pub fn wait(&mut self) -> (Stats, Option<CacheStats>) {
         {
             let (lock, cvar) = &*self.running_signal;
             let mut guard = lock.lock();
@@ -159,12 +159,12 @@ impl<S: MatchSink + 'static> RawGrepCtx<S> {
 
         self.current_job.read()
             .as_ref()
-            .map(|j| j.stats.to_stats())
+            .map(|j| (j.stats.to_stats(), j.grepper.cache().map(|c| c.stats.to_cache_stats())))
             .unwrap_or_default()
     }
 
     #[inline]
-    pub fn wait_and_save_cache(&mut self) -> Stats {
+    pub fn wait_and_save_cache(&mut self) -> (Stats, Option<CacheStats>) {
         let stats = self.wait();
 
         self.save_cache();
@@ -452,6 +452,7 @@ fn worker_thread_main<S: MatchSink + 'static>(
                     fragment_hashes:  $g.fragment_hashes(),
                     fs:               $g.fs(),
                     matcher:          $g.matcher(),
+                    selected_fragment_hash_len: $g.selected_fragment_hash_len(),
                     cli:              $g.cli(),
                     sink:             $g.sink.clone(),
                     output_tx:        ctx.output_tx.clone(),

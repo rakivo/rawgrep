@@ -122,7 +122,7 @@ impl Matcher {
             });
         }
 
-        // fallback to regex
+        // Fallback to regex
         let re = Regex::new(pattern).map_err(|e| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -151,52 +151,74 @@ impl Matcher {
         }
     }
 
-    /// Extract 4-byte fragment hashes from pattern for cache
-    pub fn extract_fragment_hashes(&self) -> Vec<u32> {
+    /// Extract fragment hashes for this matcher, along with the single fragment length
+    /// (3 or 4) used to compute all of them.
+    ///
+    /// Returns `None` if the fragment cache should be skipped entirely for this pattern e.g.
+    /// because some literal (or, for alternations/regex, the shortest literal) is under
+    /// `MIN_FRAGMENT_LEN`. Callers must not fall back to a smaller fragment in that case;
+    /// see `select_fragment_len`'s docs for why.
+    pub fn extract_fragment_hashes(&self) -> Option<(Vec<u32>, usize)> {
         use nohash_hasher::IntSet;
 
         match self {
             Matcher::Literal(finder) => {
-                crate::fragments::extract_pattern_fragments(finder.needle())
+                let needle = finder.needle();
+                let fragment_len = crate::fragments::select_fragment_len(std::iter::once(needle))?;
+                let hashes = crate::fragments::extract_pattern_fragments_with_len(needle, fragment_len);
+                Some((hashes, fragment_len))
             }
+
             Matcher::MultiLiteral { patterns, .. } => {
-                // Extract fragments from all alternation patterns
+                //
+                // One fragment length shared across every alternation branch, must be chosen
+                // from the shortest branch, not per-branch (see select_fragment_len docs).
+                //
+                let fragment_len = crate::fragments::select_fragment_len(
+                    patterns.iter().map(|p| p.as_ref())
+                )?;
+
                 let mut all_fragments = IntSet::default();
-                for pattern in patterns {
-                    let frags = crate::fragments::extract_pattern_fragments(pattern);
+                for pattern in patterns.iter() {
+                    let frags = crate::fragments::extract_pattern_fragments_with_len(pattern, fragment_len);
                     all_fragments.extend(frags);
                 }
-                all_fragments.into_iter().collect()
+                Some((all_fragments.into_iter().collect(), fragment_len))
             }
+
             Matcher::Regex { pattern, .. } => {
-                // Extract literal substrings from regex
                 extract_regex_literals(pattern)
             }
         }
     }
 }
 
-/// Extract literal substrings from regex pattern for cache
-fn extract_regex_literals(pattern: &str) -> Vec<u32> {
+/// Extract literal substrings from a regex pattern for the fragment cache, all hashed with
+/// one shared fragment length (the shortest literal part). Returns `None` if there are no
+/// usable literal parts, or the shortest one is under `MIN_FRAGMENT_LEN`.
+fn extract_regex_literals(pattern: &str) -> Option<(Vec<u32>, usize)> {
     use nohash_hasher::IntSet;
 
     // Split on common regex operators to find literal parts
-    let parts = pattern
+    let parts: Vec<&[u8]> = pattern
         .split(|c| ".*+?{[(".contains(c))
         .filter(|s| !s.is_empty())
-        .collect::<Vec<_>>();
+        // Skip parts that still contain other regex metacharacters -- not a clean literal.
+        .filter(|part| !part.chars().any(|c| "\\^$|)]}>".contains(c)))
+        .map(str::as_bytes)
+        .collect();
+
+    if parts.is_empty() {
+        return None;
+    }
+
+    let fragment_len = crate::fragments::select_fragment_len(parts.iter().copied())?;
 
     let mut all_fragments = IntSet::default();
-
-    for part in parts {
-        // Skip if part has more regex chars
-        if part.chars().any(|c| "\\^$|)]}>".contains(c)) {
-            continue;
-        }
-
-        let frags = crate::fragments::extract_pattern_fragments(part.as_bytes());
+    for part in &parts {
+        let frags = crate::fragments::extract_pattern_fragments_with_len(part, fragment_len);
         all_fragments.extend(frags);
     }
 
-    all_fragments.into_iter().collect()
+    Some((all_fragments.into_iter().collect(), fragment_len))
 }
