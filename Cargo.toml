@@ -29,7 +29,7 @@ dhat = ["dep:dhat"]
 #     cargo +nightly b \
 #        -Z build-std=std,panic_abort \
 #        -Z build-std-features= \
-#         --profile=release-fast --target=x86_64-unknown-linux-gnu --no-default-features --features=use_nightly,small,mimalloc
+#         --profile=release-small --target=x86_64-unknown-linux-gnu --no-default-features --features=use_nightly,small,mimalloc
 small = ["regex-tiny"]
 
 full  = ["regex-full"]
@@ -104,6 +104,18 @@ debug = false
 strip = true
 overflow-checks = false
 debug-assertions = false
+
+[profile.release-lto-same-as-ripgrep]
+inherits = "release"
+opt-level = 3
+debug = "none"
+strip = "symbols"
+debug-assertions = false
+overflow-checks = false
+lto = "fat"
+panic = "abort"
+incremental = false
+codegen-units = 1
 
 [profile.release-small]
 inherits = "release"
