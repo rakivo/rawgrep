@@ -13,6 +13,7 @@ use crate::path_buf::SmallPathBuf;
 use crate::fragments::FragmentLen;
 use crate::stats::Stats;
 use crate::stdout::RawStdout;
+use crate::thin_path_arc::ThinPathArc;
 use crate::parser::{BufFatPtr, BufKind, FileId, FileNode, FileType, ParsedEntry, Parser, RawFs};
 use crate::util::{is_common_skip_dir, likely, truncate_utf8, unlikely};
 use crate::{
@@ -72,9 +73,31 @@ pub struct FileWork {
 
 pub struct DirWork {
     pub file_id: FileId,
-    pub path_bytes: Arc<[u8]>,
+    pub path_bytes: ThinPathArc,
     pub gitignore_chain: GitignoreChain,
-    pub depth: u16
+}
+
+impl DirWork {
+    #[inline]
+    pub fn new(
+        file_id: FileId,
+        path: &[u8],
+        depth: u16,
+        gitignore_chain: GitignoreChain,
+    ) -> Self {
+        let path_bytes = ThinPathArc::new(depth, path);
+        Self { file_id, path_bytes, gitignore_chain }
+    }
+
+    #[inline]
+    pub fn path_bytes(&self) -> &[u8] {
+        self.path_bytes.path_bytes()
+    }
+
+    #[inline]
+    pub fn depth(&self) -> u16 {
+        self.path_bytes.depth()
+    }
 }
 
 pub trait MatchSink: Send + Sync + Clone {
@@ -295,7 +318,7 @@ impl PathArena {
 pub struct PendingSubdir {
     file_id:    FileId,
     path_start: u32,
-    path_end:   u32,
+    path_len:   u16,
     depth:      u16,
 }
 
@@ -478,10 +501,10 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, '_, F, S> {
         injector: &Injector<WorkItem>,
     ) -> io::Result<()> {
         let mark = self.path_arena.len();
-        let (start, end) = self.path_arena.push_path(&[], false, &work.path_bytes);
+        let (start, end) = self.path_arena.push_path(&[], false, work.path_bytes());
 
         let result = self.dispatch_directory_bytes(
-            work.file_id, start, end, &work.gitignore_chain, work.depth, local, injector,
+            work.file_id, start, end, &work.gitignore_chain, work.depth(), local, injector,
         );
 
         //
@@ -623,10 +646,20 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, '_, F, S> {
                         }
                     }
 
+                    let Ok(path_len) = u16::try_from(end - start) else {
+                        // Path too long to fit our packed representation (>65535 bytes) --
+                        // vanishingly rare on real filesystems, but don't let one
+                        // pathological subtree crash the whole walk.
+
+                        self.stats.dirs_skipped_path_too_long += 1;
+                        self.path_arena.truncate(start);
+                        continue;
+                    };
+
                     self.subdirs_arena.push(PendingSubdir {
                         file_id: entry.file_id,
                         path_start: start,
-                        path_end: end,
+                        path_len,
                         depth: depth + 1,
                     });
                 }
@@ -681,12 +714,12 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, '_, F, S> {
 
         for i in (queue_start..queue_end).rev() {
             let p = *unsafe { self.subdirs_arena.get_unchecked(i) };
-            local.push(WorkItem::Directory(DirWork {
-                file_id: p.file_id,
-                path_bytes: Arc::from(self.path_arena.slice(p.path_start, p.path_end)),
-                gitignore_chain: gitignore_chain.clone(),
-                depth: p.depth,
-            }));
+            local.push(WorkItem::Directory(DirWork::new(
+                p.file_id,
+                self.path_arena.slice(p.path_start, p.path_start + p.path_len as u32),
+                p.depth,
+                gitignore_chain.clone(),
+            )));
         }
 
         //
@@ -698,7 +731,7 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, '_, F, S> {
             if let Err(e) = self.dispatch_directory_bytes(
                 p.file_id,
                 p.path_start,
-                p.path_end,
+                p.path_start + p.path_len as u32,
                 &gitignore_chain,
                 p.depth,
                 local,

@@ -10,6 +10,7 @@ pub struct Stats {
     pub files_searched: u32,
     pub bytes_searched: u64,
     pub dirs_encountered: u32,
+    pub dirs_skipped_path_too_long: u32,
     pub files_skipped_by_cache: u32,
 
     // Colder
@@ -88,6 +89,9 @@ impl Display for Stats {
         dir_row!("Dirs encountered", self.dirs_encountered);
         dir_row!("Skipped (common)", self.dirs_skipped_common);
         dir_row!("Skipped (gitignore)", self.dirs_skipped_gitignore);
+        if self.dirs_skipped_path_too_long > 0 {
+            dir_row!("Skipped (path too long)", self.dirs_skipped_path_too_long);
+        }
 
         Ok(())
     }
@@ -121,6 +125,7 @@ pub struct AtomicStats {
     pub dirs_encountered: AtomicU64,
     pub dirs_skipped_common: AtomicU64,
     pub dirs_skipped_gitignore: AtomicU64,
+    pub dirs_skipped_path_too_long: AtomicU64,
     pub files_skipped_large: AtomicU64,
     pub files_skipped_as_binary_due_to_ext: AtomicU64,
     pub files_skipped_as_binary_due_to_probe: AtomicU64,
@@ -146,6 +151,7 @@ impl AtomicStats {
             dirs_encountered: AtomicU64::new(0),
             dirs_skipped_common: AtomicU64::new(0),
             dirs_skipped_gitignore: AtomicU64::new(0),
+            dirs_skipped_path_too_long: AtomicU64::new(0),
             files_skipped_large: AtomicU64::new(0),
             files_skipped_as_binary_due_to_ext: AtomicU64::new(0),
             files_skipped_as_binary_due_to_probe: AtomicU64::new(0),
@@ -159,6 +165,7 @@ impl AtomicStats {
     pub fn to_stats(&self) -> Stats {
         Stats {
             files_skipped_unreadable: 0,
+            dirs_skipped_path_too_long: self.dirs_skipped_path_too_long.load(Ordering::Relaxed) as _,
             files_encountered: self.files_encountered.load(Ordering::Relaxed) as _,
             files_searched: self.files_searched.load(Ordering::Relaxed) as _,
             files_contained_matches: self.files_contained_matches.load(Ordering::Relaxed) as _,

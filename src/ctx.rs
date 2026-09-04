@@ -345,14 +345,11 @@ impl<S: MatchSink + 'static> RawGrepCtx<S> {
                     .unwrap_or_default(),
             })
         } else {
-            WorkItem::Directory(DirWork {
-                depth: 0,
-                file_id:         root_file_id,
-                path_bytes:      Arc::default(),
-                gitignore_chain: root_gitignore
-                    .map(crate::ignore::GitignoreChain::from_root)
-                    .unwrap_or_default(),
-            })
+            WorkItem::Directory(DirWork::new(
+                root_file_id,
+                &[], 0,
+                root_gitignore.map(crate::ignore::GitignoreChain::from_root).unwrap_or_default()
+            ))
         };
         self.injector.push(work);
         debug!("[ctx] root work item pushed to injector");

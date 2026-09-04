@@ -37,6 +37,7 @@ pub mod path_buf;
 pub mod cache;
 pub mod fragments;
 pub mod platform;
+pub mod thin_path_arc;
 
 #[cfg(feature = "small")]
 pub(crate) extern crate regex_tiny as regex;
