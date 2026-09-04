@@ -1,3 +1,4 @@
+
 # rawgrep
 
 **Grep at the speed of raw disk** - search text by reading data directly from raw block devices.
@@ -6,20 +7,20 @@
 
 benchmark script: [`bench.sh`](bench.sh)
 ```
-corpus: 674,283 files across mixed C/C++/Rust/Python projects
+corpus: Chromium codebase (~500k files)
 pattern: `TODO` (literal)
-system: Intel i5-13400F, 16 threads, NVMe SSD, 16GB RAM (10GB free), Debian 6.12
-rawgrep 0.1.4 vs ripgrep 15.1.0
+system: Intel i5-13400F, 16 threads, NVMe SSD, 16GB 3200MHz RAM, Debian 6.12
+rawgrep 0.1.6 vs ripgrep 15.1.0
 ```
 
 | scenario | rawgrep | ripgrep | speedup |
 |---|---|---|---|
-| cold cache + fragment cache | 1.26s ± 0.02s | 11.08s ± 0.50s | **8.8x** |
-| cold cache, no fragment cache | 6.24s ± 0.08s | 11.03s ± 0.97s | **1.8x** |
-| warm cache + fragment cache | 173ms ± 9ms | 436ms ± 45ms | **2.5x** |
-| warm cache, no fragment cache | 389ms ± 9ms | 454ms ± 73ms | 1.2x |
+| warm cache + fragment cache | 279.0ms ± 8.7ms | 429.0ms ± 11.9ms | 1.54x |
+| cold cache + fragment cache | 3.948s ± 0.028s | 11.912s ± 0.096s | 3.02x |
+| cold cache, no fragment cache | 8.986s ± 0.051s | 11.884s ± 0.065s | 1.32x |
+| warm cache, no fragment cache | 713.8ms ± 7.2ms | 422.2ms ± 9.8ms | 0.59x (@Incomplete, slower) |
 
-fragment cache stores per-file search metadata to skip unchanged files on repeat searches.
+With *fragment cache* -- rawgrep's intended mode -- it's fast, anywhere from 1.5x to ~60x faster than ripgrep. The larger the corpus, the more of an advantage rawgrep tends to have relative to ripgrep. Using *fragment cache* rawgrep is doing much less I/O, which means it can stay in the page cache on much larger corpora, while ripgrep can't. That's what behind the 60x number -- the corpus used for that benchmark is my 1.27M-file home directory.
 
 ### Correctness notes
 
@@ -35,8 +36,6 @@ and large test data files. these are gitignore/binary detection policy differenc
 
 **files rawgrep found that ripgrep missed:** `.recording` files and other files ripgrep
 treats as binary. rawgrep searches these by default.
-
-no text file that ripgrep searched was missed by rawgrep.
 
 ## How is `rawgrep` so fast?
 
