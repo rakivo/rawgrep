@@ -101,6 +101,7 @@ pub trait RawFs: Sync + Send {
         _node: &Self::Node,
         _max_size: usize,
         _check_binary: bool,
+        _buf: &mut Vec<u8>
     ) -> io::Result<Option<SmallVec<[(u64, usize); 32]>>> {
         Ok(None)
     }
@@ -236,10 +237,20 @@ impl<'a> Parser<'a> {
 
     #[inline(always)]
     pub fn get_buf_mut(&mut self, kind: BufKind) -> &mut Vec<u8> {
+        Self::get_buf_mut_impl(&mut self.file, &mut self.dir, &mut self.gitignore, kind)
+    }
+
+    #[inline(always)]
+    pub fn get_buf_mut_impl<'b>(
+        file: &'b mut Vec<u8>,
+        dir: &'b mut Vec<u8>,
+        gitignore: &'b mut Vec<u8>,
+        kind: BufKind
+    ) -> &'b mut Vec<u8> {
         match kind {
-            BufKind::File      => &mut self.file,
-            BufKind::Dir       => &mut self.dir,
-            BufKind::Gitignore => &mut self.gitignore,
+            BufKind::File      => file,
+            BufKind::Dir       => dir,
+            BufKind::Gitignore => gitignore,
         }
     }
 

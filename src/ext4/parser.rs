@@ -149,7 +149,7 @@ impl RawFs for Ext4Fs {
     ) -> io::Result<bool> {
         let _span = tracy::span!("Ext4Fs::read_file_content");
 
-        let buf = parser.get_buf_mut(kind);
+        let buf = Parser::get_buf_mut_impl(&mut parser.file, &mut parser.dir, &mut parser.gitignore, kind);
         buf.clear();
 
         let file_size = node.size as usize;
@@ -166,6 +166,7 @@ impl RawFs for Ext4Fs {
             node,
             size_to_read,
             check_binary,
+            buf
         )? else {
             parser.get_buf_mut(kind).clear();
             return Ok(false);
@@ -188,10 +189,11 @@ impl RawFs for Ext4Fs {
     fn collect_file_chunks(
         &self,
         scratch: &mut Vec<u8>,
-        scratch2: &mut Vec<u8>, // For probe
+        scratch2: &mut Vec<u8>, // Probe buffer, only touched (and only sized) when check_binary
         node: &Ext4Inode,
         max_size: usize,
         check_binary: bool,
+        buf: &mut Vec<u8>,      // Destination buffer -- probed bytes get written straight in here
     ) -> io::Result<Option<SmallVec<[(u64, usize); 32]>>> {
         let _span = tracy::span!("Ext4Fs::collect_file_chunks");
 
@@ -205,10 +207,6 @@ impl RawFs for Ext4Fs {
 
         scratch.clear();
 
-        scratch2.clear();
-        scratch2.resize(8192, 0); // @Cleanup
-        let probe_scratch: &mut [u8] = bytemuck::cast_slice_mut(scratch2);
-
         if node.flags & EXT4_EXTENTS_FL != 0 {
             //
             // Parse extents into scratch
@@ -218,18 +216,29 @@ impl RawFs for Ext4Fs {
 
             let extents = Self::scratch_as_extents(scratch);
 
-            if check_binary {
-                // Binary probe
-                if let Some(first) = extents.first() {
-                    let probe = &mut probe_scratch[..block_size as usize];
+            // Bytes of the very first extent already pulled into `buf` by the probe below,
+            // still owed to the chunk-building loop as a "skip" so it doesn't re-read them.
+            let mut skip_first = 0usize;
 
-                    let offset = first.start * block_size;
-                    if self.read_at_offset(probe, offset).is_err() {
-                        return Ok(Some(SmallVec::new())); // unreadable
+            if check_binary && let Some(first) = extents.first() {
+                // Binary probe
+
+                let probe_len = (block_size as usize).min(max_size);
+                scratch2.clear();
+                scratch2.resize(probe_len, 0);
+
+                let offset = first.start * block_size;
+                match self.read_at_offset(scratch2, offset) {
+                    Ok(n) => {
+                        if binary_probe(&scratch2[..n], file_size) {
+                            return Ok(None);                    // binary
+                        }
+
+                        buf.extend_from_slice(&scratch2[..n]);
+                        skip_first = n;
                     }
-                    if binary_probe(probe, file_size) {
-                        return Ok(None);                  // binary
-                    }
+
+                    Err(_) => return Ok(Some(SmallVec::new())), // unreadable
                 }
             }
 
@@ -238,6 +247,7 @@ impl RawFs for Ext4Fs {
 
             for extent in extents {
                 if total >= max_size { break; }
+
                 let extent_bytes = extent.len as usize * block_size as usize;
                 let mut extent_offset = 0usize;
 
@@ -245,8 +255,21 @@ impl RawFs for Ext4Fs {
                     if total >= max_size { break; }
 
                     let remaining = max_size - total;
-                    let to_read = STREAMING_CHUNK_SIZE.min(remaining).min(extent_bytes - extent_offset);
-                    let disk_offset = extent.start * block_size + extent_offset as u64;
+                    let mut to_read = STREAMING_CHUNK_SIZE.min(remaining).min(extent_bytes - extent_offset);
+                    let mut disk_offset = extent.start * block_size + extent_offset as u64;
+
+                    // Only ever fires on the first extent's first bytes -- skip whatever the
+                    // probe already read so we don't fetch it a second time.
+                    if skip_first > 0 {
+                        let skip = skip_first.min(to_read);
+                        disk_offset   += skip as u64;
+                        to_read       -= skip;
+                        extent_offset += skip;
+                        total         += skip;
+                        skip_first    -= skip;
+                        if to_read == 0 { continue; }
+                    }
+
                     chunks.push((disk_offset, to_read));
 
                     extent_offset += to_read;
@@ -260,38 +283,53 @@ impl RawFs for Ext4Fs {
             // Direct blocks
             //
 
-            scratch.extend_from_slice(bytemuck::cast_slice(&node.blocks[..EXT4_BLOCK_POINTERS_COUNT]));
+            let blocks = &node.blocks[..EXT4_BLOCK_POINTERS_COUNT];
 
-            let blocks: &[u64] = bytemuck::cast_slice(scratch);
-
-            if blocks.iter().all(|&b| b == 0 || b >= self.max_block) {
+            if blocks.iter().all(|&b| b == 0 || b as u64 >= self.max_block) {
                 return Ok(Some(SmallVec::new()));
             }
 
-            if check_binary {
-                // Binary probe
-                if let Some(&first) = blocks.iter().find(|&&b| b != 0 && b < self.max_block) {
-                    let probe = &mut probe_scratch[..block_size as usize];
+            let mut skip_first = 0usize;
 
-                    let to_read = (block_size as usize).min(probe.len());
-                    let n = self.read_at_offset(&mut probe[..to_read], first * block_size).unwrap_or(0);
-                    if binary_probe(&probe[..n], file_size) {
-                        return Ok(None); // binary
-                    }
+            if check_binary && let Some(&first) = blocks.iter().find(|&&b| b != 0 && (b as u64) < self.max_block) {
+                // Binary probe
+
+                let probe_len = (block_size as usize).min(max_size);
+                scratch2.clear();
+                scratch2.resize(probe_len, 0);
+
+                // A failed probe read here is treated as "read nothing",
+                // not as "bail out", unlike the extents branch.
+                let n = self.read_at_offset(scratch2, first as u64 * block_size).unwrap_or(0);
+                if binary_probe(&scratch2[..n], file_size) {
+                    return Ok(None); // binary
                 }
+
+                buf.extend_from_slice(&scratch2[..n]);
+                skip_first = n;
             }
 
             let mut chunks = SmallVec::new();
             let mut total = 0usize;
 
             for &block_num in blocks.iter() {
-                if block_num == 0 || block_num >= self.max_block { continue; }
+                if block_num == 0 || block_num as u64 >= self.max_block { continue; }
                 if total >= max_size { break; }
 
                 let remaining = max_size - total;
-                let to_read = (block_size as usize).min(remaining);
-                chunks.push((block_num * block_size, to_read));
+                let mut to_read = (block_size as usize).min(remaining);
+                let mut disk_offset = block_num as u64 * block_size;
 
+                if skip_first > 0 {
+                    let skip = skip_first.min(to_read);
+                    disk_offset += skip as u64;
+                    to_read     -= skip;
+                    total       += skip;
+                    skip_first  -= skip;
+                    if to_read == 0 { continue; }
+                }
+
+                chunks.push((disk_offset, to_read));
                 total += to_read;
             }
 
@@ -454,7 +492,7 @@ impl Ext4Fs {
     ) -> io::Result<()> {
         let _span = tracy::span!("Ext4Fs::parse_extent_node");
 
-        if likely(data.len() < mem::size_of::<raw::Ext4ExtentHeader>()) {
+        if unlikely(data.len() < mem::size_of::<raw::Ext4ExtentHeader>()) {
             return Ok(());
         }
 
@@ -464,7 +502,7 @@ impl Ext4Fs {
             io::ErrorKind::InvalidData, "Invalid extent header"
         ))?;
 
-        if likely(u16::from_le(header.eh_magic) != EXT4_EXTENT_MAGIC) {
+        if unlikely(u16::from_le(header.eh_magic) != EXT4_EXTENT_MAGIC) {
             return Ok(());
         }
 
@@ -511,7 +549,7 @@ impl Ext4Fs {
 
             for i in 0..entries as usize {
                 let offset = indices_start + i * index_size;
-                if likely(offset + index_size > data.len()) {
+                if unlikely(offset + index_size > data.len()) {
                     break;
                 }
 

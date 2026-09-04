@@ -858,12 +858,21 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, '_, F, S> {
         let mut carry = self.chunk_carry.take().unwrap_or_else(|| ChunkCarry::new().into());
         carry.reset();
 
+        let buf = Parser::get_buf_mut_impl(
+            &mut self.parser.file,
+            &mut self.parser.dir,
+            &mut self.parser.gitignore,
+            BufKind::File
+        );
+        buf.clear();
+
         let Some(chunks) = self.fs.collect_file_chunks(
             &mut self.parser.scratch,
             &mut self.parser.scratch2,
             node,
             max_size,
             check_binary,
+            buf
         )? else {
             self.stats.files_skipped_as_binary_due_to_probe += 1;
             self.chunk_carry = Some(carry);

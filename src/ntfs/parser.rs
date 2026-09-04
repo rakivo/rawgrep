@@ -71,7 +71,7 @@ impl RawFs for NtfsFs {
             return self.read_dir_linearised(node, parser, kind).map(|_| true);
         }
 
-        let buf = parser.get_buf_mut(kind);
+        let buf = Parser::get_buf_mut_impl(&mut parser.file, &mut parser.dir, &mut parser.gitignore, kind);
         buf.clear();
 
         let file_size   = node.size as usize;
@@ -94,6 +94,7 @@ impl RawFs for NtfsFs {
             node,
             size_to_read,
             check_binary,
+            buf
         )? else {
             parser.get_buf_mut(kind).clear();
             return Ok(false); // binary
@@ -121,6 +122,7 @@ impl RawFs for NtfsFs {
         node: &NtfsNode,
         max_size: usize,
         check_binary: bool,
+        buf: &mut Vec<u8>
     ) -> io::Result<Option<SmallVec<[(u64, usize); 32]>>> {
         let _span = tracy::span!("NtfsFs::collect_file_chunks");
 
@@ -143,13 +145,18 @@ impl RawFs for NtfsFs {
 
         let runs = decode_runlist(attr_slice, &self.sb)?;
 
-        if check_binary && let Some(first) = runs.iter().find(|r| r.lcn != u64::MAX) {
-            let mut probe = vec![0u8; self.sb.cluster_size as usize]; // @Heap
+        let mut skip_first = 0usize;
 
-            let _ = self.read_at_offset(&mut probe, first.lcn * cluster_size);
-            if binary_probe(&probe, file_size) {
+        if check_binary && let Some(first) = runs.iter().find(|r| r.lcn != u64::MAX) {
+            let probe_len = (self.sb.cluster_size as usize).min(max_size);
+            let mut probe = vec![0u8; probe_len]; // @Heap
+
+            let n = self.read_at_offset(&mut probe, first.lcn * cluster_size).unwrap_or(0);
+            if binary_probe(&probe[..n], file_size) {
                 return Ok(None);
             }
+            buf.extend_from_slice(&probe[..n]);
+            skip_first = n;
         }
 
         let mut chunks = SmallVec::<[_; 32]>::new();
@@ -172,8 +179,18 @@ impl RawFs for NtfsFs {
                 if total >= max_size { break; }
 
                 let remaining  = max_size - total;
-                let to_read    = STREAMING_CHUNK_SIZE.min(remaining).min(run_bytes - run_offset);
-                let disk_offset = run.lcn * cluster_size + run_offset as u64;
+                let mut to_read = STREAMING_CHUNK_SIZE.min(remaining).min(run_bytes - run_offset);
+                let mut disk_offset = run.lcn * cluster_size + run_offset as u64;
+
+                if skip_first > 0 {
+                    let skip = skip_first.min(to_read);
+                    disk_offset += skip as u64;
+                    to_read     -= skip;
+                    run_offset  += skip;
+                    total       += skip;
+                    skip_first  -= skip;
+                    if to_read == 0 { continue; }
+                }
 
                 chunks.push((disk_offset, to_read));
                 run_offset += to_read;
