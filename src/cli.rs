@@ -37,7 +37,7 @@ pub struct BufferConfig {
 // TODO(#22): add --json output mode for integration tools later
 // TODO(#23): add --stats-extended (per-file timings, cache hit/miss)
 #[derive(Bpaf, Clone)]
-#[bpaf(options, version("0.1.6"))]
+#[bpaf(options, version("0.1.7"))]
 /// Grep at the speed of raw disk
 pub struct Cli {
     /// Block device to read from (auto-detected if not specified)
