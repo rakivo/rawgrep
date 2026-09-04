@@ -61,6 +61,7 @@ bumpalo = { version = "3.20.2", features = ["collections"] }
 tracing             = "0.1"
 tracing-subscriber  = { version = "0.3", features = ["env-filter"] }
 bpaf = { version = "0.9.27", features = ["derive"] }
+memmap2 = "0.9.11"
 
 [target.'cfg(not(target_os = "macos"))'.dependencies]
 gdt-cpus = { version = "0.2606.1", default-features = false }
@@ -119,7 +120,7 @@ debug-assertions = false
 [profile.profiling]
 inherits = "release"
 debug = true                      # keep DWARF symbols
-split-debuginfo = "packed"        # so perf can find them easily (Linux)
+# split-debuginfo = "packed"        # so perf can find them easily (Linux)
 strip = "none"                    # don’t strip symbols
 lto = false
 codegen-units = 16
