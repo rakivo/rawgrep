@@ -834,11 +834,7 @@ impl<S: CacheStorage> FragmentCache<S> {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "cache data truncated"));
         }
 
-        // SAFETY: offsets were computed from the same alignment rules `save_to_disk`
-        // used to write this file (16-byte align before file_keys, 8-byte before
-        // file_bitsets). mmap's base address is always page-aligned (>= 4096),
-        // which is a multiple of every alignment we need here, so base+offset
-        // preserves the required alignment for FileKey/FileMeta/u64 access.
+        // SAFETY: offsets were computed from the same alignment rules `save_to_disk` used to write this file.
         let fragment_hashes = unsafe {
             FatPtr::from_raw(bytes.as_ptr().add(fragments_offset) as *const u32, num_fragments)
         };
@@ -1142,7 +1138,7 @@ impl<S: CacheStorage> FragmentCache<S> {
         //
         //
 
-        let mut file_updates = Vec::with_capacity(file_keys.len());
+        let mut file_updates = Vec::with_capacity(file_keys.len()); // @Note: merge_updates is called once per search, which normally means once per program when running main.rs; if not, when running inside some other program using RawGrepCtx, this memory should be reused. @Incomplete.
 
         // ------- Track the original num_files to know which files are new
         let original_num_files = self.num_files.load(Ordering::Relaxed) as usize;
@@ -1211,7 +1207,7 @@ impl<S: CacheStorage> FragmentCache<S> {
                 for i in 0..bits_per_file_u64 {
                     let idx = offset + i;
                     if idx < owned_file_bitsets.len() {
-                        owned_file_bitsets[idx] = 0u64;  // Unknown, not absent - only checked fragments get marked
+                        owned_file_bitsets[idx] = 0u64;  // Unknown -- only checked fragments get marked
                     }
                 }
             }

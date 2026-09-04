@@ -245,10 +245,10 @@ pub struct Gitignore {
     /// Wildcard patterns
     wildcards: Box<[WildcardPattern]>,
 
-    // Fast path, used only when has_negations is false. In that case
-    // "any match ignores" and "last match ignores" are the same rule,
-    // so declaration order can be discarded and we can go straight to
-    // whatever's cheapest instead of walking `order`.
+    /// Fast path, used only when has_negations is false. In that case
+    /// "any match ignores" and "last match ignores" are the same rule,
+    /// so declaration order can be discarded and we can go straight to
+    /// whatever's cheapest instead of walking `order`.
     unanchored_lookup:        LiteralLookup,
     anchored_literal_indices: Box<[u16]>,
 }
@@ -354,9 +354,10 @@ impl Gitignore {
                 continue;
             }
 
-            let has_wildcards = memchr(b'*', pattern_bytes).is_some()
-                || memchr(b'?', pattern_bytes).is_some()
-                || memchr(b'[', pattern_bytes).is_some();
+            let has_wildcards =
+                memchr(b'*', pattern_bytes).is_some()
+             || memchr(b'?', pattern_bytes).is_some()
+             || memchr(b'[', pattern_bytes).is_some();
 
             let flags = (negated as u8) | ((anchored as u8) << 1) | ((dir_only as u8) << 2);
 
@@ -378,6 +379,7 @@ impl Gitignore {
                         ty: 0,
                         index: (literal_meta.len() - 1) as u16,
                     });
+
                 } else {
                     // Too long, treat as wildcard
                     wildcards.push(WildcardPattern {
@@ -391,6 +393,7 @@ impl Gitignore {
                         index: (wildcards.len() - 1) as u16,
                     });
                 }
+
             } else {
                 // --------- WILDCARD PATTERN - analyze for fast paths
                 let (suffix, prefix) = analyze_wildcard(pattern_bytes);
@@ -625,10 +628,10 @@ impl Gitignore {
 fn analyze_wildcard(pattern: &[u8]) -> (Option<Box<[u8]>>, Option<Box<[u8]>>) {
     // Pattern "*.ext" - very common
     if pattern.len() >= 2
-        && pattern[0] == b'*'
-        && !pattern[1..].contains(&b'*')
-        && !pattern[1..].contains(&b'?')
-        && !pattern[1..].contains(&b'[')
+    && pattern[0] == b'*'
+    && !pattern[1..].contains(&b'*')
+    && !pattern[1..].contains(&b'?')
+    && !pattern[1..].contains(&b'[')
     {
         return (Some(pattern[1..].to_vec().into_boxed_slice()), None);
     }
@@ -682,11 +685,11 @@ fn match_wildcard(pattern: &WildcardPattern, text: &[u8]) -> bool {
 
 #[inline]
 fn glob_match(pattern: &[u8], text: &[u8]) -> bool {
-    let plen = pattern.len();
-    let tlen = text.len();
+    let pattern_len = pattern.len();
+    let text_len = text.len();
 
-    if plen == 0 {
-        return tlen == 0;
+    if pattern_len == 0 {
+        return text_len == 0;
     }
 
     // Fast path: no wildcards
@@ -697,44 +700,44 @@ fn glob_match(pattern: &[u8], text: &[u8]) -> bool {
         return pattern == text;
     }
 
-    let mut p_idx = 0;
-    let mut t_idx = 0;
+    let mut pattern_idx = 0;
+    let mut text_idx = 0;
     let mut star_idx = usize::MAX;
     let mut match_idx = 0;
 
-    while t_idx < tlen {
-        if p_idx < plen {
-            let p_char = unsafe { *pattern.get_unchecked(p_idx) };
+    while text_idx < text_len {
+        if pattern_idx < pattern_len {
+            let p_char = unsafe { *pattern.get_unchecked(pattern_idx) };
 
             match p_char {
                 b'*' => {
-                    star_idx = p_idx;
-                    match_idx = t_idx;
-                    p_idx += 1;
+                    star_idx = pattern_idx;
+                    match_idx = text_idx;
+                    pattern_idx += 1;
                     continue;
                 }
 
                 b'?' => {
-                    p_idx += 1;
-                    t_idx += 1;
+                    pattern_idx += 1;
+                    text_idx += 1;
                     continue;
                 }
 
                 b'[' => {
                     if let Some(new_p) = match_char_class(
                         pattern,
-                        p_idx,
-                        unsafe { *text.get_unchecked(t_idx) }
+                        pattern_idx,
+                        unsafe { *text.get_unchecked(text_idx) }
                     ) {
-                        p_idx = new_p;
-                        t_idx += 1;
+                        pattern_idx = new_p;
+                        text_idx += 1;
                         continue;
                     }
                 }
 
-                c if c == unsafe { *text.get_unchecked(t_idx) } => {
-                    p_idx += 1;
-                    t_idx += 1;
+                c if c == unsafe { *text.get_unchecked(text_idx) } => {
+                    pattern_idx += 1;
+                    text_idx += 1;
                     continue;
                 }
 
@@ -743,22 +746,22 @@ fn glob_match(pattern: &[u8], text: &[u8]) -> bool {
         }
 
         if star_idx != usize::MAX {
-            p_idx = star_idx + 1;
+            pattern_idx = star_idx + 1;
             match_idx += 1;
-            t_idx = match_idx;
+            text_idx = match_idx;
         } else {
             return false;
         }
     }
 
     // Skip trailing stars
-    while p_idx < plen && unsafe {
-        *pattern.get_unchecked(p_idx)
+    while pattern_idx < pattern_len && unsafe {
+        *pattern.get_unchecked(pattern_idx)
     } == b'*' {
-        p_idx += 1;
+        pattern_idx += 1;
     }
 
-    p_idx == plen
+    pattern_idx == pattern_len
 }
 
 #[inline]
@@ -768,8 +771,10 @@ fn match_char_class(pattern: &[u8], start: usize, ch: u8) -> Option<usize> {
         return None;
     }
 
-    let negated = unsafe { *pattern.get_unchecked(start + 1) } == b'!'
-        || unsafe { *pattern.get_unchecked(start + 1) } == b'^';
+    let negated =
+        unsafe { *pattern.get_unchecked(start + 1) } == b'!'
+     || unsafe { *pattern.get_unchecked(start + 1) } == b'^';
+
     let mut i = if negated { start + 2 } else { start + 1 };
 
     // Find closing ]
@@ -790,12 +795,14 @@ fn match_char_class(pattern: &[u8], start: usize, ch: u8) -> Option<usize> {
                 matched = true;
                 break;
             }
+
             i += 3;
         } else {
             if ch == unsafe { *pattern.get_unchecked(i) } {
                 matched = true;
                 break;
             }
+
             i += 1;
         }
     }
