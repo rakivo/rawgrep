@@ -169,6 +169,42 @@ struct CacheHeader {
 pub trait CacheStorage {
     fn load(&self) -> io::Result<Option<Vec<u8>>>;
     fn save(&self, data: &[u8]) -> io::Result<()>;
+    fn save_segments(&self, segments: &[&[u8]], total_size: usize) -> io::Result<()>;
+
+    /// Load cache bytes, preferring a zero-copy mmap when the backend
+    /// supports one. Default falls back to `load()` for backends that
+    /// can't (e.g. in-memory test storage).
+    fn load_mapped(&self) -> io::Result<Option<CacheBytes>> {
+        Ok(self.load()?.map(Into::into).map(CacheBytes::Owned))
+    }
+}
+
+/// Owned bytes backing a loaded cache, either a live mmap or a plain
+/// heap buffer (used by storage backends that can't mmap, e.g. tests).
+pub enum CacheBytes {
+    Mapped(memmap2::Mmap),
+    Owned(Box<[u8]>),
+}
+
+impl std::ops::Deref for CacheBytes {
+    type Target = [u8];
+    #[inline]
+    fn deref(&self) -> &[u8] {
+        match self {
+            CacheBytes::Mapped(m) => &m[..],
+            CacheBytes::Owned(v)  => &v[..],
+        }
+    }
+}
+
+impl CacheBytes {
+    #[inline]
+    fn advise(&self, advice: memmap2::Advice) {
+        match self {
+            CacheBytes::Mapped(mmap) => _ = mmap.advise(advice),
+            _ => {}
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -203,6 +239,57 @@ impl CacheStorage for DiskStorage {
 
         Ok(())
     }
+
+    #[inline]
+    fn save_segments(&self, segments: &[&[u8]], total_size: usize) -> io::Result<()> {
+        use std::io::{IoSlice, Write};
+
+        let tmp = self.path.with_extension("tmp");
+        let mut file = std::fs::File::create(&tmp)?;
+
+        file.set_len(total_size as _)?;
+
+        let mut owned_slices = segments.iter().map(|s| IoSlice::new(s)).collect::<Vec<_>>();
+        let mut slices: &mut [IoSlice] = &mut owned_slices;
+
+        while !slices.is_empty() {
+            let written = file.write_vectored(slices)?;
+            if written == 0 {
+                return Err(io::Error::new(io::ErrorKind::WriteZero, "failed to write whole buffer"));
+            }
+
+            IoSlice::advance_slices(&mut slices, written);
+        }
+
+        file.sync_all()?;
+        drop(file);
+
+        Self::fix_ownership(&tmp)?;
+        std::fs::rename(&tmp, &self.path)?;
+
+        Ok(())
+    }
+
+    #[inline]
+    fn load_mapped(&self) -> io::Result<Option<CacheBytes>> {
+        let file = match std::fs::File::open(&self.path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+
+        // mmap2 refuses to map a zero-length file, treat that as no-cache.
+        if file.metadata()?.len() == 0 {
+            return Ok(None);
+        }
+
+        // SAFETY: the file is only ever replaced via tmp+rename,
+        // never truncated/modified in place, so this mapping stays valid for
+        // as long as we hold it. External processes touching the cache path
+        // directly would violate this, but that's outside our control anyway.
+        let mmap = unsafe { memmap2::Mmap::map(&file)? };
+        Ok(Some(CacheBytes::Mapped(mmap)))
+    }
 }
 
 impl DiskStorage {
@@ -236,20 +323,31 @@ impl DiskStorage {
 #[cfg(test)]
 #[derive(Default)]
 pub struct MemoryStorage {
-    data: std::sync::Mutex<Option<Vec<u8>>>,
+    data: parking_lot::Mutex<Option<Vec<u8>>>,
 }
 
 #[cfg(test)]
 impl CacheStorage for MemoryStorage {
     #[inline]
     fn load(&self) -> io::Result<Option<Vec<u8>>> {
-        Ok(self.data.lock().unwrap().clone())
+        Ok(self.data.lock().clone())
 
     }
 
     #[inline]
     fn save(&self, data: &[u8]) -> io::Result<()> {
-        *self.data.lock().unwrap() = Some(data.to_vec());
+        *self.data.lock() = Some(data.to_vec());
+        Ok(())
+    }
+
+    #[inline]
+    fn save_segments(&self, segments: &[&[u8]], total_size: usize) -> io::Result<()> {
+        let mut data = Vec::with_capacity(total_size);
+        for segment in segments {
+            data.extend_from_slice(segment);
+        }
+
+        *self.data.lock() = data;
         Ok(())
     }
 }
@@ -289,6 +387,8 @@ pub struct FragmentCache<S: CacheStorage = DiskStorage> {
     stats: CacheStats,
 
     storage: S,
+
+    backing: Option<CacheBytes>,
 }
 
 impl FragmentCache<DiskStorage> {
@@ -418,6 +518,7 @@ impl<S: CacheStorage> FragmentCache<S> {
 
         Ok(Self {
             num_fragments: AtomicU32::new(0),
+            backing: None,
             num_files: AtomicU32::new(0),
             ring_pos: AtomicU32::new(0),
             max_fragments,
@@ -450,7 +551,7 @@ impl<S: CacheStorage> FragmentCache<S> {
         let num_files = self.num_files.load(Ordering::Relaxed) as usize;
 
         // Allocate with growth headroom
-        let new_capacity = (num_files * 4).max(64 * 1024).min(self.max_files as usize);
+        let new_capacity = (num_files + 64*1024).min(self.max_files as usize);
 
         let alloc_start = Instant::now();
         let mut new_fragment_hashes = Box::<[u32]>::new_uninit_slice(self.max_fragments as usize);
@@ -536,9 +637,9 @@ impl<S: CacheStorage> FragmentCache<S> {
             num_files,
             new_capacity,
             num_fragments,
-            total_time.as_secs_f64() * 1000.0,
-            alloc_time.as_secs_f64() * 1000.0,
-            copy_time.as_secs_f64()  * 1000.0,
+            total_time.as_millis() as f64,
+            alloc_time.as_millis() as f64,
+            copy_time.as_millis()  as f64,
         );
     }
 
@@ -696,7 +797,7 @@ impl<S: CacheStorage> FragmentCache<S> {
     fn load_from_disk(storage: S, config: &CacheConfig) -> io::Result<Self> {
         let start = Instant::now();
 
-        let Some(bytes) = storage.load()? else {
+        let Some(bytes) = storage.load_mapped()? else {
             return Err(io::Error::new(io::ErrorKind::NotFound, "no cache data"));
         };
 
@@ -736,58 +837,25 @@ impl<S: CacheStorage> FragmentCache<S> {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "cache data truncated"));
         }
 
-        //
-        // @Incomplete @Volatile
-        //
-        // Copy out of the byte buffer into owned allocations
-        // We don't mmap here anymore cuz storage.load() already gave us a Vec<u8>.
-        // We can a load_mmap() method to CacheStorage later tho.
-        //
+        // SAFETY: offsets were computed from the same alignment rules `save_to_disk`
+        // used to write this file (16-byte align before file_keys, 8-byte before
+        // file_bitsets). mmap's base address is always page-aligned (>= 4096),
+        // which is a multiple of every alignment we need here, so base+offset
+        // preserves the required alignment for FileKey/FileMeta/u64 access.
+        let fragment_hashes = unsafe {
+            FatPtr::from_raw(bytes.as_ptr().add(fragments_offset) as *const u32, num_fragments)
+        };
+        let file_keys = unsafe {
+            FatPtr::from_raw(bytes.as_ptr().add(file_keys_offset) as *const FileKey, num_files)
+        };
+        let file_metas = unsafe {
+            FatPtr::from_raw(bytes.as_ptr().add(file_metas_offset) as *const FileMeta, num_files)
+        };
+        let file_bitsets = unsafe {
+            FatPtr::from_raw(bytes.as_ptr().add(file_bitsets_offset) as *const u64, file_bitsets_len)
+        };
 
-        let mut owned_fragment_hashes = Box::<[u32]>::new_uninit_slice(config.max_fragments);
-
-        // Give 64K headroom above num_files so small merges don't trigger growth:
-        let file_capacity = (num_files + 64 * 1024).min(config.max_files);
-        let mut owned_file_keys  = Box::<[FileKey]>::new_uninit_slice(file_capacity);
-        let mut owned_file_metas = Box::<[FileMeta]>::new_uninit_slice(file_capacity);
-        let capacity_bitset_u64s = file_capacity * bits_per_file_u64;
-        let mut owned_file_bitsets = Box::<[u64]>::new_uninit_slice(capacity_bitset_u64s);
-
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                bytes.as_ptr().add(header_size) as *const u32,
-                owned_fragment_hashes.as_mut_ptr() as *mut u32,
-                num_fragments,
-            );
-            std::ptr::copy_nonoverlapping(
-                bytes.as_ptr().add(file_keys_offset) as *const FileKey,
-                owned_file_keys.as_mut_ptr() as *mut FileKey,
-                num_files,
-            );
-            std::ptr::copy_nonoverlapping(
-                bytes.as_ptr().add(file_metas_offset) as *const FileMeta,
-                owned_file_metas.as_mut_ptr() as *mut FileMeta,
-                num_files,
-            );
-
-            // Copy only what was saved - file_bitsets_len uses bits_per_file_u64 which
-            // matches the serialized layout exactly
-            std::ptr::copy_nonoverlapping(
-                bytes.as_ptr().add(file_bitsets_offset) as *const u64,
-                owned_file_bitsets.as_mut_ptr() as *mut u64,
-                file_bitsets_len, // safe: dst has file_capacity * bits_per_file_u64 >= file_bitsets_len
-            );
-        }
-
-        let owned_fragment_hashes = unsafe { owned_fragment_hashes.assume_init() };
-        let owned_file_keys       = unsafe { owned_file_keys.assume_init() };
-        let owned_file_metas      = unsafe { owned_file_metas.assume_init() };
-        let owned_file_bitsets    = unsafe { owned_file_bitsets.assume_init() };
-
-        let fragment_hashes = FatPtr::from_box(&owned_fragment_hashes);
-        let file_keys       = FatPtr::from_box(&owned_file_keys);
-        let file_metas      = FatPtr::from_box(&owned_file_metas);
-        let file_bitsets    = FatPtr::from_box(&owned_file_bitsets);
+        bytes.advise(memmap2::Advice::Sequential);
 
         // ---- Build lookup table
         let lookup_size = ((num_files * 2).max(1024)).next_power_of_two();
@@ -799,13 +867,15 @@ impl<S: CacheStorage> FragmentCache<S> {
 
         let mask = lookup_size - 1;
         for file_id in 0..num_files {
-            let hash = owned_file_keys[file_id].hash();
+            let hash = file_keys.get(file_id).hash();
+
             let mut idx = (hash as usize) & mask;
             for _ in 0..16 {
                 if file_lookup[idx].load(Ordering::Relaxed) == FILE_LOOKUP_EMPTY {
                     file_lookup[idx].store(file_id as u32, Ordering::Relaxed);
                     break;
                 }
+
                 idx = (idx + 1) & mask;
             }
         }
@@ -814,10 +884,12 @@ impl<S: CacheStorage> FragmentCache<S> {
             "Cache loaded: {} files, {} fragments, {:.2}MB in {:.2}ms",
             num_files, num_fragments,
             bytes.len() as f64 / (1024.0 * 1024.0),
-            start.elapsed().as_secs_f64() * 1000.0,
+            start.elapsed().as_millis() as f64
         );
 
-        let file_capacity = owned_file_keys.len();
+        bytes.advise(memmap2::Advice::Random);
+
+        let file_capacity = num_files;
 
         eprintln!(
             "Cache allocations:\n  fragment_hashes: {}KB\n  file_keys: {}KB\n  file_metas: {}KB\n  file_bitsets: {}KB\n  file_lookup: {}KB\n  raw_bytes: {}KB\n  file_capacity: {}\n  bits_per_file_u64: {}",
@@ -835,6 +907,7 @@ impl<S: CacheStorage> FragmentCache<S> {
             num_fragments: AtomicU32::new(num_fragments as u32),
             num_files: AtomicU32::new(num_files as u32),
             ring_pos: AtomicU32::new(header.ring_pos),
+            backing: Some(bytes),
             max_fragments: config.max_fragments as u32,
             max_files: config.max_files as u32,
             file_capacity,
@@ -842,10 +915,10 @@ impl<S: CacheStorage> FragmentCache<S> {
             file_keys,
             file_metas,
             file_bitsets,
-            owned_fragment_hashes: Some(owned_fragment_hashes),
-            owned_file_keys:       Some(owned_file_keys),
-            owned_file_metas:      Some(owned_file_metas),
-            owned_file_bitsets:    Some(owned_file_bitsets),
+            owned_fragment_hashes: None,
+            owned_file_keys:       None,
+            owned_file_metas:      None,
+            owned_file_bitsets:    None,
             file_lookup,
             stats: CacheStats::default(),
             storage
@@ -854,21 +927,27 @@ impl<S: CacheStorage> FragmentCache<S> {
 
     #[inline]
     pub fn save_to_disk(&self) -> io::Result<()> {
+        if self.owned_file_keys.is_none() {
+            // Never dirtied this run (ensure_owned() was never called),
+            // on-disk cache is already current, nothing to write.
+            return Ok(());
+        }
+
         let start = Instant::now();
 
-        let num_fragments = self.num_fragments.load(Ordering::Relaxed) as usize;
-        let num_files = self.num_files.load(Ordering::Relaxed) as usize;
+        let num_fragments     = self.num_fragments.load(Ordering::Relaxed) as usize;
+        let num_files         = self.num_files.load(Ordering::Relaxed) as usize;
 
-        let header_size = size_of::<CacheHeader>();
-        let fragments_size = num_fragments * 4;
+        let header_size       = size_of::<CacheHeader>();
+        let fragments_size    = num_fragments * 4;
 
         // ------- Calculate padding for alignment
-        let pad1_size = ((header_size + fragments_size + (16 - 1)) & !(16 - 1)) - (header_size + fragments_size);
-        let file_keys_size = num_files * size_of::<FileKey>();
-        let file_metas_size = num_files * size_of::<FileMeta>();
+        let pad1_size         = ((header_size + fragments_size + (16 - 1)) & !(16 - 1)) - (header_size + fragments_size);
+        let file_keys_size    = num_files * size_of::<FileKey>();
+        let file_metas_size   = num_files * size_of::<FileMeta>();
 
-        let after_metas = header_size + fragments_size + pad1_size + file_keys_size + file_metas_size;
-        let pad2_size = ((after_metas + (8 - 1)) & !(8 - 1)) - after_metas;
+        let after_metas       = header_size + fragments_size + pad1_size + file_keys_size + file_metas_size;
+        let pad2_size         = ((after_metas + (8 - 1)) & !(8 - 1)) - after_metas;
 
         let bits_per_file_u64 = num_fragments.div_ceil(64);
         let file_bitsets_size = num_files * bits_per_file_u64 * size_of::<u64>();
@@ -878,8 +957,6 @@ impl<S: CacheStorage> FragmentCache<S> {
             + file_keys_size + file_metas_size + pad2_size
             + file_bitsets_size;
 
-        let mut buf = Vec::with_capacity(total_size);
-
         let header = CacheHeader {
             magic: CACHE_MAGIC,
             num_fragments: num_fragments as u32,
@@ -888,34 +965,35 @@ impl<S: CacheStorage> FragmentCache<S> {
             _padding: 0,
         };
 
-        // SAFETY: CacheHeader is repr(C), all fields are plain integers, no padding issues
-        buf.extend_from_slice(unsafe {
-            std::slice::from_raw_parts(&header as *const CacheHeader as *const u8, header_size)
-        });
-        buf.extend_from_slice(unsafe {
-            std::slice::from_raw_parts(self.fragment_hashes.ptr as *const u8, fragments_size)
-        });
-        buf.resize(buf.len() + pad1_size, 0u8);
-        buf.extend_from_slice(unsafe {
-            std::slice::from_raw_parts(self.file_keys.ptr as *const u8, file_keys_size)
-        });
-        buf.extend_from_slice(unsafe {
-            std::slice::from_raw_parts(self.file_metas.ptr as *const u8, file_metas_size)
-        });
-        buf.resize(buf.len() + pad2_size, 0u8);
-        buf.extend_from_slice(unsafe {
-            std::slice::from_raw_parts(self.file_bitsets.ptr as *const u8, file_bitsets_size)
-        });
+        let pad1 = [0u8; 16];
+        let pad2 = [0u8; 8];
 
-        debug_assert_eq!(buf.len(), total_size);
+        let segments: [&[u8]; 7] = [
+            unsafe { std::slice::from_raw_parts(&header as *const CacheHeader as *const u8, header_size) },
+            unsafe { std::slice::from_raw_parts(self.fragment_hashes.ptr as *const u8, fragments_size) },
+            &pad1[..pad1_size],
+            unsafe { std::slice::from_raw_parts(self.file_keys.ptr as *const u8, file_keys_size) },
+            unsafe { std::slice::from_raw_parts(self.file_metas.ptr as *const u8, file_metas_size) },
+            &pad2[..pad2_size],
+            unsafe { std::slice::from_raw_parts(self.file_bitsets.ptr as *const u8, file_bitsets_size) },
+        ];
 
-        self.storage.save(&buf)?;
+        eprintln!(
+            "Cache prepared to write in {:.2}ms",
+            start.elapsed().as_millis() as f64
+        );
+
+        debug_assert_eq!(total_size, segments.iter().map(|s| s.len()).sum::<usize>());
+
+        let start = Instant::now();
+
+        self.storage.save_segments(&segments, total_size)?;
 
         eprintln!(
             "Cache saved: {} files, {} fragments, {:.2}MB in {:.2}ms",
             num_files, num_fragments,
             total_size as f64 / (1024.0 * 1024.0),
-            start.elapsed().as_secs_f64() * 1000.0,
+            start.elapsed().as_millis() as f64
         );
 
         Ok(())
@@ -1157,7 +1235,7 @@ impl<S: CacheStorage> FragmentCache<S> {
         }
 
         let elapsed = start.elapsed();
-        eprintln!("Cache updated: {} files in {:.2}ms", file_keys.len(), elapsed.as_secs_f64() * 1000.0);
+        eprintln!("Cache updated: {} files in {:.2}ms", file_keys.len(), elapsed.as_millis() as f64);
 
         Ok(())
     }
@@ -1366,7 +1444,6 @@ impl<S: CacheStorage> FragmentCache<S> {
 }
 
 // @Note: These tests are AI-generated, but its ok for a start I guess..
-
 
 #[cfg(test)]
 mod tests {
