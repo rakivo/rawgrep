@@ -15,6 +15,7 @@ pub struct GitignoreChain {
 struct GitignoreChainInner {
     /// Stack of (depth, gitignore) pairs
     stack: SmallVec<[(u16, Arc<Gitignore>); 8]>,
+
     /// Pre-computed: any gitignore in chain has negations?
     has_any_negations: bool,
 }
@@ -109,27 +110,28 @@ impl GitignoreChain {
 
         let filename_start = memrchr(MAIN_SEPARATOR as _, path).map_or(0, |i| i + 1);
         let filename = unsafe { path.get_unchecked(filename_start..) };
+        let filename_hash = fnv1a(filename);
 
         if inner.stack.len() == 1 {
-            return unsafe {
-                inner.stack.get_unchecked(0).1.is_ignored_with_filename(path, filename, is_dir)
-            };
+            let gi = unsafe { &inner.stack.get_unchecked(0).1 };
+            return gi.is_ignored_with_filename_hashed(path, filename, is_dir, filename_hash)
         }
 
         if !inner.has_any_negations {
             // -------- NO NEGATIONS - early exit on first match
             for (_, gi) in inner.stack.iter() {
-                if gi.is_ignored_with_filename(path, filename, is_dir) {
+                if gi.is_ignored_with_filename_hashed(path, filename, is_dir, filename_hash) {
                     return true;
                 }
             }
+
             return false
         }
 
         // ---------- HAS NEGATIONS - must check all, last match wins
         let mut result = false;
         for (_, gi) in inner.stack.iter() {
-            match gi.check_ignored_with_filename(path, filename, is_dir) {
+            match gi.check_ignored_with_filename(path, filename, is_dir, filename_hash) {
                 MatchResult::Ignored => result = true,
                 MatchResult::Negated => result = false,
                 MatchResult::NoMatch => {}
@@ -155,25 +157,100 @@ enum MatchResult {
     Negated,
 }
 
-#[derive(Clone)]
+#[inline(always)]
+fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for &b in bytes {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+/// Open-addressed linear-probed table mapping a literal pattern's bytes to
+/// its index in `literal_meta`. Built once per gitignore file at parse time,
+/// never mutated after.
+struct LiteralLookup {
+    slots: Box<[(u64, u16)]>, // (hash, literal_meta index), index == u16::MAX means empty
+    mask:  u64,
+}
+
+impl LiteralLookup {
+    fn build(literal_data: &[u8], metas: &[LiteralMeta], indices: &[u16]) -> Self {
+        let cap  = (indices.len().max(1) * 2).next_power_of_two();
+        let mask = (cap - 1) as u64;
+        let mut slots = vec![(0u64, u16::MAX); cap].into_boxed_slice();
+
+        for &idx in indices {
+            let meta    = metas[idx as usize];
+            let pattern = &literal_data[meta.offset as usize..meta.offset as usize + meta.len as usize];
+            let h       = fnv1a(pattern);
+
+            let mut slot = (h & mask) as usize;
+            while slots[slot].1 != u16::MAX {
+                slot = (slot + 1) & mask as usize;
+            }
+
+            slots[slot] = (h, idx);
+        }
+
+        Self { slots, mask }
+    }
+
+    #[inline]
+    fn contains_hashed(
+        &self,
+        literal_data: &[u8],
+        metas: &[LiteralMeta],
+        filename: &[u8],
+        is_dir: bool,
+        h: u64,
+    ) -> bool {
+        let mut slot = (h & self.mask) as usize;
+
+        loop {
+            let (slot_hash, idx) = self.slots[slot];
+            if idx == u16::MAX {
+                return false;
+            }
+
+            if slot_hash == h {
+                let meta = metas[idx as usize];
+                if !(meta.dir_only() && !is_dir) {
+                    let len     = meta.len as usize;
+                    let pattern = &literal_data[meta.offset as usize..meta.offset as usize + len];
+                    if pattern == filename {
+                        return true;
+                    }
+                }
+            }
+
+            slot = (slot + 1) & self.mask as usize;
+        }
+    }
+}
+
 #[allow(dead_code, reason = "@Incomplete")]
 pub struct Gitignore {
     /// Pre-computed: does this gitignore have any negations?
     pub(crate) has_negations: bool,
 
-    /// Quick rejection: if filename length is outside this range, skip literal checks
-    min_literal_len: u8,
-    max_literal_len: u8,
-
     /// Literal patterns
     literal_data: Box<[u8]>,
     literal_meta: Box<[LiteralMeta]>,
 
+    /// Pattern execution order for correct semantics
+    order: Box<[OrderEntry]>,
+
     /// Wildcard patterns
     wildcards: Box<[WildcardPattern]>,
 
-    /// Pattern execution order for correct semantics
-    order: Box<[OrderEntry]>,
+    // Fast path, used only when has_negations is false. In that case
+    // "any match ignores" and "last match ignores" are the same rule,
+    // so declaration order can be discarded and we can go straight to
+    // whatever's cheapest instead of walking `order`.
+    unanchored_lookup:        LiteralLookup,
+    anchored_literal_indices: Box<[u16]>,
 }
 
 /// Packed literal pattern metadata
@@ -237,9 +314,6 @@ impl Gitignore {
 
         let mut has_negations = false;
 
-        let mut min_literal_len = u8::MAX;
-        let mut max_literal_len = 0u8;
-
         for line in content.split(|&b| b == b'\n') {
             if line.is_empty() || line[0] == b'#' {
                 continue;
@@ -300,10 +374,6 @@ impl Gitignore {
                         flags,
                     });
 
-                    // Track length bounds for quick rejection
-                    min_literal_len = min_literal_len.min(len as u8);
-                    max_literal_len = max_literal_len.max(len as u8);
-
                     order.push(OrderEntry {
                         ty: 0,
                         index: (literal_meta.len() - 1) as u16,
@@ -338,10 +408,23 @@ impl Gitignore {
             }
         }
 
+        // after literal_meta is fully built, before assembling Self:
+        let unanchored_indices: Vec<u16> = literal_meta.iter().enumerate()
+            .filter(|(_, m)| !m.anchored())
+            .map(|(i, _)| i as u16)
+            .collect();
+
+        let anchored_literal_indices = literal_meta.iter().enumerate()
+            .filter(|(_, m)| m.anchored())
+            .map(|(i, _)| i as u16)
+            .collect();
+
+        let unanchored_lookup = LiteralLookup::build(&literal_data, &literal_meta, &unanchored_indices);
+
         Self {
             has_negations,
-            min_literal_len,
-            max_literal_len,
+            anchored_literal_indices,
+            unanchored_lookup,
             literal_data: literal_data.into_boxed_slice(),
             literal_meta: literal_meta.into_boxed_slice(),
             wildcards: wildcards.into_boxed_slice(),
@@ -352,7 +435,45 @@ impl Gitignore {
     /// Check if ignored, returns bool (for non-negation fast path)
     #[inline(always)]
     pub fn is_ignored_with_filename(&self, path: &[u8], filename: &[u8], is_dir: bool) -> bool {
+        let filename_hash = fnv1a(filename);
+        self.is_ignored_with_filename_hashed(path, filename, is_dir, filename_hash)
+    }
+
+    /// Check if ignored, returns bool (for non-negation fast path)
+    #[inline(always)]
+    pub fn is_ignored_with_filename_hashed(&self, path: &[u8], filename: &[u8], is_dir: bool, filename_hash: u64) -> bool {
         if self.order.is_empty() {
+            return false;
+        }
+
+        if !self.has_negations {
+            if self.unanchored_lookup.contains_hashed(&self.literal_data, &self.literal_meta, filename, is_dir, filename_hash) {
+                return true;
+            }
+
+            for &idx in self.anchored_literal_indices.iter() {
+                let meta = unsafe { *self.literal_meta.get_unchecked(idx as usize) };
+                if meta.dir_only() && !is_dir { continue; }
+
+                let len = meta.len as usize;
+                let pattern = unsafe {
+                    self.literal_data.get_unchecked(meta.offset as usize..meta.offset as usize + len)
+                };
+
+                if match_anchored_literal(pattern, path) {
+                    return true;
+                }
+            }
+
+            for pattern in self.wildcards.iter() {
+                if pattern.dir_only() && !is_dir { continue; }
+
+                let text = if pattern.anchored() { path } else { filename };
+                if match_wildcard(pattern, text) {
+                    return true;
+                }
+            }
+
             return false;
         }
 
@@ -391,8 +512,7 @@ impl Gitignore {
                 }
 
                 let text = if pattern.anchored() { path } else { filename };
-
-                let matched = match_wildcard_fast(pattern, text);
+                let matched = match_wildcard(pattern, text);
 
                 if matched {
                     result = !pattern.negated();
@@ -405,8 +525,41 @@ impl Gitignore {
 
     /// Check if ignored, returns MatchResult (for negation handling)
     #[inline]
-    fn check_ignored_with_filename(&self, path: &[u8], filename: &[u8], is_dir: bool) -> MatchResult {
+    fn check_ignored_with_filename(&self, path: &[u8], filename: &[u8], is_dir: bool, filename_hash: u64) -> MatchResult {
         if self.order.is_empty() {
+            return MatchResult::NoMatch;
+        }
+
+        if !self.has_negations {
+            // @Cutnpaste from is_ignored_with_filename_hashed
+
+            if self.unanchored_lookup.contains_hashed(&self.literal_data, &self.literal_meta, filename, is_dir, filename_hash) {
+                return MatchResult::Ignored;
+            }
+
+            for &idx in self.anchored_literal_indices.iter() {
+                let meta = unsafe { *self.literal_meta.get_unchecked(idx as usize) };
+                if meta.dir_only() && !is_dir { continue; }
+
+                let len = meta.len as usize;
+                let pattern = unsafe {
+                    self.literal_data.get_unchecked(meta.offset as usize..meta.offset as usize + len)
+                };
+
+                if match_anchored_literal(pattern, path) {
+                    return MatchResult::Ignored;
+                }
+            }
+
+            for pattern in self.wildcards.iter() {
+                if pattern.dir_only() && !is_dir { continue; }
+
+                let text = if pattern.anchored() { path } else { filename };
+                if match_wildcard(pattern, text) {
+                    return MatchResult::Ignored;
+                }
+            }
+
             return MatchResult::NoMatch;
         }
 
@@ -451,7 +604,7 @@ impl Gitignore {
 
                 let text = if pattern.anchored() { path } else { filename };
 
-                if match_wildcard_fast(pattern, text) {
+                if match_wildcard(pattern, text) {
                     result = if pattern.negated() {
                         MatchResult::Negated
                     } else {
@@ -508,7 +661,7 @@ fn match_anchored_literal(pattern: &[u8], path: &[u8]) -> bool {
 }
 
 #[inline(always)]
-fn match_wildcard_fast(pattern: &WildcardPattern, text: &[u8]) -> bool {
+fn match_wildcard(pattern: &WildcardPattern, text: &[u8]) -> bool {
     // Fast path: suffix match (*.rs)
     if let Some(ref suffix) = pattern.suffix {
         return text.len() >= suffix.len() && unsafe {
@@ -538,8 +691,8 @@ fn glob_match(pattern: &[u8], text: &[u8]) -> bool {
 
     // Fast path: no wildcards
     if !pattern.contains(&b'*') &&
-        !pattern.contains(&b'?') &&
-        !pattern.contains(&b'[')
+       !pattern.contains(&b'?') &&
+       !pattern.contains(&b'[')
     {
         return pattern == text;
     }
