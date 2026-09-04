@@ -1,3 +1,5 @@
+#[cfg(windows)]
+use std::sync::OnceLock;
 use std::{fs::File, io, sync::Arc};
 
 use smallvec::SmallVec;
@@ -13,6 +15,12 @@ pub fn read_u16_le(buf: &[u8], offset: usize) -> u16 {
     u16::from_le_bytes(buf[offset..offset+2].try_into().unwrap())
 }
 
+#[cfg(windows)]
+pub static SECTOR_SIZE: OnceLock<u64> = OnceLock::new();
+
+#[cfg(windows)]
+const DEFAULT_SECTOR_SIZE: u64 = 512;
+
 #[inline]
 pub fn read_at_offset(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
     #[cfg(unix)] {
@@ -23,18 +31,18 @@ pub fn read_at_offset(file: &File, buf: &mut [u8], offset: u64) -> io::Result<us
     #[cfg(windows)] {
         use std::os::windows::fs::FileExt;
 
-        const SECTOR: u64 = 512;
+        let sector_size = SECTOR_SIZE.get().copied().unwrap_or(DEFAULT_SECTOR_SIZE);
 
-        let aligned_offset = offset & !(SECTOR - 1);
+        let aligned_offset = offset & !(sector_size - 1);
         let prefix = (offset - aligned_offset) as usize;
-        if prefix == 0 && buf.len() % SECTOR as usize == 0 {
+        if prefix == 0 && buf.len() % sector_size as usize == 0 {
             // Already aligned, read directly
             return file.seek_read(buf, offset);
         }
 
         // Unaligned, probably never would happen but for @Robustness,
         // read into a sector-aligned temp buffer and copy out.
-        let aligned_len = ((prefix + buf.len()) + SECTOR as usize - 1) & !(SECTOR as usize - 1);
+        let aligned_len = ((prefix + buf.len()) + sector_size as usize - 1) & !(sector_size as usize - 1);
         let mut tmp = vec![0u8; aligned_len];  // @Heap @Heap @Heap
         let n = file.seek_read(&mut tmp, aligned_offset)?;
 

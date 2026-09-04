@@ -210,15 +210,20 @@ pub fn open_device(path: &str) -> io::Result<File> {
 
 #[cfg(windows)]
 #[inline]
-pub fn open_device_impl(path: &str, _uncached: bool) -> io::Result<File> {
+pub fn open_device_impl(path: &str, uncached: bool) -> io::Result<File> {
     use std::os::windows::fs::OpenOptionsExt;
     use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_NO_BUFFERING;
 
-    OpenOptions::new()
-        .read(true)
-        .share_mode(0x3) // FILE_SHARE_READ | FILE_SHARE_WRITE
-        .custom_flags(FILE_FLAG_NO_BUFFERING) // required for raw volume reads
-        .open(path)
+    let is_raw_device = path.starts_with(r"\\.\") || path.starts_with(r"\\?\");
+
+    let mut opts = OpenOptions::new();
+    opts.read(true).share_mode(0x3);
+
+    if is_raw_device && uncached {
+        opts.custom_flags(FILE_FLAG_NO_BUFFERING);
+    }
+
+    opts.open(path)
 }
 
 #[cfg(unix)]
@@ -238,13 +243,44 @@ pub fn open_device_impl(path: &str, uncached: bool) -> io::Result<File> {
 
 #[inline]
 pub fn open_device_and_detect_fs(device_path: &str) -> io::Result<(File, FsType)> {
+    let file = open_device(device_path)?;
+
     {
         let t = std::time::Instant::now();
-        unsafe { libc::sync(); }
-        eprintln!("sync: {:.2}ms", t.elapsed().as_secs_f64() * 1000.0);
-    }
 
-    let file = open_device(device_path)?;
+        #[cfg(unix)]
+        unsafe { libc::sync(); }
+
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawHandle;
+            use windows_sys::Win32::Storage::FileSystem::FlushFileBuffers;
+            use windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED;
+
+            let handle = file.as_raw_handle();
+            let result = unsafe { FlushFileBuffers(handle as _) };
+            if result == 0 {
+                let err = io::Error::last_os_error();
+
+                //
+                // A read-only handle has nothing to flush -- FlushFileBuffers
+                // requires GENERIC_WRITE, so ERROR_ACCESS_DENIED here just means
+                // "this handle can't flush," not a real failure.
+                //
+                if err.raw_os_error() != Some(ERROR_ACCESS_DENIED as i32) {
+                    return Err(err);
+                } else {
+                    eprintln!("FlushFileBuffers skipped: handle not opened for write");
+                }
+            }
+
+            if let Ok(sector_size) = crate::platform::windows::query_sector_size(&file) {
+                _ = crate::util::SECTOR_SIZE.set(sector_size);
+            }
+        }
+
+        eprintln!("sync: {:.2}ms", t.elapsed().as_millis() as f64);
+    }
 
     //
     // @Volatile

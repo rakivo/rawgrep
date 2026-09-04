@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::Path;
+use std::path::PathBuf;
 use std::io::{self, BufWriter};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -249,11 +250,15 @@ impl<S: MatchSink + 'static> RawGrepCtx<S> {
         // Open device and detect fs
         //
 
-        let search_root = fs::canonicalize(&*config.search_root_path)
-            .map_err(|e| Error::PathNotFound {
+        let search_root = if config.device.is_some() {
+            fs::canonicalize(&*config.search_root_path)
+                .unwrap_or_else(|_| PathBuf::from(&*config.search_root_path))
+        } else {
+            fs::canonicalize(&*config.search_root_path).map_err(|e| Error::PathNotFound {
                 path:   config.search_root_path.clone(),
                 source: e,
-            })?;
+            })?
+        };
 
         let device = match config.device.clone() {
             Some(d) => d,

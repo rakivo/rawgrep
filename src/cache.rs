@@ -242,6 +242,7 @@ impl std::ops::Deref for CacheBytes {
 }
 
 impl CacheBytes {
+    #[cfg(unix)]
     #[inline]
     fn advise(&self, advice: memmap2::Advice) {
         if let CacheBytes::Mapped(mmap) = self { _ = mmap.advise(advice) }
@@ -313,23 +314,41 @@ impl CacheStorage for DiskStorage {
 
     #[inline]
     fn load_mapped(&self) -> io::Result<Option<CacheBytes>> {
-        let file = match std::fs::File::open(&self.path) {
+        let mut file = match std::fs::File::open(&self.path) {
             Ok(f) => f,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(e),
         };
+        let len = file.metadata()?.len();
 
         // mmap2 refuses to map a zero-length file, treat that as no-cache.
-        if file.metadata()?.len() == 0 {
+        if len == 0 {
             return Ok(None);
         }
 
-        // SAFETY: the file is only ever replaced via tmp+rename,
-        // never truncated/modified in place, so this mapping stays valid for
-        // as long as we hold it. External processes touching the cache path
-        // directly would violate this, but that's outside our control anyway.
-        let mmap = unsafe { memmap2::Mmap::map(&file)? };
-        Ok(Some(CacheBytes::Mapped(mmap)))
+        #[cfg(windows)]
+        {
+            //
+            // Apparently, a live mmap keeps the file's section object referenced at the
+            // kernel level regardless of share-mode flags, which blocks the
+            // tmp+rename swap in save_segments. Read into an owned buffer
+            // instead so the handle is fully released once this returns.
+            //
+            use std::io::Read;
+            let mut buf = Vec::with_capacity(len as usize);
+            file.read_to_end(&mut buf)?;
+            return Ok(Some(CacheBytes::Owned(buf.into())));
+        }
+
+        #[cfg(not(windows))]
+        {
+            // SAFETY: the file is only ever replaced via tmp+rename,
+            // never truncated/modified in place, so this mapping stays valid for
+            // as long as we hold it. External processes touching the cache path
+            // directly would violate this, but that's outside our control anyway.
+            let mmap = unsafe { memmap2::Mmap::map(&file)? };
+            Ok(Some(CacheBytes::Mapped(mmap)))
+        }
     }
 }
 
@@ -892,6 +911,7 @@ impl<S: CacheStorage> FragmentCache<S> {
             FatPtr::from_raw(bytes.as_ptr().add(file_bitsets_offset) as *const u64, file_bitsets_len)
         };
 
+        #[cfg(unix)]
         bytes.advise(memmap2::Advice::Sequential);
 
         // ---- Build lookup table
@@ -924,6 +944,7 @@ impl<S: CacheStorage> FragmentCache<S> {
             start.elapsed().as_millis() as f64
         );
 
+        #[cfg(unix)]
         bytes.advise(memmap2::Advice::Random);
 
         let file_capacity = num_files;
@@ -1425,8 +1446,13 @@ impl<S: CacheStorage> FragmentCache<S> {
                 //
                 PathBuf::from("/home").join(sudo_user)
             } else {
-                let home_str = std::env::var("HOME")
-                    .map_err(|_| io::Error::new(io::ErrorKind::NotFound, "HOME not set"))?;
+                #[cfg(unix)]
+                let home_str = std::env::var("HOME");
+
+                #[cfg(not(unix))]
+                let home_str = std::env::var("USERPROFILE");
+
+                let home_str = home_str.map_err(|_| io::Error::new(io::ErrorKind::NotFound, "HOME not set"))?;
 
                 PathBuf::from(home_str)
             };

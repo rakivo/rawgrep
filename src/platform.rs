@@ -418,7 +418,6 @@ pub mod windows {
     use std::os::windows::ffi::OsStrExt;
     use std::path::MAIN_SEPARATOR_STR;
 
-    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
     use windows_sys::Win32::Storage::FileSystem::{
         GetFileInformationByHandle, GetVolumePathNameW,
         BY_HANDLE_FILE_INFORMATION,
@@ -439,10 +438,60 @@ pub mod windows {
 
     pub struct WindowsPlatform;
 
+    #[inline]
+    fn is_invalid_handle(handle: std::os::windows::io::RawHandle) -> bool {
+        (handle as isize) == -1
+    }
+
+    /// Strips the `\\?\` or `\\?\UNC\` verbatim-path prefix that
+    /// `Path::canonicalize()` (and some WinAPI calls) prepend on Windows.
+    #[inline]
+    fn strip_verbatim_prefix(s: &str) -> &str {
+        s.strip_prefix(r"\\?\UNC\")
+            .or_else(|| s.strip_prefix(r"\\?\"))
+            .unwrap_or(s)
+    }
+
+    pub fn query_sector_size(file: &File) -> io::Result<u64> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::System::Ioctl::{
+            IOCTL_STORAGE_QUERY_PROPERTY, StorageAccessAlignmentProperty,
+            STORAGE_PROPERTY_QUERY, STORAGE_ACCESS_ALIGNMENT_DESCRIPTOR,
+        };
+        use windows_sys::Win32::System::IO::DeviceIoControl;
+
+        let query = STORAGE_PROPERTY_QUERY {
+            PropertyId: StorageAccessAlignmentProperty,
+            QueryType: 0, // PropertyStandardQuery
+            AdditionalParameters: [0],
+        };
+        let mut descriptor: STORAGE_ACCESS_ALIGNMENT_DESCRIPTOR = unsafe { std::mem::zeroed() };
+        let mut bytes_returned = 0u32;
+
+        let ok = unsafe {
+            DeviceIoControl(
+                file.as_raw_handle() as _,
+                IOCTL_STORAGE_QUERY_PROPERTY,
+                &query as *const _ as *const _,
+                std::mem::size_of_val(&query) as u32,
+                &mut descriptor as *mut _ as *mut _,
+                std::mem::size_of_val(&descriptor) as u32,
+                &mut bytes_returned,
+                std::ptr::null_mut(),
+            )
+        };
+
+        if ok == 0 || descriptor.BytesPerPhysicalSector == 0 {
+            Ok(512) // conservative fallback
+        } else {
+            Ok(descriptor.BytesPerPhysicalSector as u64)
+        }
+    }
+
     impl Platform for WindowsPlatform {
         fn device_size(fd: &File) -> io::Result<u64> {
             let handle = fd.as_raw_handle();
-            if std::ptr::eq(handle, INVALID_HANDLE_VALUE) {
+            if is_invalid_handle(handle) {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     "Invalid file handle"
@@ -474,7 +523,7 @@ pub mod windows {
 
         fn device_id(fd: &File) -> io::Result<u64> {
             let handle = fd.as_raw_handle();
-            if std::ptr::eq(handle, INVALID_HANDLE_VALUE) {
+            if is_invalid_handle(handle) {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     "Invalid file handle"
@@ -530,6 +579,7 @@ pub mod windows {
             //
             let len = volume_path.iter().position(|&c| c == 0).unwrap_or(volume_path.len());
             let volume_str = String::from_utf16_lossy(&volume_path[..len]);
+            let volume_str = volume_str.strip_prefix(r"\\?\UNC\").or_else(|| volume_str.strip_prefix(r"\\?\")).unwrap_or(&volume_str);
 
             //
             // Windows returns mount points like "C:\", convert to device path "\\.\C:"
@@ -559,9 +609,8 @@ pub mod windows {
         }
 
         fn strip_mountpoint_prefix(device: &str, path: &Path) -> Option<String> {
-            use std::os::windows::ffi::OsStrExt;
-
-            let path_wide: Vec<u16> = path.as_os_str()
+            let path_wide: Vec<u16> = path
+                .as_os_str()
                 .encode_wide()
                 .chain(std::iter::once(0))
                 .collect();
@@ -574,14 +623,23 @@ pub mod windows {
                     volume_path.len() as u32,
                 )
             };
-            if result == 0 { return None; }
+            if result == 0 {
+                return None;
+            }
 
             let len = volume_path.iter().position(|&c| c == 0).unwrap_or(volume_path.len());
             let mountpoint = String::from_utf16_lossy(&volume_path[..len]);
-            // mountpoint is e.g. "C:\" - check it matches device
+            let mountpoint = strip_verbatim_prefix(&mountpoint).to_string();
+
             let trimmed = mountpoint.trim_end_matches('\\');
-            let device_path = format!("\\\\.\\{trimmed}");
-            if !device.eq_ignore_ascii_case(&device_path) { return None; }
+            let device_path = format!(r"\\.\{trimmed}");
+
+            // Normalize both sides the same way before comparing `device` (from the caller)
+            // may or may not carry a verbatim prefix depending on where it originated.
+            let device_normalized = strip_verbatim_prefix(device);
+            if !device_normalized.eq_ignore_ascii_case(&device_path) {
+                return None;
+            }
 
             let mount_path = std::path::Path::new(&mountpoint);
             let relative = path.strip_prefix(mount_path).ok()?;
