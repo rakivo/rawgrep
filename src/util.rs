@@ -54,11 +54,11 @@ pub const fn is_dot_entry(name: &[u8]) -> bool {
 
 #[inline(always)]
 pub const fn is_common_skip_dir(dir: &[u8]) -> bool {
-    matches!{
+    matches!(
         dir,
         b"node_modules" | b"target" | b".git" | b".hg" | b".svn" |
         b"dist" | b"build" | b"out" | b"bin" | b"tmp" | b".cache"
-    }
+    )
 }
 
 #[inline(always)]

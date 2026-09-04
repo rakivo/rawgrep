@@ -347,7 +347,7 @@ mod tests {
     fn test_check_fragment_presence_found() {
         let buf = b"hello world test";
         let pattern_frags = extract_pattern_fragments(b"hello");
-        let words_per_file = (pattern_frags.len() + 63) / 64;
+        let words_per_file = pattern_frags.len().div_ceil(64);
         let mut found = vec![0u64; words_per_file];
         check_fragment_presence(buf, &pattern_frags, &mut found);
 
@@ -360,7 +360,7 @@ mod tests {
     fn test_check_fragment_presence_not_found() {
         let buf = b"hello world test";
         let pattern_frags = extract_pattern_fragments(b"xyzzy");
-        let words_per_file = (pattern_frags.len() + 63) / 64;
+        let words_per_file = pattern_frags.len().div_ceil(64);
         let mut found = vec![0u64; words_per_file];
         check_fragment_presence(buf, &pattern_frags, &mut found);
 
