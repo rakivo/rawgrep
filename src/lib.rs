@@ -6,6 +6,7 @@
     clippy::collapsible_if,
     clippy::module_inception,
     clippy::new_without_default,
+    clippy::explicit_counter_loop,
     clippy::only_used_in_recursion,
     clippy::doc_overindented_list_items,
 )]

@@ -95,7 +95,7 @@ pub fn extract_pattern_fragments(pattern: &[u8]) -> Vec<u32> {  // @Memory @Spee
 
 /// Returns a SmallVec where `result[i]` is true if `fragment_hashes[i]` was found in the buffer.
 #[inline]
-pub fn check_fragment_presence(buf: &[u8], fragment_hashes: &[u32], fragment_presence_scratch: &mut Vec<u64>) {
+pub fn check_fragment_presence(buf: &[u8], fragment_hashes: &[u32], fragment_presence_scratch: &mut [u64]) {
     let num_frags = fragment_hashes.len();
 
     if num_frags == 0 {
@@ -123,7 +123,7 @@ pub fn check_fragment_presence(buf: &[u8], fragment_hashes: &[u32], fragment_pre
 
 /// Scalar fallback for fragment presence checking
 #[inline]
-fn check_fragment_presence_scalar(buf: &[u8], fragment_hashes: &[u32], fragment_presence_scratch: &mut Vec<u64>) {
+fn check_fragment_presence_scalar(buf: &[u8], fragment_hashes: &[u32], fragment_presence_scratch: &mut [u64]) {
     let num_frags = fragment_hashes.len();
     let stride = stride_heuristic(buf.len());
 
@@ -169,7 +169,7 @@ macro_rules! impl_fragment_presence_scanner {
         #[cfg(target_arch = $cfg_arch)]
         #[target_feature(enable = $feature)]
         #[allow(unsafe_op_in_unsafe_fn)]
-        unsafe fn $fn_name(buf: &[u8], fragment_hashes: &[u32], fragment_presence_scratch: &mut Vec<u64>) {
+        unsafe fn $fn_name(buf: &[u8], fragment_hashes: &[u32], fragment_presence_scratch: &mut [u64]) {
             let num_frags = fragment_hashes.len();
             let stride = stride_heuristic(buf.len()).max($min_stride);
             let buf_len = buf.len();

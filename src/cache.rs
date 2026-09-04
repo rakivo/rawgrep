@@ -200,10 +200,7 @@ impl std::ops::Deref for CacheBytes {
 impl CacheBytes {
     #[inline]
     fn advise(&self, advice: memmap2::Advice) {
-        match self {
-            CacheBytes::Mapped(mmap) => _ = mmap.advise(advice),
-            _ => {}
-        }
+        if let CacheBytes::Mapped(mmap) = self { _ = mmap.advise(advice) }
     }
 }
 
@@ -1090,7 +1087,7 @@ impl<S: CacheStorage> FragmentCache<S> {
         fragment_presence: Vec<bool>,
     ) -> io::Result<()> {
         let fragment_count = fragment_hashes.len();
-        let words_per_file = (fragment_count + 63) / 64;
+        let words_per_file = fragment_count.div_ceil(64);
         debug_assert_eq!(
             fragment_presence.len(),
             file_keys.len() * fragment_count,
@@ -1137,7 +1134,7 @@ impl<S: CacheStorage> FragmentCache<S> {
 
         let start = Instant::now();
 
-        let words_per_file = (fragment_hashes.len() + 63) / 64;
+        let words_per_file = fragment_hashes.len().div_ceil(64);
 
         //
         //

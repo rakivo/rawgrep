@@ -440,7 +440,7 @@ fn worker_thread_main<S: MatchSink + 'static>(
         path_arena.clear();
         if fragment_presence_scratch.is_empty() {
             let fragment_hash_count = job.grepper.fragment_hashes().len();
-            fragment_presence_scratch.resize((fragment_hash_count + 63) / 64, 0);
+            fragment_presence_scratch.resize(fragment_hash_count.div_ceil(64), 0);
             fragment_presence = FragmentPresenceBits::new(fragment_hash_count);
         }
 

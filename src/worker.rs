@@ -313,7 +313,7 @@ impl FragmentPresenceBits {
     pub fn new(fragment_count: usize) -> Self {
         Self {
             words: Vec::new(),
-            words_per_file: (fragment_count + 63) / 64,
+            words_per_file: fragment_count.div_ceil(64),
             fragment_count,
         }
     }
@@ -511,6 +511,7 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, '_, F, S> {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments, reason = "@Incomplete?..")]
     pub fn dispatch_directory_bytes(
         &mut self,
         file_id: u64,
