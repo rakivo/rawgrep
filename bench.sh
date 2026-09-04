@@ -15,7 +15,7 @@ SEARCH_DIR=".."
 DEVICE="/dev/nvme0n1p2"
 THREADS=16
 RUNS=10
-WARMUP=3
+WARMUP=5
 RESULTS_DIR="./benchmark_results"
 
 mkdir -p "$RESULTS_DIR"
