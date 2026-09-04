@@ -347,7 +347,7 @@ impl CacheStorage for MemoryStorage {
             data.extend_from_slice(segment);
         }
 
-        *self.data.lock() = data;
+        *self.data.lock() = Some(data);
         Ok(())
     }
 }

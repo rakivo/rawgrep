@@ -11,12 +11,9 @@ use crate::matcher::Matcher;
 use crate::binary::is_binary_ext;
 use crate::path_buf::SmallPathBuf;
 use crate::stats::Stats;
-use crate::parser::{
-    BufFatPtr, BufKind, FileId, FileNode, FileType, ParsedEntry, Parser, RawFs
-};
-use crate::util::{
-    is_common_skip_dir, likely, truncate_utf8, unlikely
-};
+use crate::stdout::RawStdout;
+use crate::parser::{BufFatPtr, BufKind, FileId, FileNode, FileType, ParsedEntry, Parser, RawFs};
+use crate::util::{is_common_skip_dir, likely, truncate_utf8, unlikely};
 use crate::{
     tracy,
     COLOR_CYAN,
@@ -34,6 +31,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use bumpalo::collections::Vec as BumpVec;
 use crossbeam_channel::{Receiver, Sender};
+use parking_lot::{Mutex, Condvar};
 use crossbeam_deque::{Injector, Steal, Stealer};
 pub use crossbeam_deque::Worker as DequeWorker;
 
@@ -44,22 +42,22 @@ pub use crossbeam_deque::Worker as DequeWorker;
 // so when we're gonna try to stream a file, we won't stumble upon
 // an NTFS resident file (implementation details...).
 //
-pub const STREAMING_THRESHOLD: usize = 10 * 1024 * 1024; // 10MB @Tune
+pub const STREAMING_THRESHOLD:     usize = 10 * 1024 * 1024; // 10MB @Tune
 
-pub const STREAMING_CHUNK_SIZE: usize = 512 * 1024;      // 512KB read buffer @Tune
+pub const STREAMING_CHUNK_SIZE:    usize = 512 * 1024;       // 512KB read buffer @Tune
 
-pub const LARGE_DIR_THRESHOLD: usize = 256; // Split dirs with 1000+ entries @Tune
-pub const FILE_BATCH_SIZE: usize = 64; // Process files in batches of 500 @Tune
+pub const LARGE_DIR_THRESHOLD:     usize = 256;              // Split dirs with 1000+ entries @Tune
+pub const FILE_BATCH_SIZE:         usize = 64;               // Process files in batches of 500 @Tune
 
-pub const WORKER_FLUSH_BATCH: usize = 16 * 1024; // @Tune
-pub const OUTPUTTER_FLUSH_BATCH: usize = 16 * 1024; // @Tune
+pub const WORKER_FLUSH_BATCH:      usize = 16 * 1024;        // @Tune
+pub const OUTPUTTER_FLUSH_BATCH:   usize = 16 * 1024;        // @Tune
 
-pub const BINARY_CONTROL_COUNT: usize = 51; // @Tune
-pub const BINARY_PROBE_BYTE_SIZE: usize = 0x1000; // @Tune
+pub const BINARY_CONTROL_COUNT:    usize = 51;               // @Tune
+pub const BINARY_PROBE_BYTE_SIZE:  usize = 0x1000;           // @Tune
 
-pub const MAX_EXTENTS_UNTIL_SPILL: usize = 64; // @Tune
+pub const MAX_EXTENTS_UNTIL_SPILL: usize = 64;               // @Tune
 
-pub const __MAX_FILE_BYTE_SIZE: usize = 8 * 1024 * 1024; // @Tune
+pub const __MAX_FILE_BYTE_SIZE:    usize = 8 * 1024 * 1024;  // @Tune
 
 pub enum WorkItem {
     File(FileWork),
@@ -149,44 +147,66 @@ where
     }
 }
 
+pub enum OutputMessage {
+    Data(&'static [u8]),
+    FlushReq,
+}
+
 pub struct OutputWorker {
-    pub rx: Receiver<&'static [u8]>,
-    pub flush_req_rx: Receiver<()>,
+    pub rx: Receiver<OutputMessage>,
     pub flush_ack_tx: Sender<()>,
-    pub writer: BufWriter<io::Stdout>,
+    pub writer: BufWriter<RawStdout>,
 }
 
 impl OutputWorker {
-    #[inline]
     pub fn run(mut self) {
         let _span = tracy::span!("OutputThread::run");
 
-        loop {
-            crossbeam_channel::select! {
-                recv(self.rx) -> msg => match msg {
-                    Ok(buf) => {
-                        _ = self.writer.write_all(buf);
-                        if self.writer.buffer().len() > OUTPUTTER_FLUSH_BATCH {
-                            _ = self.writer.flush();
+        'outer: loop {
+            match self.rx.recv() {
+                Ok(OutputMessage::Data(buf)) => {
+                    if self.write_and_maybe_flush(buf).is_err() {
+                        break 'outer;
+                    }
+
+                    //
+                    // Drain remaining output first
+                    //
+
+                    while let Ok(msg) = self.rx.try_recv() {
+                        match msg {
+                            OutputMessage::Data(buf) => {
+                                if self.write_and_maybe_flush(buf).is_err() {
+                                    break 'outer;
+                                }
+                            }
+                            OutputMessage::FlushReq => {
+                                _ = self.writer.flush();
+                                _ = self.flush_ack_tx.send(());
+                            }
                         }
                     }
+                }
 
-                    Err(_) => break,
-                },
-
-                recv(self.flush_req_rx) -> _ => {
-                    // Drain remaining output first
-                    for buf in self.rx.try_iter() {
-                        _ = self.writer.write_all(buf);
-                    }
-
+                Ok(OutputMessage::FlushReq) => {
                     _ = self.writer.flush();
                     _ = self.flush_ack_tx.send(());
                 }
+
+                Err(_) => break,
             }
         }
 
         _ = self.writer.flush();
+    }
+
+    #[inline]
+    fn write_and_maybe_flush(&mut self, buf: &[u8]) -> io::Result<()> {
+        self.writer.write_all(buf)?;
+        if self.writer.buffer().len() >= OUTPUTTER_FLUSH_BATCH {
+            self.writer.flush()?;
+        }
+        Ok(())
     }
 }
 
@@ -354,7 +374,7 @@ pub struct WorkerResult<'a> {
     pub fragment_presence:  FragmentPresenceBits,
 }
 
-pub struct WorkerContext<'a, 'output_arena, F: RawFs, S: MatchSink> {
+pub struct WorkerCtx<'a, 'output_arena, F: RawFs, S: MatchSink> {
     // ----- Setup-once
     pub fs:              &'a F,
     pub cache:    Option<&'a FragmentCache>,
@@ -389,10 +409,10 @@ pub struct WorkerContext<'a, 'output_arena, F: RawFs, S: MatchSink> {
 
     // ----- Cold / output plumbing ----
     pub sink: S,
-    pub output_tx: Sender<&'static [u8]>,
+    pub output_tx: Sender<OutputMessage>,
 }
 
-impl<'a, 'output_arena, F: RawFs, S: MatchSink> WorkerContext<'a, 'output_arena, F, S> {
+impl<'a, 'output_arena, F: RawFs, S: MatchSink> WorkerCtx<'a, 'output_arena, F, S> {
     #[inline(always)]
     fn init(&mut self) {
         let config = self.cli.get_buffer_config();
@@ -432,7 +452,7 @@ impl<'a, 'output_arena, F: RawFs, S: MatchSink> WorkerContext<'a, 'output_arena,
         }
 
         _ = self.output_tx.send(unsafe {  // @Cleanup
-            core::mem::transmute::<&[u8], &[u8]>(self.parser.output.as_slice())
+            OutputMessage::Data(core::mem::transmute::<&[u8], &[u8]>(self.parser.output.as_slice()))
         });
         self.parser.output.clear();
     }
@@ -448,7 +468,7 @@ impl<'a, 'output_arena, F: RawFs, S: MatchSink> WorkerContext<'a, 'output_arena,
 }
 
 // impl block of the core logic
-impl<F: RawFs, S: MatchSink> WorkerContext<'_, '_, F, S> {
+impl<F: RawFs, S: MatchSink> WorkerCtx<'_, '_, F, S> {
     pub fn dispatch_directory(
         &mut self,
         work: DirWork,
@@ -724,7 +744,7 @@ impl<F: RawFs, S: MatchSink> WorkerContext<'_, '_, F, S> {
         parent_path: &[u8],
         gitignore_chain: &GitignoreChain,
     ) -> io::Result<()> {
-        let _span = tracy::span!("WorkerContext::process_file_not_batch");
+        let _span = tracy::span!("WorkerCtx::process_file_not_batch");
 
         self.stats.files_encountered += 1;
 
@@ -752,13 +772,6 @@ impl<F: RawFs, S: MatchSink> WorkerContext<'_, '_, F, S> {
             self.path_buf.extend_from_slice(file_name);
         }
 
-        if !self.cli.should_ignore_gitignore() && !gitignore_chain.is_empty() {
-            if gitignore_chain.is_ignored(self.path_buf.as_ref(), false) {
-                self.stats.files_skipped_gitignore += 1;
-                return Ok(());
-            }
-        }
-
         let cache_key = if self.cache.is_some() {
             Some((
                 FileKey::new(self.fs.device_id(), node.file_id()),
@@ -772,6 +785,13 @@ impl<F: RawFs, S: MatchSink> WorkerContext<'_, '_, F, S> {
             let (file_key, file_meta) = unsafe { cache_key.unwrap_unchecked() };
             if cache.can_skip_file(file_key, file_meta, self.fragment_hashes) {
                 self.stats.files_skipped_by_cache += 1;
+                return Ok(());
+            }
+        }
+
+        if !self.cli.should_ignore_gitignore() && !gitignore_chain.is_empty() {
+            if gitignore_chain.is_ignored(self.path_buf.as_ref(), false) {
+                self.stats.files_skipped_gitignore += 1;
                 return Ok(());
             }
         }
@@ -830,7 +850,7 @@ impl<F: RawFs, S: MatchSink> WorkerContext<'_, '_, F, S> {
         max_size: usize,
         check_binary: bool,
     ) -> io::Result<bool> {
-        let _span = tracy::span!("WorkerContext::process_file_streaming");
+        let _span = tracy::span!("WorkerCtx::process_file_streaming");
 
         let mut carry = self.chunk_carry.take().unwrap_or_else(|| ChunkCarry::new().into());
         carry.reset();
@@ -910,7 +930,7 @@ impl<F: RawFs, S: MatchSink> WorkerContext<'_, '_, F, S> {
 }
 
 // impl block for printng matches
-impl<F: RawFs, S: MatchSink> WorkerContext<'_, '_, F, S> {
+impl<F: RawFs, S: MatchSink> WorkerCtx<'_, '_, F, S> {
     fn find_and_print_matches(&mut self) -> io::Result<bool> {
         let _span = tracy::span!("find_and_print_matches");
 
@@ -1145,10 +1165,10 @@ impl<F: RawFs, S: MatchSink> WorkerContext<'_, '_, F, S> {
 }
 
 /// impl block of gitignore helper functions
-impl<F: RawFs, S: MatchSink> WorkerContext<'_, '_, F, S> {
+impl<F: RawFs, S: MatchSink> WorkerCtx<'_, '_, F, S> {
     #[inline]
     fn try_load_gitignore(&mut self, gi_file_id: FileId) -> Option<Gitignore> {
-        let _span = tracy::span!("WorkerContext::try_load_gitignore");
+        let _span = tracy::span!("WorkerCtx::try_load_gitignore");
 
         if let Ok(gi_node) = self.fs.parse_node(gi_file_id) {
             let size = (gi_node.size() as usize).min(self.max_file_byte_size());
@@ -1169,11 +1189,12 @@ impl<F: RawFs, S: MatchSink> WorkerContext<'_, '_, F, S> {
     }
 }
 
-impl<'a, 'output_arena, F: RawFs, S: MatchSink> WorkerContext<'a, 'output_arena, F, S> {
+impl<'a, 'output_arena, F: RawFs, S: MatchSink> WorkerCtx<'a, 'output_arena, F, S> {
     pub fn start_worker_loop(
         mut self,
 
         running: &AtomicBool,
+        running_signal: &(Mutex<()>, Condvar),
         active_workers: &AtomicUsize,
 
         injector: &Injector<WorkItem>,
@@ -1183,12 +1204,14 @@ impl<'a, 'output_arena, F: RawFs, S: MatchSink> WorkerContext<'a, 'output_arena,
         self.init();
 
         let mut consecutive_steals = 0;
-        let mut idle_iterations = 0;
+        let mut idle_iterations    = 0;
 
         loop {
             if !running.load(Ordering::Relaxed) {
                 break;
             }
+
+            active_workers.fetch_add(1, Ordering::Release);
 
             let work = self.find_work(
                 local_worker,
@@ -1200,33 +1223,31 @@ impl<'a, 'output_arena, F: RawFs, S: MatchSink> WorkerContext<'a, 'output_arena,
             match work {
                 Some(work_item) => {
                     idle_iterations = 0;
-                    active_workers.fetch_add(1, Ordering::Release);
 
-                    match work_item {
-                        WorkItem::Directory(dir_work) => {
-                            _ = self.dispatch_directory(
-                                dir_work,
-                                local_worker,
-                                injector,
-                            );
-                        }
-
-                        WorkItem::File(file_work) => {
-                            _ = self.dispatch_file(file_work);
-                        }
-                    }
+                    _ = match work_item {
+                        WorkItem::Directory(dir_work) => self.dispatch_directory(dir_work, local_worker, injector),
+                        WorkItem::File(file_work)     => self.dispatch_file(file_work),
+                    };
 
                     active_workers.fetch_sub(1, Ordering::Release);
                 }
 
                 None => {
-                    idle_iterations += 1;
+                    // Didn't find anything this iteration, go back to idle
+                    // before checking whether the whole search is done.
+                    active_workers.fetch_sub(1, Ordering::Release);
 
+                    idle_iterations += 1;
                     self.flush_output();
 
                     if active_workers.load(Ordering::Acquire) == 0 {
                         if injector.is_empty() && local_worker.is_empty() {
                             running.store(false, Ordering::Release);
+                            {
+                                let (lock, cvar) = running_signal;
+                                let _guard = lock.lock();
+                                cvar.notify_all();
+                            }
                             break;
                         }
                     }

@@ -9,7 +9,7 @@
 //!   - Inline / compressed-size reporting (decmpfs xattr size only; full
 //!     transparent decompression is left as a future extension)
 //!
-//! Not yet supported (marked @Incomplete):
+//! Not yet supported:
 //!   - Transparent HFS+ compression (decmpfs / resource-fork data)
 //!   - Snapshots / multiple transaction epochs
 //!   - Encryption (wrapped keys)

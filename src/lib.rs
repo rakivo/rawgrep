@@ -25,6 +25,7 @@ pub mod ntfs;
 pub mod util;
 pub mod stats;
 pub mod tracy;
+pub mod stdout;
 pub mod ignore;
 pub mod parser;
 pub mod error;

@@ -14,12 +14,13 @@ use crossbeam_deque::{Injector, Stealer, Worker as DequeWorker};
 use crate::error::Error;
 use crate::RawGrepConfig;
 use crate::path_buf::SmallPathBuf;
+use crate::stdout::RawStdout;
 use crate::{cli, ignore, platform};
 use crate::parser::Parser;
 use crate::cache::{FileKey, FileMeta};
 use crate::stats::{AtomicStats, Stats};
 use crate::grep::{AnyGrepper, FsType, RawGrepper, open_device_and_detect_fs};
-use crate::worker::{DirWork, FileWork, MatchSink, OutputWorker, WorkItem, WorkerContext, PathArena, FileEntryArena, SubdirsArena, FragmentPresenceBits};
+use crate::worker::{DirWork, FileWork, MatchSink, OutputWorker, WorkItem, WorkerCtx, PathArena, FileEntryArena, SubdirsArena, FragmentPresenceBits, OUTPUTTER_FLUSH_BATCH, OutputMessage};
 
 #[derive(Default)]
 struct CacheAccumulator {
@@ -43,14 +44,19 @@ struct SearchJob<S: MatchSink> {
 /// wakes the idle workers.
 #[derive(Clone)]
 pub struct RawGrepCtx<S: MatchSink> {
+    worker_count:   usize,
+
     injector:       Arc<Injector<WorkItem>>,
     running:        Arc<AtomicBool>,
     active_workers: Arc<AtomicUsize>,
+
+    running_signal: Arc<(Mutex<()>, Condvar)>,    // notified when `running` flips false
+    job_done:       Arc<(Mutex<usize>, Condvar)>, // counts workers still owing a finish for this job
+
     wake:           Arc<(Mutex<u64>, Condvar)>,
     current_job:    Arc<RwLock<Option<Arc<SearchJob<S>>>>>,
 
-    output_tx:      Sender<&'static [u8]>,
-    flush_req_tx:   Sender<()>,
+    output_tx:      Sender<OutputMessage>,
     flush_ack_rx:   Arc<Mutex<Receiver<()>>>,
 }
 
@@ -62,18 +68,18 @@ impl<S: MatchSink + 'static> RawGrepCtx<S> {
         let injector       = Arc::default();
         let active_workers = Arc::default();
         let wake           = Arc::default();
+        let running_signal = Arc::default();
+        let job_done       = Arc::default();
         let job            = Arc::default();
 
-        let (output_tx, output_rx) = unbounded();
-        let (flush_req_tx, flush_req_rx) = unbounded();
+        let (output_tx, output_rx)       = unbounded();
         let (flush_ack_tx, flush_ack_rx) = unbounded();
 
         _ = std::thread::spawn(move || {
             OutputWorker {
                 rx: output_rx,
-                flush_req_rx,
                 flush_ack_tx,
-                writer: BufWriter::with_capacity(128 * 1024, io::stdout()), // @Contant @Tune
+                writer: BufWriter::with_capacity(OUTPUTTER_FLUSH_BATCH * 2, RawStdout::new()), // @Contant @Tune
             }.run();
         });
 
@@ -81,10 +87,12 @@ impl<S: MatchSink + 'static> RawGrepCtx<S> {
             injector,
             running,
             active_workers,
+            job_done,
+            running_signal,
             wake,
             current_job: job,
             output_tx,
-            flush_req_tx,
+            worker_count: num_threads,
             flush_ack_rx: Arc::new(Mutex::new(flush_ack_rx)),
         };
 
@@ -126,26 +134,27 @@ impl<S: MatchSink + 'static> RawGrepCtx<S> {
     #[inline]
     pub fn cancel(&self) {
         self.running.store(false, Ordering::SeqCst);
+        {
+            let (lock, cvar) = &*self.running_signal;
+            let _guard = lock.lock();
+            cvar.notify_all();
+        }
     }
 
     #[inline]
     pub fn wait(&mut self) -> Stats {
-        while self.running.load(Ordering::SeqCst) {
-            core::hint::spin_loop();
-        }
-
-        // Spin until all workers have dropped their job Arc clones
         {
-            let guard = self.current_job.read();
-            if let Some(job_arc) = guard.as_ref() {
-                while Arc::strong_count(job_arc) > 1 {
-                    std::hint::spin_loop();
-                }
-            }
+            let (lock, cvar) = &*self.running_signal;
+            let mut guard = lock.lock();
+            cvar.wait_while(&mut guard, |_| self.running.load(Ordering::SeqCst));
+        }
+        {
+            let (lock, cvar) = &*self.job_done;
+            let mut guard = lock.lock();
+            cvar.wait_while(&mut guard, |remaining| *remaining > 0);
         }
 
-        // Request flush and wait for ack
-        _ = self.flush_req_tx.send(());
+        _ = self.output_tx.send(OutputMessage::FlushReq);
         _ = self.flush_ack_rx.lock().recv();
 
         self.current_job.read()
@@ -213,16 +222,27 @@ impl<S: MatchSink + 'static> RawGrepCtx<S> {
         debug!("[ctx] search() pattern={:?} root={:?}", config.pattern, config.search_root_path);
 
         //
-        // Cancel previous search and wait for workers to go idle
+        // Cancel previous search and wait for it to fully stop before touching
+        // anything shared (current_job, injector) that the old generation's
+        // workers might still be using.
         //
+        self.running.store(false, Ordering::SeqCst);
         {
-            self.running.store(false, Ordering::SeqCst);
-            while self.active_workers.load(Ordering::SeqCst) > 0 {
-                std::hint::spin_loop();
-            }
+            let (lock, cvar) = &*self.running_signal;
+            let mut guard = lock.lock();
+            cvar.wait_while(&mut guard, |_| self.running.load(Ordering::SeqCst));
+        }
+        {
+            let (lock, cvar) = &*self.job_done;
+            let mut guard = lock.lock();
+            cvar.wait_while(&mut guard, |remaining| *remaining > 0);
+        }
+        while self.injector.steal().is_success() {}
 
-            // Clear the injector from potential stale work
-            while self.injector.steal().is_success() {}
+        // Now it's safe to arm the counter for the new generation.
+        {
+            let (lock, _) = &*self.job_done;
+            *lock.lock() = self.worker_count;
         }
 
         //
@@ -426,7 +446,7 @@ fn worker_thread_main<S: MatchSink + 'static>(
 
         macro_rules! dispatch {
             ($g:expr) => {
-                WorkerContext {
+                WorkerCtx {
                     worker_id,
                     cache:            $g.cache(),
                     fragment_hashes:  $g.fragment_hashes(),
@@ -453,6 +473,7 @@ fn worker_thread_main<S: MatchSink + 'static>(
                     pending_fragment_presence: fragment_presence
                 }.start_worker_loop(
                     &ctx.running,
+                    &ctx.running_signal,
                     &ctx.active_workers,
                     &ctx.injector,
                     stealers,
@@ -495,6 +516,15 @@ fn worker_thread_main<S: MatchSink + 'static>(
             file_keys = result.file_keys;
             file_metas = result.file_metas;
             fragment_presence = result.fragment_presence;
+        }
+
+        {
+            let (lock, cvar) = &*ctx.job_done;
+            let mut remaining = lock.lock();
+            *remaining -= 1;
+            if *remaining == 0 {
+                cvar.notify_all();
+            }
         }
     }
 }

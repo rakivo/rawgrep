@@ -61,7 +61,6 @@ impl<'a> Iterator for MatchIterator<'a> {
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
-        let _span = tracy::span!("MatchIterator::next");
         match self {
             MatchIterator::Literal { iter, needle_len } => {
                 iter.next().map(|pos| (pos, pos + *needle_len))
