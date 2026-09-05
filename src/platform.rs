@@ -419,11 +419,12 @@ pub mod windows {
     use std::path::MAIN_SEPARATOR_STR;
 
     use windows_sys::Win32::Storage::FileSystem::{
-        GetFileInformationByHandle, GetVolumePathNameW,
+        GetFileInformationByHandle, GetVolumeInformationByHandleW, GetVolumePathNameW,
         BY_HANDLE_FILE_INFORMATION,
     };
     use windows_sys::Win32::System::IO::DeviceIoControl;
     use windows_sys::Win32::System::Ioctl::IOCTL_DISK_GET_LENGTH_INFO;
+
     use windows_sys::Win32::System::Threading::{
         GetCurrentProcess, SetPriorityClass,
         ABOVE_NORMAL_PRIORITY_CLASS, HIGH_PRIORITY_CLASS,
@@ -446,7 +447,7 @@ pub mod windows {
     /// Strips the `\\?\` or `\\?\UNC\` verbatim-path prefix that
     /// `Path::canonicalize()` (and some WinAPI calls) prepend on Windows.
     #[inline]
-    fn strip_verbatim_prefix(s: &str) -> &str {
+    pub fn strip_verbatim_prefix(s: &str) -> &str {
         s.strip_prefix(r"\\?\UNC\")
             .or_else(|| s.strip_prefix(r"\\?\"))
             .unwrap_or(s)
@@ -530,22 +531,46 @@ pub mod windows {
                 ));
             }
 
+            //
+            // Try the file/directory path first, this is the common case
+            //
             let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
-
             let result = unsafe {
                 GetFileInformationByHandle(handle as _, &mut info)
+            };
+
+            if result != 0 {
+                let file_index = ((info.nFileIndexHigh as u64) << 32) | (info.nFileIndexLow as u64);
+                let volume_serial = info.dwVolumeSerialNumber as u64;
+                return Ok(volume_serial ^ file_index);
+            }
+
+            //
+            // ERROR_INVALID_PARAMETER (87) here means the handle is a raw
+            // volume handle, not a file, fall back to the volume-only query
+            //
+            let err = io::Error::last_os_error();
+            if err.raw_os_error() != Some(87) {
+                return Err(err);
+            }
+
+            let mut volume_serial: u32 = 0;
+            let result = unsafe {
+                GetVolumeInformationByHandleW(
+                    handle as _,
+                    std::ptr::null_mut(), 0,
+                    &mut volume_serial,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(), 0,
+                )
             };
 
             if result == 0 {
                 return Err(io::Error::last_os_error());
             }
 
-            //
-            // Combine volume serial number and file index for unique ID
-            //
-            let file_index = ((info.nFileIndexHigh as u64) << 32) | (info.nFileIndexLow as u64);
-            let volume_serial = info.dwVolumeSerialNumber as u64;
-            Ok(volume_serial ^ file_index)
+            Ok(volume_serial as u64)
         }
 
         fn detect_partition_for_path(path: &Path) -> io::Result<String> {

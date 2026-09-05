@@ -138,6 +138,7 @@ pub struct Parser<'a> {
 
     // =============== Cache line ======================
 
+    pub mft_record: Vec<u8>,
     pub chunk:     Vec<u8>,
 }
 
@@ -149,6 +150,7 @@ impl<'a> Parser<'a> {
             dir: Vec::new(),
             gitignore: Vec::new(),
             output: BumpVec::new_in(bump),
+            mft_record: Vec::new(),
             scratch: Vec::new(),
             scratch2: Vec::new(),
             chunk: Vec::new()
@@ -162,6 +164,19 @@ impl<'a> Parser<'a> {
         self.output.reserve(config.output_buf);
         self.gitignore.reserve(config.gitignore_buf);
         self.scratch.reserve(config.extent_buf * 8); // extents are ~8 bytes each
+    }
+
+    #[inline]
+    pub fn mft_record_buf_mut(&mut self, size: usize) -> &mut Vec<u8> {
+        if self.mft_record.len() != size {
+            self.mft_record.resize(size, 0);
+        }
+        &mut self.mft_record
+    }
+
+    #[inline]
+    pub fn mft_record_buf(&mut self) -> &[u8] {
+        &self.mft_record
     }
 
     /// Find a file id by name in buf

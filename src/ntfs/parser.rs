@@ -9,19 +9,32 @@ use crate::worker::STREAMING_CHUNK_SIZE;
 
 use super::*;
 
-use std::io;
+use std::cell::UnsafeCell;
 use std::fs::File;
+use std::io;
 use std::ops::ControlFlow;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
-// "$I30" in UTF-16LE - the name of the $FILE_NAME index on every directory
-const I30: [u16; 4] = [0x0024, 0x0049, 0x0033, 0x0030];
+use parking_lot::{Condvar, Mutex};
+
+const DATA_NONE: u8 = 0;
+const DATA_RESIDENT: u8 = 1;
+const DATA_NONRESIDENT: u8 = 2;
 
 pub struct NtfsFs {
     pub file: File,
     pub sb: NtfsSuperBlock,
+    pub device_path: Arc<str>,
     pub device_id: u64,
     pub mft_runs: SmallVec<[NtfsExtent; 8]>,
+    tree: UnsafeCell<NtfsTree>,
+    scan: MftScan,
 }
+
+// Disjoint per-record writes during the parallel `$MFT` scan; after `ready`
+// the tree is read-only. `File`/`Vec` fields are otherwise `Sync`.
+unsafe impl Sync for NtfsFs {}
 
 impl FileNode for NtfsNode {
     #[inline(always)]
@@ -50,10 +63,16 @@ impl RawFs for NtfsFs {
     fn parse_node(&self, file_id: FileId) -> io::Result<Self::Node> {
         let _span = tracy::span!("NtfsFs::parse_node");
 
-        let mut record = vec![0u8; self.sb.mft_record_size as usize]; // @Heap
-        self.read_mft_record(file_id, &mut record)?;
-
-        parse_mft_record(&record, file_id)
+        if !self.tree().is_in_use(file_id) {
+            return Err(io::Error::new(io::ErrorKind::NotFound, "MFT record not in use"));
+        }
+        let m = self.tree().meta(file_id);
+        Ok(NtfsNode {
+            record_num: file_id,
+            flags: m.flags,
+            size: m.size,
+            mtime_sec: m.mtime_sec,
+        })
     }
 
     #[inline]
@@ -71,22 +90,30 @@ impl RawFs for NtfsFs {
             return self.read_dir_linearised(node, parser, kind).map(|_| true);
         }
 
-        let buf = Parser::get_buf_mut_impl(&mut parser.file, &mut parser.dir, &mut parser.gitignore, kind);
-        buf.clear();
-
         let file_size   = node.size as usize;
         let size_to_read = file_size.min(max_size);
 
-        let mut record = vec![0u8; self.sb.mft_record_size as usize]; // @Heap
-        self.read_mft_record(node.record_num, &mut record)?;
-
-        let Some((is_resident, attr_slice)) = find_attribute(&record, NTFS_ATTR_DATA, None) else {
-            return Ok(true); // no $DATA, metadata-only or empty
-        };
-
-        if is_resident {
-            return self.read_resident_data(parser, attr_slice, size_to_read, file_size, kind, check_binary);
+        match self.tree().data_kind(node.record_num) {
+            DATA_NONE => {
+                parser.get_buf_mut(kind).clear();
+                return Ok(true);
+            }
+            DATA_RESIDENT => {
+                let data = self.tree().raw_runlist(node.record_num);
+                let actual = data.len().min(size_to_read);
+                if check_binary && binary_probe(&data[..actual], file_size) {
+                    return Ok(false);
+                }
+                let buf = parser.get_buf_mut(kind);
+                buf.clear();
+                buf.extend_from_slice(&data[..actual]);
+                return Ok(true);
+            }
+            _ => {}
         }
+
+        let buf = Parser::get_buf_mut_impl(&mut parser.file, &mut parser.dir, &mut parser.gitignore, kind);
+        buf.clear();
 
         let Some(chunks) = self.collect_file_chunks(
             &mut parser.scratch,
@@ -130,20 +157,15 @@ impl RawFs for NtfsFs {
         let cluster_size = self.sb.cluster_size as u64;
 
         if node.is_dir() {
-            // Directories are handled separately via `read_dir_linearised`
             return Ok(Some(SmallVec::new()));
         }
 
-        let mut record = vec![0u8; self.sb.mft_record_size as usize]; // @Heap
-        self.read_mft_record(node.record_num, &mut record)?;
+        let raw = self.tree().raw_runlist(node.record_num);
+        if raw.is_empty() {
+            return Ok(Some(SmallVec::new()));
+        }
 
-        let Some((is_resident, attr_slice)) = find_attribute(&record, NTFS_ATTR_DATA, None) else {
-            return Ok(Some(SmallVec::new())); // no $DATA, metadata-only or empty
-        };
-
-        debug_assert!(!is_resident);
-
-        let runs = decode_runlist(attr_slice, &self.sb)?;
+        let runs = decode_runlist_bytes(raw)?;
 
         let mut skip_first = 0usize;
 
@@ -243,7 +265,7 @@ impl RawFs for NtfsFs {
 
 impl NtfsFs {
     #[inline]
-    pub fn new(file: File, device_id: u64) -> io::Result<Self> {
+    pub fn new(file: File, device_id: u64, device_path: &str) -> io::Result<Self> {
         let mut boot = [0u8; 512];
         read_at_offset(&file, &mut boot, 0)?;
         let sb = parse_boot_sector(&boot)?;
@@ -260,46 +282,109 @@ impl NtfsFs {
             _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "Could not find $MFT $DATA attribute")),
         };
 
-        Ok(NtfsFs { file, sb, device_id, mft_runs })
+        let mft_data_size = find_data_size(&mft_record);
+        let num_records = (mft_data_size / sb.mft_record_size as u64) as usize;
+        let tree = NtfsTree::with_capacity(num_records);
+        let scan = MftScan::new(num_records);
+
+        Ok(NtfsFs {
+            file,
+            sb,
+            device_id,
+            mft_runs,
+            device_path: device_path.into(),
+            tree: UnsafeCell::new(tree),
+            scan,
+        })
     }
 
     #[inline]
-    fn read_mft_record(&self, record_num: u64, buf: &mut [u8]) -> io::Result<()> {
-        let offset = mft_record_offset(&self.mft_runs, record_num, &self.sb)?;
-        self.read_at_offset(buf, offset)?;
-        apply_fixups(buf)
+    fn tree(&self) -> &NtfsTree {
+        // SAFETY: slots are written disjointly during scan; after `ready` the
+        // tree is treated as read-only shared state.
+        unsafe { &*self.tree.get() }
+    }
+
+    /// Arm the parallel `$MFT` scan. Call once on the search thread before
+    /// workers wake; each worker then runs [`scan_mft_worker`].
+    pub fn init_parallel_scan(&self, num_workers: usize) {
+        let n = num_workers.max(1);
+        *self.scan.parts.lock() = (0..n).map(|_| None).collect();
+        self.scan.remaining.store(n, Ordering::Release);
+        *self.scan.ready.0.lock() = false;
+        *self.scan.work_gate.0.lock() = false;
+        *self.scan.error.lock() = None;
+    }
+
+    /// One worker's disjoint record-number slice. Last arriver merges arenas
+    /// and builds the CSR. Every worker then waits on the work gate so the
+    /// search thread can resolve the root path and push the first `WorkItem`
+    /// before anyone enters the steal loop.
+    pub fn scan_mft_worker(&self, worker_id: usize, num_workers: usize) {
+        let _span = tracy::span!("NtfsFs::scan_mft_worker");
+
+        let n = self.tree().capacity();
+        let nw = num_workers.max(1);
+        let start = n * worker_id / nw;
+        let end = n * (worker_id + 1) / nw;
+
+        let mut part = ScanPart {
+            rec_start: start,
+            rec_end: end,
+            names: Vec::with_capacity((end - start).saturating_mul(16)),
+            runlists: Vec::new(),
+        };
+
+        if let Err(e) = self.scan_mft_range(start, end, &mut part) {
+            *self.scan.error.lock() = Some(e);
+        }
+
+        self.scan.parts.lock()[worker_id] = Some(part);
+
+        if self.scan.remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.finish_scan();
+            let (lock, cvar) = &self.scan.ready;
+            *lock.lock() = true;
+            cvar.notify_all();
+        } else {
+            let (lock, cvar) = &self.scan.ready;
+            let mut ready = lock.lock();
+            while !*ready {
+                cvar.wait(&mut ready);
+            }
+        }
+
+        let (lock, cvar) = &self.scan.work_gate;
+        let mut gate = lock.lock();
+        while !*gate {
+            cvar.wait(&mut gate);
+        }
+    }
+
+    pub fn wait_mft_ready(&self) -> io::Result<()> {
+        let (lock, cvar) = &self.scan.ready;
+        let mut ready = lock.lock();
+        while !*ready {
+            cvar.wait(&mut ready);
+        }
+        drop(ready);
+        match self.scan.error.lock().take() {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
+    pub fn release_work_gate(&self) {
+        let (lock, cvar) = &self.scan.work_gate;
+        *lock.lock() = true;
+        cvar.notify_all();
     }
 
     #[inline]
     fn read_at_offset(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
-        read_at_offset(&self.file, buf, offset)
-    }
-
-    #[inline]
-    fn read_resident_data(
-        &self,
-        parser: &mut Parser,
-        attr_slice: &[u8],
-        size_to_read: usize, file_size: usize,
-        kind: BufKind,
-        check_binary: bool,
-    ) -> io::Result<bool> {
-        let _span = tracy::span!("NtfsFs::read_resident_data");
-
-        let value_len = read_u32_le(attr_slice, NTFS_ATTR_RES_VALUE_LEN_OFFSET) as usize;
-        let value_off = read_u16_le(attr_slice, NTFS_ATTR_RES_VALUE_OFF_OFFSET) as usize;
-        let end = (value_off + value_len).min(attr_slice.len());
-        if value_off >= end { return Ok(true); }
-
-        let data = &attr_slice[value_off..end];
-        let actual = data.len().min(size_to_read);
-
-        if check_binary && binary_probe(&data[..actual], file_size) {
-            return Ok(false);
-        }
-
-        parser.get_buf_mut(kind).extend_from_slice(&data[..actual]);
-        Ok(true)
+        crate::util::with_thread_device_file(&self.device_path, |file| {
+            crate::util::read_at_offset(file, buf, offset)
+        })?
     }
 
     #[inline]
@@ -309,118 +394,308 @@ impl NtfsFs {
         let buf = parser.get_buf_mut(kind);
         buf.clear();
 
-        let mut record = vec![0u8; self.sb.mft_record_size as usize]; // @Heap
-        self.read_mft_record(node.record_num, &mut record)?;
+        for &child in self.tree().dir_children(node.record_num) {
+            let child = child as u64;
+            if child == node.record_num { continue; }
+            if !self.tree().is_in_use(child) { continue; }
 
-        // $INDEX_ROOT: resident, always present, holds entries for small dirs or the B-tree root
-        self.collect_index_root_entries(&record, buf);
+            let name = self.tree().name(child);
+            if name.is_empty() || name.len() > 255 { continue; }
 
-        // $INDEX_ALLOCATION: non-resident INDX blocks on disk, holds entries for larger dirs
-        // Both are collected into the same linearised buf so caller doesn't need to care which had what
-        _ = self.collect_index_alloc_entries(&record, buf);
-
+            buf.extend_from_slice(&child.to_le_bytes());
+            buf.push(self.tree().is_dir(child) as u8);
+            buf.push(name.len() as u8);
+            buf.extend_from_slice(name);
+        }
         Ok(())
     }
 
-    #[inline]
-    fn collect_index_root_entries(&self, record: &[u8], out: &mut Vec<u8>) {
-        let Some((true, attr_slice)) = find_attribute(
-            record,
-            NTFS_ATTR_INDEX_ROOT,
-            Some(&I30)
-        ) else { return; };
-
-        let val_off = read_u16_le(attr_slice, NTFS_ATTR_RES_VALUE_OFF_OFFSET) as usize;
-        let val_len = read_u32_le(attr_slice, NTFS_ATTR_RES_VALUE_LEN_OFFSET) as usize;
-        if val_off + 0x20 > attr_slice.len() { return; }
-
-        let value = &attr_slice[val_off..(val_off + val_len).min(attr_slice.len())];
-        if value.len() < 0x20 { return; }
-
-        let node_hdr = &value[0x10..];
-
-        let first_entry_off = read_u32_le(node_hdr, 0) as usize;
-        let used_size       = read_u32_le(node_hdr, 4) as usize;
-        let end = used_size.min(node_hdr.len());
-        if first_entry_off >= end { return; }
-
-        linearise_index_entries_into(&node_hdr[first_entry_off..end], out);
-    }
-
-    fn collect_index_alloc_entries(&self, record: &[u8], out: &mut Vec<u8>) -> io::Result<()> {
-        let Some((false, attr_slice)) = find_attribute(
-            record,
-            NTFS_ATTR_INDEX_ALLOCATION,
-            Some(&I30)
-        ) else {
+    fn scan_mft_range(&self, rec_start: usize, rec_end: usize, part: &mut ScanPart) -> io::Result<()> {
+        if rec_start >= rec_end {
             return Ok(());
+        }
+
+        const CHUNK_RECORDS: usize = 4096;
+        let record_size = self.sb.mft_record_size as usize;
+        let chunk_cap = record_size * CHUNK_RECORDS;
+
+        #[cfg(windows)]
+        let mut chunk = crate::util::AlignedBuf::new(chunk_cap);
+        #[cfg(not(windows))]
+        let mut chunk = vec![0u8; chunk_cap];
+
+        let file = {
+            #[cfg(windows)]
+            { crate::grep::open_device_impl(&self.device_path, true)? }
+            #[cfg(not(windows))]
+            { crate::grep::open_device(&self.device_path)? }
         };
 
-        //
-        // Index block size comes from $INDEX_ROOT value+0x08; fall back to cluster size
-        //
-        let index_block_size = find_attribute(record, NTFS_ATTR_INDEX_ROOT, Some(&I30)).and_then(|(resident, ir)| {
-            if !resident { return None; }
+        for run in &self.mft_runs {
+            if run.lcn == u64::MAX { continue; }
 
-            let val_off = read_u16_le(ir, NTFS_ATTR_RES_VALUE_OFF_OFFSET) as usize;
-            if val_off + 12 > ir.len() { return None; }
+            let (run_first, run_end) = run_record_span(run, &self.sb);
+            let start = rec_start.max(run_first as usize);
+            let end = rec_end.min(run_end as usize);
+            if start >= end { continue; }
 
-            Some(read_u32_le(ir, val_off + 8) as u64)
-        }).unwrap_or(self.sb.cluster_size as u64).max(512);
+            let Ok(mut disk_offset) = mft_record_offset(&self.mft_runs, start as u64, &self.sb) else {
+                continue;
+            };
 
-        let runs = decode_runlist(attr_slice, &self.sb)?;
-        let cluster_size = self.sb.cluster_size as u64;
-        let clusters_per_block = (index_block_size / cluster_size).max(1);
-        let total_clusters: u64 = runs.iter().map(|r| r.len).sum();
-        let total_blocks = total_clusters / clusters_per_block;
+            let mut rec = start;
+            while rec < end {
+                let batch = (end - rec).min(CHUNK_RECORDS);
+                let to_read = batch * record_size;
 
-        for block_idx in 0..total_blocks {
-            let vcn = block_idx * clusters_per_block;
+                let (prefix, n) = scan_read_chunk(&file, &mut chunk, to_read, disk_offset)?;
+                if n < record_size { break; }
 
-            //
-            // Walk runlist to find LCN for this block's VCN
-            //
+                let mut pos = prefix;
+                let data_end = prefix + n;
+                while pos + record_size <= data_end {
+                    let record_num = rec + (pos - prefix) / record_size;
+                    if record_num >= end { break; }
 
-            let mut lcn_start = None;
-            let mut remaining = vcn;
-            for run in &runs {
-                if run.lcn == u64::MAX {
-                    if remaining < run.len { break; }
-                    remaining -= run.len;
-                    continue;
+                    #[cfg(windows)]
+                    let record = &mut chunk.as_mut_slice()[pos..pos + record_size];
+                    #[cfg(not(windows))]
+                    let record = &mut chunk[pos..pos + record_size];
+
+                    if apply_fixups(record).is_ok() && validate_file_magic(record).is_ok() {
+                        let _ = parse_mft_record_full(
+                            record,
+                            record_num as u64,
+                            self.tree(),
+                            unsafe { &mut *self.scan.parent.0.get() },
+                            part,
+                        );
+                    }
+                    pos += record_size;
                 }
-                if remaining < run.len {
-                    lcn_start = Some(run.lcn + remaining);
-                    break;
-                }
-                remaining -= run.len;
+
+                let consumed = (n / record_size) * record_size;
+                rec += consumed / record_size;
+                disk_offset += consumed as u64;
             }
-
-            let Some(lcn) = lcn_start else { continue; };
-
-            let mut indx = vec![0u8; index_block_size as usize]; // @Heap
-            if self.read_at_offset(&mut indx, lcn * cluster_size).is_err() { continue; }
-
-            //
-            // Skip corrupt blocks
-            //
-            if apply_fixups(&mut indx).is_err() { continue; }
-
-            if indx.len() < 4 { continue; }
-            if u32::from_le_bytes(indx[0..4].try_into().unwrap()) != NTFS_INDX_MAGIC { continue; }
-            if indx.len() < 0x28 { continue; }
-
-            let node_hdr = &indx[0x18..];
-
-            let first_entry_off = read_u32_le(node_hdr, 0) as usize;
-            let used_size       = read_u32_le(node_hdr, 4) as usize;
-            let end = used_size.min(node_hdr.len());
-            if first_entry_off >= end { continue; }
-
-            linearise_index_entries_into(&node_hdr[first_entry_off..end], out);
         }
 
         Ok(())
+    }
+
+    fn finish_scan(&self) {
+        let mut parts = self.scan.parts.lock();
+        let mut names = Vec::new();
+        let mut runlists = Vec::new();
+
+        for part in parts.iter_mut().flatten() {
+            let name_base = names.len() as u32;
+            let run_base = runlists.len() as u32;
+            for idx in part.rec_start..part.rec_end {
+                if self.tree().name_len_at(idx) > 0 {
+                    self.tree().add_name_off(idx, name_base);
+                }
+                if self.tree().runlist_len_at(idx) > 0 {
+                    self.tree().add_runlist_off(idx, run_base);
+                }
+            }
+            names.append(&mut part.names);
+            runlists.append(&mut part.runlists);
+        }
+
+        let tree = unsafe { &mut *self.tree.get() };
+        tree.set_arenas(names, runlists);
+        let parent = unsafe { &*self.scan.parent.0.get() };
+        tree.build_csr(parent);
+    }
+}
+
+struct ScanPart {
+    rec_start: usize,
+    rec_end: usize,
+    names: Vec<u8>,
+    runlists: Vec<u8>,
+}
+
+struct ScanParent(UnsafeCell<Vec<u64>>);
+unsafe impl Sync for ScanParent {}
+
+struct MftScan {
+    remaining: AtomicUsize,
+    error: Mutex<Option<io::Error>>,
+    ready: (Mutex<bool>, Condvar),
+    work_gate: (Mutex<bool>, Condvar),
+    parts: Mutex<Vec<Option<ScanPart>>>,
+    parent: ScanParent,
+}
+
+impl MftScan {
+    fn new(num_records: usize) -> Self {
+        Self {
+            remaining: AtomicUsize::new(0),
+            error: Mutex::new(None),
+            ready: (Mutex::new(false), Condvar::new()),
+            work_gate: (Mutex::new(false), Condvar::new()),
+            parts: Mutex::new(Vec::new()),
+            parent: ScanParent(UnsafeCell::new(vec![0u64; num_records])),
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct RecordMeta {
+    pub flags: u16,
+    pub size: u64,
+    pub mtime_sec: i64,
+}
+
+pub struct NtfsTree {
+    meta: Vec<RecordMeta>,
+    name_off: Vec<u32>,
+    name_len: Vec<u16>,
+    names: Vec<u8>,
+    runlist_off: Vec<u32>,
+    runlist_len: Vec<u32>,
+    runlists: Vec<u8>,
+    data_kind: Vec<u8>,
+    child_offsets: Vec<u32>,
+    child_ids: Vec<u32>,
+}
+
+impl NtfsTree {
+    pub fn with_capacity(num_records: usize) -> Self {
+        Self {
+            meta: vec![RecordMeta { flags: 0, size: 0, mtime_sec: 0 }; num_records],
+            name_off: vec![0; num_records],
+            name_len: vec![0; num_records],
+            names: Vec::new(),
+            runlist_off: vec![0; num_records],
+            runlist_len: vec![0; num_records],
+            runlists: Vec::new(),
+            data_kind: vec![0; num_records],
+            child_offsets: Vec::new(),
+            child_ids: Vec::new(),
+        }
+    }
+
+    #[inline]
+    pub fn capacity(&self) -> usize { self.meta.len() }
+
+    #[inline]
+    pub fn is_in_use(&self, id: u64) -> bool {
+        self.meta.get(id as usize).is_some_and(|m| m.flags & NTFS_MFT_RECORD_FLAG_IN_USE != 0)
+    }
+
+    #[inline]
+    pub fn meta(&self, id: u64) -> RecordMeta {
+        self.meta[id as usize]
+    }
+
+    #[inline]
+    pub fn is_dir(&self, id: u64) -> bool {
+        self.meta[id as usize].flags & NTFS_MFT_RECORD_FLAG_IS_DIR != 0
+    }
+
+    #[inline]
+    pub fn name(&self, id: u64) -> &[u8] {
+        let idx = id as usize;
+        let off = self.name_off[idx] as usize;
+        let len = self.name_len[idx] as usize;
+        &self.names[off..off + len]
+    }
+
+    #[inline]
+    pub fn raw_runlist(&self, id: u64) -> &[u8] {
+        let idx = id as usize;
+        let off = self.runlist_off[idx] as usize;
+        let len = self.runlist_len[idx] as usize;
+        &self.runlists[off..off + len]
+    }
+
+    #[inline]
+    pub fn data_kind(&self, id: u64) -> u8 {
+        self.data_kind.get(id as usize).copied().unwrap_or(0)
+    }
+
+    #[inline]
+    fn name_len_at(&self, idx: usize) -> u16 { self.name_len[idx] }
+
+    #[inline]
+    fn runlist_len_at(&self, idx: usize) -> u32 { self.runlist_len[idx] }
+
+    #[inline]
+    fn add_name_off(&self, idx: usize, base: u32) {
+        unsafe {
+            let p = self.name_off.as_ptr() as *mut u32;
+            *p.add(idx) += base;
+        }
+    }
+
+    #[inline]
+    fn add_runlist_off(&self, idx: usize, base: u32) {
+        unsafe {
+            let p = self.runlist_off.as_ptr() as *mut u32;
+            *p.add(idx) += base;
+        }
+    }
+
+    fn set_arenas(&mut self, names: Vec<u8>, runlists: Vec<u8>) {
+        self.names = names;
+        self.runlists = runlists;
+    }
+
+    pub fn build_csr(&mut self, parent: &[u64]) {
+        let n = parent.len();
+        let mut offsets = vec![0u32; n + 1];
+
+        for i in 0..n {
+            if !self.is_in_use(i as u64) { continue; }
+            let p = parent[i] as usize;
+            if p < n { offsets[p + 1] += 1; }
+        }
+        for i in 0..n { offsets[i + 1] += offsets[i]; }
+
+        let mut cursor = offsets.clone();
+        let mut child_ids = vec![0u32; offsets[n] as usize];
+
+        for i in 0..n {
+            if !self.is_in_use(i as u64) { continue; }
+            let p = parent[i] as usize;
+            if p < n {
+                let slot = &mut cursor[p];
+                child_ids[*slot as usize] = i as u32;
+                *slot += 1;
+            }
+        }
+
+        self.child_offsets = offsets;
+        self.child_ids = child_ids;
+    }
+
+    #[inline]
+    pub fn dir_children(&self, dir_id: FileId) -> &[u32] {
+        let r = dir_id as usize;
+        if r + 1 >= self.child_offsets.len() {
+            return &[];
+        }
+        let start = self.child_offsets[r] as usize;
+        let end = self.child_offsets[r + 1] as usize;
+        &self.child_ids[start..end]
+    }
+
+    fn write_slot(&self, idx: usize, meta: RecordMeta, parent_ref: u64, parent: &mut [u64], part: &mut ScanPart, name: &[u8], data: &[u8], kind: u8) {
+        unsafe {
+            *self.meta.as_ptr().cast_mut().add(idx) = meta;
+            *self.data_kind.as_ptr().cast_mut().add(idx) = kind;
+            *self.name_off.as_ptr().cast_mut().add(idx) = part.names.len() as u32;
+            *self.name_len.as_ptr().cast_mut().add(idx) = name.len() as u16;
+            *self.runlist_off.as_ptr().cast_mut().add(idx) = part.runlists.len() as u32;
+            *self.runlist_len.as_ptr().cast_mut().add(idx) = data.len() as u32;
+        }
+        parent[idx] = parent_ref;
+        part.names.extend_from_slice(name);
+        part.runlists.extend_from_slice(data);
     }
 }
 
@@ -490,42 +765,148 @@ fn apply_fixups(buf: &mut [u8]) -> io::Result<()> {
 }
 
 #[inline]
-fn parse_mft_record(record: &[u8], record_num: u64) -> io::Result<NtfsNode> {
-    if record.len() < 48 {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "MFT record too short"));
+fn find_data_size(record: &[u8]) -> u64 {
+    match find_attribute(record, NTFS_ATTR_DATA, None) {
+        Some((true,  attr)) => read_u32_le(attr, NTFS_ATTR_RES_VALUE_LEN_OFFSET) as u64,
+        Some((false, attr)) if attr.len() >= 56 => u64::from_le_bytes(attr[48..56].try_into().unwrap()),
+        _ => 0,
+    }
+}
+
+fn find_best_file_name(record: &[u8]) -> Option<(u64, &[u8])> {
+    let raw = record.get(NTFS_MFT_RECORD_ATTRS_OFFSET..NTFS_MFT_RECORD_ATTRS_OFFSET + 2)?;
+    let mut offset = u16::from_le_bytes(raw.try_into().ok()?) as usize;
+    let mut best: Option<(u8, u64, &[u8])> = None;
+
+    loop {
+        if offset + 8 > record.len() { break; }
+        let a_type = read_u32_le(record, offset);
+        if a_type == NTFS_ATTR_END || a_type == 0 { break; }
+
+        let a_len = read_u32_le(record, offset + 4) as usize;
+        if a_len < 8 || offset + a_len > record.len() { break; }
+
+        if a_type == NTFS_ATTR_FILE_NAME {
+            let attr = &record[offset..offset + a_len];
+            if attr.get(NTFS_ATTR_NON_RESIDENT_OFFSET) == Some(&0) {
+                let val_off = read_u16_le(attr, NTFS_ATTR_RES_VALUE_OFF_OFFSET) as usize;
+                let val_len = read_u32_le(attr, NTFS_ATTR_RES_VALUE_LEN_OFFSET) as usize;
+                let end = (val_off + val_len).min(attr.len());
+
+                if val_off + NTFS_FN_NAME_OFFSET + 2 <= end {
+                    let value = &attr[val_off..end];
+                    let parent_ref = u64::from_le_bytes(value[0..8].try_into().unwrap());
+                    let namespace = value[NTFS_FN_NAMESPACE_OFFSET];
+                    let name_len_chars = value[NTFS_FN_NAME_LEN_OFFSET] as usize;
+                    let name_end = NTFS_FN_NAME_OFFSET + name_len_chars * 2;
+
+                    if name_len_chars > 0 && name_end <= value.len() {
+                        let rank = if namespace == 2 { 0 } else { 1 };
+                        if best.map_or(true, |(r, _, _)| rank > r) {
+                            best = Some((rank, parent_ref, &value[NTFS_FN_NAME_OFFSET..name_end]));
+                        }
+                    }
+                }
+            }
+        }
+
+        offset += a_len;
     }
 
-    validate_file_magic(record)?;
+    best.map(|(_, parent_ref, name)| (parent_ref, name))
+}
 
-    let flags = &record[NTFS_MFT_RECORD_FLAGS_OFFSET..NTFS_MFT_RECORD_FLAGS_OFFSET+2];
-    let flags = u16::from_le_bytes(flags.try_into().unwrap());
+fn parse_mft_record_full(
+    record: &[u8],
+    record_num: u64,
+    tree: &NtfsTree,
+    parent: &mut [u64],
+    part: &mut ScanPart,
+) -> io::Result<()> {
+    if record.len() < 48 {
+        return Ok(());
+    }
+
+    let flags = u16::from_le_bytes(
+        record[NTFS_MFT_RECORD_FLAGS_OFFSET..NTFS_MFT_RECORD_FLAGS_OFFSET + 2].try_into().unwrap()
+    );
     if flags & NTFS_MFT_RECORD_FLAG_IN_USE == 0 {
-        return Err(io::Error::new(io::ErrorKind::NotFound, "MFT record not in use"));
+        return Ok(());
+    }
+
+    const BASE_RECORD_REF_OFFSET: usize = 0x20;
+    if record.len() >= BASE_RECORD_REF_OFFSET + 8 {
+        let base_ref = u64::from_le_bytes(
+            record[BASE_RECORD_REF_OFFSET..BASE_RECORD_REF_OFFSET + 8].try_into().unwrap()
+        );
+        if base_ref & 0x0000_FFFF_FFFF_FFFF != 0 {
+            return Ok(());
+        }
     }
 
     let mut mtime_sec = 0i64;
     if let Some((true, si)) = find_attribute(record, NTFS_ATTR_STANDARD_INFORMATION, None) {
         let val_off = read_u16_le(si, NTFS_ATTR_RES_VALUE_OFF_OFFSET) as usize;
         if val_off + NTFS_SI_MTIME_OFFSET + 8 <= si.len() {
-            let ft = &si[val_off + NTFS_SI_MTIME_OFFSET..val_off + NTFS_SI_MTIME_OFFSET + 8];
-            let ft = u64::from_le_bytes(ft.try_into().unwrap());
+            let ft = u64::from_le_bytes(
+                si[val_off + NTFS_SI_MTIME_OFFSET..val_off + NTFS_SI_MTIME_OFFSET + 8].try_into().unwrap()
+            );
             mtime_sec = filetime_to_unix(ft);
         }
     }
 
     let size = find_data_size(record);
-    Ok(NtfsNode { record_num, flags, size, mtime_sec })
+    let idx = record_num as usize;
+    if idx >= tree.capacity() {
+        return Ok(());
+    }
+
+    let (parent_ref, name_utf16) = find_best_file_name(record).unwrap_or((0, &[][..]));
+    let parent_ref = parent_ref & 0x0000_FFFF_FFFF_FFFF;
+
+    let mut utf16: SmallVec<[u16; 64]> = SmallVec::new();
+    utf16.extend(name_utf16.chunks_exact(2).map(|b| u16::from_le_bytes([b[0], b[1]])));
+    let name = String::from_utf16_lossy(&utf16);
+    let name_bytes = name.as_bytes();
+    let name_len = name_bytes.len().min(255);
+    let name = &name_bytes[..name_len];
+
+    let (kind, data): (u8, &[u8]) = match find_attribute(record, NTFS_ATTR_DATA, None) {
+        Some((true, attr)) => {
+            let value_len = read_u32_le(attr, NTFS_ATTR_RES_VALUE_LEN_OFFSET) as usize;
+            let value_off = read_u16_le(attr, NTFS_ATTR_RES_VALUE_OFF_OFFSET) as usize;
+            let end = (value_off + value_len).min(attr.len());
+            if value_off < end {
+                (DATA_RESIDENT, &attr[value_off..end])
+            } else {
+                (DATA_NONE, &[][..])
+            }
+        }
+        Some((false, attr)) if attr.len() >= 34 => {
+            let runlist_off = read_u16_le(attr, 32) as usize;
+            if runlist_off < attr.len() {
+                (DATA_NONRESIDENT, &attr[runlist_off..])
+            } else {
+                (DATA_NONE, &[][..])
+            }
+        }
+        _ => (DATA_NONE, &[][..]),
+    };
+
+    tree.write_slot(
+        idx,
+        RecordMeta { flags, size, mtime_sec },
+        parent_ref,
+        parent,
+        part,
+        name,
+        data,
+        kind,
+    );
+    Ok(())
 }
 
 #[inline]
-fn find_data_size(record: &[u8]) -> u64 {
-    match find_attribute(record, NTFS_ATTR_DATA, None) {
-        Some((true,  attr)) => read_u32_le(attr, NTFS_ATTR_RES_VALUE_LEN_OFFSET) as u64,
-        Some((false, attr)) if attr.len() >= 56 => u64::from_le_bytes(attr[48..56].try_into().unwrap()), // data_size at +0x30
-        _ => 0,
-    }
-}
-
 fn find_attribute<'a>(
     record: &'a [u8],
     attr_type: u32,
@@ -568,7 +949,6 @@ fn find_attribute<'a>(
     }
 }
 
-/// Decode NTFS runlist from a non-resident attribute slice into absolute LCNs.
 fn decode_runlist(attr_slice: &[u8], _sb: &NtfsSuperBlock) -> io::Result<SmallVec<[NtfsExtent; 8]>> {
     if attr_slice.len() < 34 {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "Attr slice too short"));
@@ -579,7 +959,10 @@ fn decode_runlist(attr_slice: &[u8], _sb: &NtfsSuperBlock) -> io::Result<SmallVe
         return Err(io::Error::new(io::ErrorKind::InvalidData, "Runlist offset out of range"));
     }
 
-    let runlist = &attr_slice[runlist_off..];
+    decode_runlist_bytes(&attr_slice[runlist_off..])
+}
+
+fn decode_runlist_bytes(runlist: &[u8]) -> io::Result<SmallVec<[NtfsExtent; 8]>> {
     let mut runs = SmallVec::new();
     let mut pos = 0usize;
     let mut current_lcn = 0i64;
@@ -599,7 +982,7 @@ fn decode_runlist(attr_slice: &[u8], _sb: &NtfsSuperBlock) -> io::Result<SmallVe
         pos += len_len;
 
         let lcn = if off_len == 0 {
-            u64::MAX // sparse
+            u64::MAX
         } else {
             let mut raw = 0i64;
             for i in 0..off_len { raw |= (runlist[pos + i] as i64) << (i * 8) }
@@ -623,7 +1006,7 @@ fn decode_runlist(attr_slice: &[u8], _sb: &NtfsSuperBlock) -> io::Result<SmallVe
 fn mft_record_offset(mft_runs: &[NtfsExtent], record_num: u64, sb: &NtfsSuperBlock) -> io::Result<u64> {
     let mft_record_size     = sb.mft_record_size as u64;
     let cluster_size        = sb.cluster_size as u64;
-    let records_per_cluster = cluster_size / mft_record_size; // e.g. 4096/1024 = 4
+    let records_per_cluster = cluster_size / mft_record_size;
     let vcn                 = record_num / records_per_cluster;
     let byte_within_cluster = (record_num % records_per_cluster) * mft_record_size;
 
@@ -643,54 +1026,56 @@ fn filetime_to_unix(ft: u64) -> i64 {
     ((ft - FILETIME_EPOCH_OFFSET) / 10_000_000) as i64
 }
 
-fn linearise_index_entries_into(entries_buf: &[u8], out: &mut Vec<u8>) {
-    let mut pos = 0;
-    while pos + 0x10 <= entries_buf.len() { // @Cleanup
-        let entry_len = u16::from_le_bytes(entries_buf[pos+8..pos+10].try_into().unwrap()) as usize;
-        let key_len   = u16::from_le_bytes(entries_buf[pos+10..pos+12].try_into().unwrap()) as usize;
-        let flags     = u16::from_le_bytes(entries_buf[pos+12..pos+14].try_into().unwrap());
+#[inline]
+fn run_record_span(run: &NtfsExtent, sb: &NtfsSuperBlock) -> (u64, u64) {
+    let rec_size = sb.mft_record_size as u64;
+    let cluster_size = sb.cluster_size as u64;
+    let rpc = (cluster_size / rec_size).max(1);
+    let first = run.vcn * rpc;
+    let recs = (run.len * cluster_size) / rec_size;
+    (first, first + recs)
+}
 
-        if entry_len < 0x10 || flags & NTFS_INDEX_ENTRY_LAST != 0 { break; }
+#[cfg(windows)]
+fn scan_read_chunk(
+    file: &File,
+    chunk: &mut crate::util::AlignedBuf,
+    to_read: usize,
+    offset: u64,
+) -> io::Result<(usize, usize)> {
+    use std::os::windows::fs::FileExt;
 
-        let record_num = u64::from_le_bytes(entries_buf[pos..pos+8].try_into().unwrap()) & 0x0000_FFFF_FFFF_FFFF;
+    let sector = crate::util::sector_size();
+    let aligned_offset = offset & !(sector - 1);
+    let prefix = (offset - aligned_offset) as usize;
+    let aligned_len = (prefix + to_read + sector as usize - 1) & !(sector as usize - 1);
+    chunk.ensure_len(aligned_len);
 
-        'entry: {
-            let key_end = pos + 0x10 + key_len;
-            if record_num == 0 || key_end > entries_buf.len() { break 'entry; }
-
-            let key = &entries_buf[pos+0x10..key_end];
-            if key.len() < NTFS_FN_NAME_OFFSET + 2 { break 'entry; }
-
-            let namespace   = key[NTFS_FN_NAMESPACE_OFFSET];
-            let fn_name_len = key[NTFS_FN_NAME_LEN_OFFSET] as usize;
-            let file_attrs  = key[NTFS_FN_FLAGS_OFFSET..NTFS_FN_FLAGS_OFFSET+4].try_into().unwrap();
-            let file_attrs  = u32::from_le_bytes(file_attrs);
-
-            if namespace == 2 || fn_name_len == 0 { break 'entry; }
-
-            let name_end = NTFS_FN_NAME_OFFSET + fn_name_len * 2;
-            if name_end > key.len() { break 'entry; }
-
-            let mut utf16: SmallVec<[u16; 64]> = SmallVec::new();
-            utf16.extend(key[NTFS_FN_NAME_OFFSET..name_end].chunks_exact(2).map(|b| u16::from_le_bytes([b[0], b[1]])));
-
-            let name = String::from_utf16_lossy(&utf16);
-            let name = name.as_bytes();
-            if name.len() > 255 { break 'entry; }
-
-            //
-            //
-            // Linearised format: [u64 record_num][u8 is_dir][u8 name_len][name_utf8...]
-            //
-            //
-
-            let is_dir = (file_attrs & NTFS_FILE_ATTR_DIRECTORY) != 0;
-            out.extend_from_slice(&record_num.to_le_bytes());
-            out.push(is_dir as u8);
-            out.push(name.len() as u8);
-            out.extend_from_slice(name);
+    let n = match file.seek_read(&mut chunk.as_mut_slice()[..aligned_len], aligned_offset) {
+        Ok(n) => n,
+        Err(e) if e.raw_os_error() == Some(87) => {
+            let shrunk = (prefix + to_read + sector as usize - 1) & !(sector as usize - 1);
+            if shrunk == 0 {
+                return Ok((prefix, 0));
+            }
+            chunk.ensure_len(shrunk);
+            file.seek_read(&mut chunk.as_mut_slice()[..shrunk], aligned_offset)?
         }
+        Err(e) => return Err(e),
+    };
+    Ok((prefix, n.saturating_sub(prefix).min(to_read)))
+}
 
-        pos += entry_len;
+#[cfg(not(windows))]
+fn scan_read_chunk(
+    file: &File,
+    chunk: &mut Vec<u8>,
+    to_read: usize,
+    offset: u64,
+) -> io::Result<(usize, usize)> {
+    if chunk.len() < to_read {
+        chunk.resize(to_read, 0);
     }
+    let n = crate::util::read_at_offset(file, &mut chunk[..to_read], offset)?;
+    Ok((0, n))
 }

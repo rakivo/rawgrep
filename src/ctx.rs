@@ -291,6 +291,11 @@ impl<S: MatchSink + 'static> RawGrepCtx<S> {
 
         debug!("[ctx] grepper built ok");
 
+        let is_ntfs = matches!(fs_type, FsType::Ntfs);
+        if let AnyGrepper::Ntfs(g) = &grepper {
+            g.fs().init_parallel_scan(self.worker_count);
+        }
+
         inspect_before_search(
             &search_root, &device, fs_type, &cli.pattern
         );  // called after grepper is built, before workers wake
@@ -298,6 +303,7 @@ impl<S: MatchSink + 'static> RawGrepCtx<S> {
         //
         // Resolve root inode
         //
+
         let search_root_for_fs = if config.device.is_some() {
             platform::strip_mountpoint_prefix(&device, &search_root)
                 .unwrap_or_else(|| search_root.to_string_lossy().into_owned())
@@ -305,28 +311,25 @@ impl<S: MatchSink + 'static> RawGrepCtx<S> {
             search_root.to_string_lossy().into_owned()
         }.into_boxed_str();
 
-        let root_file_id = grepper
-            .try_resolve_path_to_file_id(&search_root_for_fs)
-            .map_err(|e| Error::RootNotFound {
-                path:   search_root_for_fs.clone(),
-                device: device.clone(),
-                source: e,
-            })?;
-
         debug!("[ctx] search_root_for_fs={search_root_for_fs:?} root_file_id={root_file_id:?}");
 
-        //
-        // Setup output channel and gitignore
-        //
         let root_gitignore = {
             let gi_path = search_root.join(".gitignore");
             ignore::build_gitignore_from_file(&gi_path.to_string_lossy())
         };
         debug!("[ctx] root_gitignore present={}", root_gitignore.is_some());
 
-        //
-        // Swap in new job
-        //
+        // Non-NTFS can resolve immediately. NTFS needs workers to scan $MFT first.
+        let mut root_file_id = if is_ntfs {
+            None
+        } else {
+            Some(grepper.try_resolve_path_to_file_id(&search_root_for_fs).map_err(|e| Error::RootNotFound {
+                path:   search_root_for_fs.clone(),
+                device: device.clone(),
+                source: e,
+            })?)
+        };
+
         {
             let mut guard = self.current_job.write();
             *guard = Some(SearchJob {
@@ -338,10 +341,66 @@ impl<S: MatchSink + 'static> RawGrepCtx<S> {
         }
         debug!("[ctx] job swapped in");
 
-        //
-        // Push root work item and wake workers
-        //
+        let wake_workers = || {
+            let (lock, cvar) = &*self.wake;
+            {
+                let mut _gen = lock.lock();
+                *_gen = _gen.wrapping_add(1);
+            }
+            cvar.notify_all();
+        };
 
+        if is_ntfs {
+            // Workers scan disjoint $MFT slices; steal loop stays gated until
+            // the root WorkItem is pushed (see NtfsFs::scan_mft_worker).
+            wake_workers();
+
+            let scan_result = {
+                let job = self.current_job.read().as_ref().cloned();
+                match job.as_ref() {
+                    Some(job) => match &job.grepper {
+                        AnyGrepper::Ntfs(g) => g.fs().wait_mft_ready(),
+                        _ => Ok(()),
+                    },
+                    None => Ok(()),
+                }
+            };
+
+            if let Err(e) = scan_result {
+                self.running.store(false, Ordering::SeqCst);
+                if let Some(job) = self.current_job.read().as_ref() {
+                    if let AnyGrepper::Ntfs(g) = &job.grepper {
+                        g.fs().release_work_gate();
+                    }
+                }
+                return Err(Error::Io(e));
+            }
+
+            root_file_id = match {
+                let guard = self.current_job.read();
+                let job = guard.as_ref().expect("NTFS job");
+                job.grepper.try_resolve_path_to_file_id(&search_root_for_fs)
+            } {
+                Ok(id) => Some(id),
+                Err(e) => {
+                    self.running.store(false, Ordering::SeqCst);
+                    if let Some(job) = self.current_job.read().as_ref() {
+                        if let AnyGrepper::Ntfs(g) = &job.grepper {
+                            g.fs().release_work_gate();
+                        }
+                    }
+                    return Err(Error::RootNotFound {
+                        path:   search_root_for_fs.clone(),
+                        device: device.clone(),
+                        source: e,
+                    });
+                }
+            };
+        }
+
+        debug!("[ctx] search_root_for_fs={search_root_for_fs:?} root_file_id={root_file_id:?}");
+
+        let root_file_id = root_file_id.expect("root file id");
         let work = if std::fs::metadata(&search_root).is_ok_and(|m| m.is_file()) {
             WorkItem::File(FileWork {
                 file_id:         root_file_id,
@@ -360,12 +419,16 @@ impl<S: MatchSink + 'static> RawGrepCtx<S> {
         debug!("[ctx] root work item pushed to injector");
 
         self.running.store(true, Ordering::SeqCst);
-        let (lock, cvar) = &*self.wake;
-        {
-            let mut _gen = lock.lock();
-            *_gen = _gen.wrapping_add(1);
+
+        if is_ntfs {
+            if let Some(job) = self.current_job.read().as_ref() {
+                if let AnyGrepper::Ntfs(g) = &job.grepper {
+                    g.fs().release_work_gate();
+                }
+            }
+        } else {
+            wake_workers();
         }
-        cvar.notify_all();
         debug!("[ctx] running=true, all workers notified");
 
         Ok(())
@@ -430,6 +493,10 @@ fn worker_thread_main<S: MatchSink + 'static>(
         };
 
         debug!("[ctx] worker {worker_id} got job device={:?}", job.device);
+
+        if let AnyGrepper::Ntfs(g) = &job.grepper {
+            g.fs().scan_mft_worker(worker_id as usize, ctx.worker_count);
+        }
 
         //
         // Reset the buffers

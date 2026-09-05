@@ -65,6 +65,16 @@ impl<F: RawFs, S: MatchSink> RawGrepper<F, S> {
     pub fn try_resolve_path_to_file_id(&self, path: &str) -> io::Result<FileId> {
         let _span = tracy::span!("RawGrepper::try_resolve_path_to_file_id");
 
+        // @KindaHack?
+        #[cfg(windows)]
+        let path = {
+            let path = crate::platform::windows::strip_verbatim_prefix(path);
+            match path.as_bytes() {
+                [drive, b':', ..] if drive.is_ascii_alphabetic() => &path[2..],
+                _ => path,
+            }
+        };
+
         if path == MAIN_SEPARATOR_STR || path.is_empty() {
             return Ok(self.fs.root_id());
         }
@@ -103,7 +113,7 @@ impl<F: RawFs, S: MatchSink> RawGrepper<F, S> {
 /// impl block for ext4-specific construction
 impl<S: MatchSink> RawGrepper<Ext4Fs, S> {
     #[inline]
-    pub fn new_ext4(cli: &Cli, _device_path: &str, mut file: File, sink: S) -> Result<AnyGrepper<S>> {
+    pub fn new_ext4(cli: &Cli, device_path: &str, mut file: File, sink: S) -> Result<AnyGrepper<S>> {
         let mut sb_bytes = [0u8; EXT4_SUPERBLOCK_SIZE];
         read_at_offset(&file, &mut sb_bytes, EXT4_SUPERBLOCK_OFFSET)?;
 
@@ -157,7 +167,7 @@ impl<S: MatchSink> RawGrepper<Ext4Fs, S> {
             inode_table_blocks.push(inode_table_block as u64);
         }
 
-        let fs = Ext4Fs { sb, device_id, max_block, file, inode_table_blocks };
+        let fs = Ext4Fs { sb, device_id, max_block, file, inode_table_blocks, device_path: device_path.into() };
         Self::new_with_fs(cli, fs, sink).map(AnyGrepper::Ext4)
     }
 }
@@ -189,7 +199,7 @@ impl<S: MatchSink> RawGrepper<ApfsFs, S> {
 /// impl block for ntfs-specific construction
 impl<S: MatchSink> RawGrepper<NtfsFs, S> {
     #[inline]
-    pub fn new_ntfs(cli: &Cli, _device_path: &str, file: File, sink: S) -> Result<AnyGrepper<S>> {
+    pub fn new_ntfs(cli: &Cli, device_path: &str, file: File, sink: S) -> Result<AnyGrepper<S>> {
         let mut boot = [0u8; 512];
         read_at_offset(&file, &mut boot, 0)?;
 
@@ -198,7 +208,7 @@ impl<S: MatchSink> RawGrepper<NtfsFs, S> {
         }
 
         let device_id = device_id(&file)?;
-        let fs = NtfsFs::new(file, device_id)?;
+        let fs = NtfsFs::new(file, device_id, device_path)?;
         Self::new_with_fs(cli, fs, sink).map(AnyGrepper::Ntfs)
     }
 }
@@ -212,18 +222,54 @@ pub fn open_device(path: &str) -> io::Result<File> {
 #[inline]
 pub fn open_device_impl(path: &str, uncached: bool) -> io::Result<File> {
     use std::os::windows::fs::OpenOptionsExt;
-    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_NO_BUFFERING;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_NO_BUFFERING,
+        FILE_FLAG_BACKUP_SEMANTICS,
+    };
+
+    #[cfg(windows)]
+    fn allow_extended_dasd_io(file: &File) -> io::Result<()> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::System::IO::DeviceIoControl;
+
+        // CTL_CODE(FILE_DEVICE_FILE_SYSTEM, 0x20, METHOD_NEITHER, FILE_ANY_ACCESS)
+        const FSCTL_ALLOW_EXTENDED_DASD_IO: u32 = 0x0009_0083;
+
+        let mut bytes_returned = 0u32;
+        let ok = unsafe {
+            DeviceIoControl(
+                file.as_raw_handle() as _,
+                FSCTL_ALLOW_EXTENDED_DASD_IO,
+                std::ptr::null(), 0,
+                std::ptr::null_mut(), 0,
+                &mut bytes_returned,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 { return Err(io::Error::last_os_error()); }
+        Ok(())
+    }
 
     let is_raw_device = path.starts_with(r"\\.\") || path.starts_with(r"\\?\");
 
     let mut opts = OpenOptions::new();
     opts.read(true).share_mode(0x3);
 
-    if is_raw_device && uncached {
-        opts.custom_flags(FILE_FLAG_NO_BUFFERING);
+    if is_raw_device {
+        let mut flags = FILE_FLAG_BACKUP_SEMANTICS;
+        if uncached {
+            flags |= FILE_FLAG_NO_BUFFERING;
+        }
+        opts.custom_flags(flags);
     }
 
-    opts.open(path)
+    let file = opts.open(path)?;
+
+    if is_raw_device {
+        allow_extended_dasd_io(&file)?;
+    }
+
+    Ok(file)
 }
 
 #[cfg(unix)]

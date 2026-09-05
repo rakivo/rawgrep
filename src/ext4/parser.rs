@@ -8,6 +8,7 @@ use crate::worker::STREAMING_CHUNK_SIZE;
 use super::*;
 
 use std::fs::File;
+use std::sync::Arc;
 use std::{io, mem};
 use std::ops::ControlFlow;
 
@@ -19,6 +20,7 @@ pub struct Ext4Fs {
     pub sb: Ext4SuperBlock,
     pub device_id: u64,
     pub max_block: u64,
+    pub device_path: Arc<str>,
     pub inode_table_blocks: Vec<u64>,
 }
 

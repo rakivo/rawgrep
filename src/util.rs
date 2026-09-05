@@ -2,6 +2,7 @@
 use std::sync::OnceLock;
 use std::{fs::File, io, sync::Arc};
 
+use std::cell::RefCell;
 use smallvec::SmallVec;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
@@ -22,36 +23,158 @@ pub static SECTOR_SIZE: OnceLock<u64> = OnceLock::new();
 const DEFAULT_SECTOR_SIZE: u64 = 512;
 
 #[inline]
+#[cfg(unix)]
 pub fn read_at_offset(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
-    #[cfg(unix)] {
-        use std::os::unix::fs::FileExt;
-        file.read_at(buf, offset)
+    use std::os::unix::fs::FileExt;
+    file.read_at(buf, offset)
+}
+
+use std::sync::atomic::{AtomicU64, Ordering};
+
+pub static CACHE_HITS: AtomicU64 = AtomicU64::new(0);
+pub static CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(windows)]
+#[inline]
+pub(crate) fn sector_size() -> u64 {
+    SECTOR_SIZE.get().copied().unwrap_or(DEFAULT_SECTOR_SIZE)
+}
+
+/// Sector-aligned heap buffer. Used as the thread-local read cache inside
+/// `read_at_offset` and as the sequential scratch buffer for `$MFT` scans.
+#[cfg(windows)]
+pub(crate) struct AlignedBuf {
+    ptr: *mut u8,
+    len: usize,
+    layout: std::alloc::Layout,
+    valid_offset: u64,
+    valid_len: usize,
+}
+
+#[cfg(windows)]
+impl AlignedBuf {
+    pub(crate) fn new(len: usize) -> Self {
+        let sector_size = sector_size() as usize;
+        let layout = std::alloc::Layout::from_size_align(len, sector_size).unwrap();
+        let ptr = unsafe { std::alloc::alloc(layout) };
+        if ptr.is_null() {
+            std::alloc::handle_alloc_error(layout);
+        }
+        Self { ptr, len, layout, valid_offset: 0, valid_len: 0 }
     }
 
-    #[cfg(windows)] {
-        use std::os::windows::fs::FileExt;
+    pub(crate) fn ensure_len(&mut self, min_len: usize) {
+        if min_len <= self.len {
+            return;
+        }
+        unsafe { std::alloc::dealloc(self.ptr, self.layout) };
+        let sector_size = self.layout.align();
+        let new_len = min_len.next_power_of_two();
+        let layout = std::alloc::Layout::from_size_align(new_len, sector_size).unwrap();
+        let ptr = unsafe { std::alloc::alloc(layout) };
+        if ptr.is_null() {
+            std::alloc::handle_alloc_error(layout);
+        }
+        self.ptr = ptr;
+        self.len = new_len;
+        self.layout = layout;
+        self.valid_len = 0;
+    }
 
-        let sector_size = SECTOR_SIZE.get().copied().unwrap_or(DEFAULT_SECTOR_SIZE);
+    pub(crate) fn as_mut_slice(&mut self) -> &mut [u8] {
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
+    }
 
-        let aligned_offset = offset & !(sector_size - 1);
-        let prefix = (offset - aligned_offset) as usize;
-        if prefix == 0 && buf.len() % sector_size as usize == 0 {
-            // Already aligned, read directly
-            return file.seek_read(buf, offset);
+    pub(crate) fn as_slice(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for AlignedBuf {
+    fn drop(&mut self) {
+        unsafe { std::alloc::dealloc(self.ptr, self.layout) };
+    }
+}
+
+#[cfg(windows)]
+pub fn read_at_offset(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+    use std::os::windows::fs::FileExt;
+
+    const CACHE_SIZE: usize = 256 * 1024;
+
+    thread_local! {
+        static CACHE: RefCell<AlignedBuf> = RefCell::new(AlignedBuf::new(CACHE_SIZE));
+    }
+
+    let sector_size = sector_size();
+    let aligned_offset = offset & !(sector_size - 1);
+    let prefix = (offset - aligned_offset) as usize;
+
+    CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+
+        let cache_end = cache.valid_offset + cache.valid_len as u64;
+        let req_end = offset + buf.len() as u64;
+        let hit = cache.valid_len > 0 && offset >= cache.valid_offset && req_end <= cache_end;
+
+        if hit {
+            CACHE_HITS.fetch_add(1, Ordering::Relaxed);
+
+            let start = (offset - cache.valid_offset) as usize;
+            buf.copy_from_slice(&cache.as_slice()[start..start + buf.len()]);
+            return Ok(buf.len());
         }
 
-        // Unaligned, probably never would happen but for @Robustness,
-        // read into a sector-aligned temp buffer and copy out.
-        let aligned_len = ((prefix + buf.len()) + sector_size as usize - 1) & !(sector_size as usize - 1);
-        let mut tmp = vec![0u8; aligned_len];  // @Heap @Heap @Heap
-        let n = file.seek_read(&mut tmp, aligned_offset)?;
+        CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
+
+        // Miss.
+        let want = prefix + buf.len();
+        let aligned_len = (want + sector_size as usize - 1) & !(sector_size as usize - 1);
+        cache.ensure_len(aligned_len);
+
+        let n = match file.seek_read(&mut cache.as_mut_slice()[..aligned_len], aligned_offset) {
+            Ok(n) => n,
+            Err(e) if e.raw_os_error() == Some(87 /* ERROR_INVALID_PARAMETER */) => {
+                // Retry with the exact remaining sector-aligned span instead of the
+                // opportunistic CACHE_SIZE-sized window.
+                let shrunk = (buf.len() + prefix + sector_size as usize - 1) & !(sector_size as usize - 1);
+                cache.ensure_len(shrunk);
+                file.seek_read(&mut cache.as_mut_slice()[..shrunk], aligned_offset)?
+            }
+            Err(e) => return Err(e),
+        };
+        cache.valid_offset = aligned_offset;
+        cache.valid_len = n;
 
         let available = n.saturating_sub(prefix);
         let to_copy = available.min(buf.len());
-        buf[..to_copy].copy_from_slice(&tmp[prefix..prefix + to_copy]);
-
+        buf[..to_copy].copy_from_slice(&cache.as_slice()[prefix..prefix + to_copy]);
         Ok(to_copy)
-    }
+    })
+}
+
+thread_local! {
+    static THREAD_DEVICE_FILE: RefCell<Option<(Arc<str>, File)>> = RefCell::new(None);
+}
+
+pub fn with_thread_device_file<R>(
+    device_path: &Arc<str>,
+    f: impl FnOnce(&File) -> R,
+) -> io::Result<R> {
+    THREAD_DEVICE_FILE.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let needs_open = match &*slot {
+            Some((p, _)) => !Arc::ptr_eq(p, device_path) && **p != **device_path,
+            None => true,
+        };
+        if needs_open {
+            let file = crate::grep::open_device(device_path)?;
+            *slot = Some((device_path.clone(), file));
+        }
+        let (_, file) = slot.as_ref().unwrap();
+        Ok(f(file))
+    })
 }
 
 #[inline(always)]
