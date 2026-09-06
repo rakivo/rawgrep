@@ -11,10 +11,12 @@
 set -uo pipefail
 
 PATTERN="TODO"
-SEARCH_DIR=".."
+SEARCH_DIR="../chromium"
 DEVICE="/dev/nvme0n1p2"
+NVME_CTRL="nvme0"
 THREADS=16
 RUNS=10
+WARM_RUNS=30
 WARMUP=5
 RESULTS_DIR="./benchmark_results"
 
@@ -26,6 +28,45 @@ for cmd in rg rawgrep hyperfine; do
         exit 1
     fi
 done
+
+# --- pin CPU governor and NVMe power state for the duration of the run ---
+# schedutil ramps clocks lazily under sudden multi-thread load, and NVMe
+# APST (auto) lets the drive drop into low power states between bursts,
+# both of which inject noise into short benchmark runs. Force both to
+# max-performance mode here, and restore original state on exit no matter
+# how the script terminates.
+
+ORIG_GOVERNORS=$(cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor 2>/dev/null | sort -u)
+ORIG_APST=$(cat "/sys/class/nvme/${NVME_CTRL}/power/control" 2>/dev/null || echo "auto")
+
+restore_power_settings() {
+    echo ""
+    echo "=== restoring original power settings ==="
+    if [ -n "${ORIG_GOVERNORS:-}" ]; then
+        # if governors were mixed originally just fall back to schedutil,
+        # otherwise restore whatever the single common value was
+        governor_count=$(echo "$ORIG_GOVERNORS" | wc -l)
+        if [ "$governor_count" -eq 1 ]; then
+            echo "$ORIG_GOVERNORS" | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor > /dev/null
+            echo "cpu governor restored to: $ORIG_GOVERNORS"
+        else
+            echo "schedutil" | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor > /dev/null
+            echo "cpu governor was mixed originally, defaulted restore to: schedutil"
+        fi
+    fi
+    echo "$ORIG_APST" | sudo tee "/sys/class/nvme/${NVME_CTRL}/power/control" > /dev/null
+    echo "nvme power control restored to: $ORIG_APST"
+}
+trap restore_power_settings EXIT
+
+echo "=== pinning cpu governor to performance ==="
+echo performance | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor > /dev/null
+cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor | sort -u
+
+echo ""
+echo "=== disabling nvme autonomous power state transitions ==="
+echo on | sudo tee "/sys/class/nvme/${NVME_CTRL}/power/control" > /dev/null
+cat "/sys/class/nvme/${NVME_CTRL}/power/control"
 
 drop_caches() {
     sync
@@ -47,7 +88,7 @@ echo "rawgrep: $(rawgrep --version 2>/dev/null || echo unknown)" | tee -a "$RESU
 echo "ripgrep: $(rg --version | head -1)" | tee -a "$RESULTS_DIR/system.txt"
 
 CMD_RAWGREP="rawgrep '$PATTERN' '$SEARCH_DIR' --jump --no-color --threads $THREADS"
-CMD_RAWGREP_NOCACHE="rawgrep '$PATTERN' '$SEARCH_DIR' --jump --no-color --threads $THREADS --no-cache"
+CMD_RAWGREP_NOCACHE="rawgrep '$PATTERN' '$SEARCH_DIR' --jump --no-color --threads $THREADS --no-cache --no-cache-write"
 CMD_RG="rg '$PATTERN' '$SEARCH_DIR' --no-heading --color=never -n --threads $THREADS"
 
 # correctness check
@@ -97,7 +138,7 @@ eval "$CMD_RG" > /dev/null 2>&1 || true
 
 hyperfine \
     --warmup "$WARMUP" \
-    --runs "$RUNS" \
+    --runs "$WARM_RUNS" \
     --export-json "$RESULTS_DIR/warm_with_cache.json" \
     --export-markdown "$RESULTS_DIR/warm_with_cache.md" \
     --command-name "rawgrep" "$CMD_RAWGREP" \
@@ -112,7 +153,7 @@ eval "$CMD_RG" > /dev/null 2>&1 || true
 
 hyperfine \
     --warmup "$WARMUP" \
-    --runs "$RUNS" \
+    --runs "$WARM_RUNS" \
     --export-json "$RESULTS_DIR/warm_no_cache.json" \
     --export-markdown "$RESULTS_DIR/warm_no_cache.md" \
     --command-name "rawgrep (no cache)" "$CMD_RAWGREP_NOCACHE" \
