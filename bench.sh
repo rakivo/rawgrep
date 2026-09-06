@@ -16,7 +16,7 @@ DEVICE="/dev/nvme0n1p2"
 NVME_CTRL="nvme0"
 THREADS=16
 RUNS=10
-WARM_RUNS=30
+WARM_RUNS=100
 WARMUP=5
 RESULTS_DIR="./benchmark_results"
 
@@ -98,19 +98,21 @@ echo ""
 echo "=== correctness check ===" | tee "$RESULTS_DIR/correctness.txt"
 
 eval "$CMD_RAWGREP_NOCACHE" 2>/dev/null \
+    | tr -d '\r' \
     | sed 's/:\([0-9]*\): /:\1:/' \
-    | sort > /tmp/bench_rawgrep.txt
+    | LC_ALL=C sort > /tmp/bench_rawgrep.txt
 
 eval "$CMD_RG" 2>/dev/null \
-    | sort > /tmp/bench_rg.txt
+    | tr -d '\r' \
+    | LC_ALL=C sort > /tmp/bench_rg.txt
 
-cut -d: -f1 /tmp/bench_rawgrep.txt | sort -u > /tmp/bench_files_rawgrep.txt
-cut -d: -f1 /tmp/bench_rg.txt | sort -u > /tmp/bench_files_rg.txt
+cut -d: -f1 /tmp/bench_rawgrep.txt | LC_ALL=C sort -u > /tmp/bench_files_rawgrep.txt
+cut -d: -f1 /tmp/bench_rg.txt | LC_ALL=C sort -u > /tmp/bench_files_rg.txt
 
-MISSED_LINES=$(comm -23 /tmp/bench_rawgrep.txt /tmp/bench_rg.txt | wc -l)
-EXTRA_LINES=$(comm -13 /tmp/bench_rawgrep.txt /tmp/bench_rg.txt | wc -l)
-MISSED_FILES=$(comm -23 /tmp/bench_files_rawgrep.txt /tmp/bench_files_rg.txt | wc -l)
-EXTRA_FILES=$(comm -13 /tmp/bench_files_rawgrep.txt /tmp/bench_files_rg.txt | wc -l)
+MISSED_LINES=$(LC_ALL=C comm -23 /tmp/bench_rawgrep.txt /tmp/bench_rg.txt | wc -l)
+EXTRA_LINES=$(LC_ALL=C comm -13 /tmp/bench_rawgrep.txt /tmp/bench_rg.txt | wc -l)
+MISSED_FILES=$(LC_ALL=C comm -23 /tmp/bench_files_rawgrep.txt /tmp/bench_files_rg.txt | wc -l)
+EXTRA_FILES=$(LC_ALL=C comm -13 /tmp/bench_files_rawgrep.txt /tmp/bench_files_rg.txt | wc -l)
 
 {
     echo "line-level diff:"
@@ -121,14 +123,11 @@ EXTRA_FILES=$(comm -13 /tmp/bench_files_rawgrep.txt /tmp/bench_files_rg.txt | wc
     echo "  files matched by rg only:      $MISSED_FILES"
     echo "  files matched by rawgrep only: $EXTRA_FILES"
     echo ""
-    echo "differences are due to binary detection and gitignore policy differences,"
-    echo "not missed matches in text files."
-    echo ""
     echo "files matched by rg only (sample):"
-    comm -23 /tmp/bench_files_rawgrep.txt /tmp/bench_files_rg.txt | head -10
+    LC_ALL=C comm -23 /tmp/bench_files_rg.txt /tmp/bench_files_rawgrep.txt | head -10
     echo ""
     echo "files matched by rawgrep only (sample):"
-    comm -13 /tmp/bench_files_rawgrep.txt /tmp/bench_files_rg.txt | head -10
+    LC_ALL=C comm -13 /tmp/bench_files_rg.txt /tmp/bench_files_rawgrep.txt | head -10
 } | tee -a "$RESULTS_DIR/correctness.txt"
 
 # Warm cache - with fragment cache
