@@ -313,12 +313,14 @@ impl CacheStorage for DiskStorage {
     }
 
     #[inline]
+    #[allow(unused_mut)]
     fn load_mapped(&self) -> io::Result<Option<CacheBytes>> {
         let mut file = match std::fs::File::open(&self.path) {
             Ok(f) => f,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(e),
         };
+
         let len = file.metadata()?.len();
 
         // mmap2 refuses to map a zero-length file, treat that as no-cache.
@@ -342,11 +344,63 @@ impl CacheStorage for DiskStorage {
 
         #[cfg(not(windows))]
         {
+            fn ensure_memlock_capacity(min_bytes: u64) {
+                let mut rl = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+                if unsafe { libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut rl) } != 0 {
+                    return;  // Can't even query; leave as-is...
+                }
+
+                // RLIM_INFINITY means no hard cap -- safe to just request what we need
+                let target = if rl.rlim_max == libc::RLIM_INFINITY {
+                    min_bytes
+                } else {
+                    min_bytes.min(rl.rlim_max)
+                };
+
+                if rl.rlim_cur >= target {
+                    return;  // Already sufficient
+                }
+
+                let new_rl = libc::rlimit { rlim_cur: target, rlim_max: rl.rlim_max };
+                let ret = unsafe { libc::setrlimit(libc::RLIMIT_MEMLOCK, &new_rl) };
+                if ret != 0 {
+                    ::tracing::debug!(
+                        "[cache] setrlimit(RLIMIT_MEMLOCK) failed ({}), mlock may still fail",
+                        io::Error::last_os_error()
+                    );
+                }
+            }
+
+            fn try_mlock_cache(bytes: &[u8]) -> bool {
+                let ret = unsafe { libc::mlock(bytes.as_ptr() as *const libc::c_void, bytes.len()) };
+                if ret != 0 {
+                    let err = io::Error::last_os_error();
+                    eprintln!("[cache] mlock failed ({err}), falling back to populate+advise");
+                    false
+                } else {
+                    true
+                }
+            }
+
+            ensure_memlock_capacity(256 * 1024 * 1024); // @Constant @Tune
+
+            let t0 = Instant::now();
+
             // SAFETY: the file is only ever replaced via tmp+rename,
             // never truncated/modified in place, so this mapping stays valid for
             // as long as we hold it. External processes touching the cache path
             // directly would violate this, but that's outside our control anyway.
-            let mmap = unsafe { memmap2::Mmap::map(&file)? };
+            let mmap = unsafe {
+                memmap2::MmapOptions::new().populate().map(&file)?
+            };
+
+            eprintln!("mmap populated cache pages in {}ms", t0.elapsed().as_millis() as f64);
+
+            let t0 = Instant::now();
+            if try_mlock_cache(&mmap[..]) {
+                eprintln!("mlock-cached cache pages in {}ms", t0.elapsed().as_millis() as f64);
+            }
+
             Ok(Some(CacheBytes::Mapped(mmap)))
         }
     }
@@ -635,7 +689,7 @@ impl<S: CacheStorage> FragmentCache<S> {
         let alloc_time = alloc_start.elapsed();
 
         //
-        // Copy existing data from mmap
+        // Copy existing data from the mmap
         //
         let copy_start = Instant::now();
         unsafe {
@@ -913,6 +967,10 @@ impl<S: CacheStorage> FragmentCache<S> {
 
         #[cfg(unix)]
         bytes.advise(memmap2::Advice::Sequential);
+
+        // @Note: This is here to try to prevent possible major page faults in ensure_owned calls we do.
+        #[cfg(unix)]
+        bytes.advise(memmap2::Advice::WillNeed);
 
         // ---- Build lookup table
         let lookup_size = ((num_files * 2).max(1024)).next_power_of_two();
