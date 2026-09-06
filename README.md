@@ -15,10 +15,10 @@ rawgrep 0.1.6 vs ripgrep 15.1.0
 
 | scenario | rawgrep | ripgrep | speedup |
 |---|---|---|---|
-| warm cache + fragment cache | 279.0ms ± 8.7ms | 429.0ms ± 11.9ms | 1.54x |
-| cold cache + fragment cache | 3.948s ± 0.028s | 11.912s ± 0.096s | 3.02x |
-| cold cache, no fragment cache | 8.986s ± 0.051s | 11.884s ± 0.065s | 1.32x |
-| warm cache, no fragment cache | 713.8ms ± 7.2ms | 422.2ms ± 9.8ms | 0.59x (@Incomplete, slower) |
+| warm cache + fragment cache | 214.8ms ± 2.4ms | 373.9ms ± 4.3ms | 1.74x |
+| cold cache + fragment cache | 3.492s ± 0.034s | 11.860s ± 0.069s | 3.40x |
+| cold cache, no fragment cache | 9.167s ± 0.132s | 11.885s ± 0.073s | 1.30x |
+| warm cache, no fragment cache | 652.5ms ± 3.7ms | 375.2ms ± 6.6ms | 0.58x (@Incomplete, slower) |
 
 With *fragment cache* -- rawgrep's intended mode -- it's fast, anywhere from 1.5x to ~60x faster than ripgrep. The larger the corpus, the more of an advantage rawgrep tends to have relative to ripgrep. Using *fragment cache* rawgrep is doing much less I/O, which means it can stay in the page cache on much larger corpora, while ripgrep can't. That's what behind the 60x number -- the corpus used for that benchmark is my 1.27M-file home directory.
 
