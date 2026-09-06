@@ -28,8 +28,8 @@ pub struct BufFatPtr {
 #[derive(Clone, Copy)]
 pub struct ParsedEntry<Id> {
     pub file_id: Id,
-    pub name_offset: u16,
-    pub name_len: u8,
+    pub name_offset: u32,
+    pub name_len: u16,
     pub file_type: FileType
 }
 
