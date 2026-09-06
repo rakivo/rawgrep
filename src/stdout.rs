@@ -126,7 +126,8 @@ pub mod vmsplice {
     /// Returns Ok(n) for however many bytes the kernel accepted (may be
     /// less than buf.len(), including 0 if the pipe is full).
     ///
-    /// SAFETY: caller must not touch/reuse the accepted portion of `buf`
+    /// # Safety
+    /// Caller must not touch/reuse the accepted portion of `buf`
     /// until the reader has consumed it, OR must know the kernel has
     /// already copied it out (true for our call site -- see release()
     /// timing in flush_batch_pipe). Only ever call this on a fd known to

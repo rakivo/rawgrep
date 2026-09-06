@@ -179,6 +179,8 @@ pub enum PendingBuf {
 }
 
 impl PendingBuf {
+    /// # Safety
+    /// Caller must hold read-side
     #[inline]
     pub unsafe fn as_slice(&self) -> &[u8] {
         match self {
@@ -210,20 +212,16 @@ pub struct OutputWorker {
 impl OutputWorker {
     pub fn run(mut self) {
         let _span = tracy::span!("OutputThread::run");
-        'outer: loop {
-            match self.rx.recv() {
-                Ok(msg) => {
-                    if !self.absorb(msg) { break 'outer }
 
-                    while let Ok(msg) = self.rx.try_recv() {
-                        if !self.absorb(msg) { break 'outer } // absorb() already flushes when full
-                    }
+        'outer: while let Ok(msg) = self.rx.recv() {
+            if !self.absorb(msg) { break 'outer }
 
-                    if self.flush_batch().is_err() { break 'outer }
-                }
-
-                Err(_) => break
+            while let Ok(msg) = self.rx.try_recv() {
+                if !self.absorb(msg) { break 'outer } // absorb() already flushes when full
             }
+
+            if self.flush_batch().is_err() { break 'outer }
+
         }
 
         _ = self.flush_batch();

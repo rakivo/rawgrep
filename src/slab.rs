@@ -44,9 +44,8 @@ impl OutputSlab {
         // through `v` again (ManuallyDrop), only through the Box we
         // construct here, which owns it from this point on.
         let storage = unsafe {
-            Box::from_raw(std::slice::from_raw_parts_mut(
-                v.as_mut_ptr() as *mut UnsafeCell<u8>,
-                v.len(),
+            Box::from_raw(std::ptr::slice_from_raw_parts_mut(
+                v.as_mut_ptr() as *mut UnsafeCell<u8>, v.len()
             ))
         };
 
@@ -62,15 +61,18 @@ impl OutputSlab {
         Box::leak(Box::new(Self { storage, free }))
     }
 
-    /// # Safety: caller must hold exclusive (claimed, not-yet-released)
+    /// # Safety
+    /// Caller must hold exclusive (claimed, not-yet-released)
     /// ownership of `slot`.
     #[inline(always)]
+    #[allow(clippy::mut_from_ref)]
     pub unsafe fn slot_mut(&self, slot: usize) -> &mut [u8] {
         let base = self.storage.as_ptr().add(slot * SLOT_CAP) as *mut u8;
         std::slice::from_raw_parts_mut(base, SLOT_CAP)
     }
 
-    /// # Safety: caller must hold read-side ownership (received via an
+    /// # Safety
+    /// Caller must hold read-side ownership (received via an
     /// OutputMessage::Slot, not yet released).
     #[inline(always)]
     pub unsafe fn slot(&self, slot: usize) -> &[u8] {
@@ -138,12 +140,12 @@ pub enum SlotBuf {
 
 impl SlotBuf {
     #[inline(always)]
-    pub const fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
         match self { SlotBuf::Slab { len, .. } => *len, SlotBuf::Owned(v) => v.len() }
     }
 
     #[inline(always)]
-    pub const fn is_empty(&self) -> bool { self.len() == 0 }
+    pub fn is_empty(&self) -> bool { self.len() == 0 }
 
     #[inline(always)]
     pub fn push(&mut self, b: u8) { self.extend_from_slice(&[b]); }

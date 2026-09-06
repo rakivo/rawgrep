@@ -91,7 +91,7 @@ pub trait RawFs: Sync + Send {
         check_binary: bool,
     ) -> io::Result<bool>;
 
-    #[allow(clippy::type_complexity)] // @Cleanup
+    #[allow(clippy::type_complexity, clippy::too_many_arguments)] // @Cleanup
     fn collect_file_chunks(
         &self,
         _scratch: &mut Vec<u8>,
