@@ -194,7 +194,7 @@ impl<S: MatchSink + 'static> RawGrepCtx<S> {
     pub fn save_cache(&mut self, config: &RawGrepConfig) {
         debug!("[ctx] trying to save cache..");
 
-        if !config.no_cache_write && !config.no_cache {
+        if config.no_cache_write {
             debug!("[ctx] cache is disabled, exiting..");
             return;
         }
