@@ -86,6 +86,22 @@ cargo build --profile=release-fast
 sudo ./target/release-fast/rawgrep "search pattern"
 ```
 
+### Optional: `cap_ipc_lock` for Faster Cache Loads
+
+rawgrep keeps its on-disk *fragment cache* `mlock`ed in memory once mmap'ed, so it
+can't be evicted under memory pressure from a large scan. Locking requires
+either root or the `cap_ipc_lock` capability; without it, rawgrep still
+works fine, it just falls back to a best-effort population strategy
+that's usually just as fast, but can occasionally be slower on a cold cache
+under heavy concurrent memory pressure.
+
+If you're already setting `cap_dac_read_search` per Option 1 above, add
+`cap_ipc_lock` to the same command instead of running it twice:
+
+```bash
+sudo setcap 'cap_dac_read_search,cap_ipc_lock=eip' ./target/release-fast/rawgrep
+```
+
 ## Usage
 
 ### Basic Search
