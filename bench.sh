@@ -43,7 +43,7 @@ restore_power_settings() {
     echo ""
     echo "=== restoring original power settings ==="
     if [ -n "${ORIG_GOVERNORS:-}" ]; then
-        # if governors were mixed originally just fall back to schedutil,
+        # If governors were mixed originally just fall back to schedutil,
         # otherwise restore whatever the single common value was
         governor_count=$(echo "$ORIG_GOVERNORS" | wc -l)
         if [ "$governor_count" -eq 1 ]; then
@@ -74,7 +74,8 @@ drop_caches() {
     sleep 1
 }
 
-# system info
+# System info
+
 echo "=== system info ===" | tee "$RESULTS_DIR/system.txt"
 uname -a | tee -a "$RESULTS_DIR/system.txt"
 lscpu | grep -E "Model name|CPU\(s\)|MHz" | tee -a "$RESULTS_DIR/system.txt"
@@ -91,7 +92,8 @@ CMD_RAWGREP="rawgrep '$PATTERN' '$SEARCH_DIR' --jump --no-color --threads $THREA
 CMD_RAWGREP_NOCACHE="rawgrep '$PATTERN' '$SEARCH_DIR' --jump --no-color --threads $THREADS --no-cache --no-cache-write"
 CMD_RG="rg '$PATTERN' '$SEARCH_DIR' --no-heading --color=never -n --threads $THREADS"
 
-# correctness check
+# Correctness check
+
 echo ""
 echo "=== correctness check ===" | tee "$RESULTS_DIR/correctness.txt"
 
@@ -129,7 +131,8 @@ EXTRA_FILES=$(comm -13 /tmp/bench_files_rawgrep.txt /tmp/bench_files_rg.txt | wc
     comm -13 /tmp/bench_files_rawgrep.txt /tmp/bench_files_rg.txt | head -10
 } | tee -a "$RESULTS_DIR/correctness.txt"
 
-# warm cache - with fragment cache
+# Warm cache - with fragment cache
+
 echo ""
 echo "=== warm cache + fragment cache ==="
 
@@ -144,7 +147,8 @@ hyperfine \
     --command-name "rawgrep" "$CMD_RAWGREP" \
     --command-name "ripgrep" "$CMD_RG"
 
-# warm cache - no fragment cache
+# Warm cache - no fragment cache
+
 echo ""
 echo "=== warm cache, no fragment cache ==="
 
@@ -159,7 +163,8 @@ hyperfine \
     --command-name "rawgrep (no cache)" "$CMD_RAWGREP_NOCACHE" \
     --command-name "ripgrep" "$CMD_RG"
 
-# cold cache - no fragment cache
+# Cold cache - no fragment cache
+
 echo ""
 echo "=== cold cache, no fragment cache ==="
 
@@ -171,7 +176,8 @@ hyperfine \
     --command-name "rawgrep (no cache)" "$CMD_RAWGREP_NOCACHE" \
     --command-name "ripgrep" "$CMD_RG"
 
-# cold cache - with fragment cache
+# Cold cache - with fragment cache
+
 echo ""
 echo "=== cold cache + fragment cache ==="
 
@@ -185,33 +191,7 @@ hyperfine \
     --command-name "rawgrep" "$CMD_RAWGREP" \
     --command-name "ripgrep" "$CMD_RG"
 
-# detailed time stats
-echo ""
-echo "=== detailed stats ===" | tee "$RESULTS_DIR/perf.txt"
-
-eval "$CMD_RAWGREP" > /dev/null 2>&1 || true
-eval "$CMD_RG" > /dev/null 2>&1 || true
-
-warm_labels=("rawgrep_warm_cache" "rawgrep_warm_nocache" "ripgrep_warm")
-warm_cmds=("$CMD_RAWGREP" "$CMD_RAWGREP_NOCACHE" "$CMD_RG")
-
-for i in "${!warm_labels[@]}"; do
-    echo "" | tee -a "$RESULTS_DIR/perf.txt"
-    echo "--- ${warm_labels[$i]} ---" | tee -a "$RESULTS_DIR/perf.txt"
-    /usr/bin/time -v bash -c "${warm_cmds[$i]}" > /dev/null 2>> "$RESULTS_DIR/perf.txt"
-done
-
-cold_labels=("rawgrep_cold_cache" "rawgrep_cold_nocache" "ripgrep_cold")
-cold_cmds=("$CMD_RAWGREP" "$CMD_RAWGREP_NOCACHE" "$CMD_RG")
-
-for i in "${!cold_labels[@]}"; do
-    drop_caches
-    echo "" | tee -a "$RESULTS_DIR/perf.txt"
-    echo "--- ${cold_labels[$i]} ---" | tee -a "$RESULTS_DIR/perf.txt"
-    /usr/bin/time -v bash -c "${cold_cmds[$i]}" > /dev/null 2>> "$RESULTS_DIR/perf.txt"
-done
-
-# summary
+# Summary
 echo ""
 echo "========================================"
 echo "results"
