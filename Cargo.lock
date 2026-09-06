@@ -683,7 +683,7 @@ dependencies = [
 
 [[package]]
 name = "rawgrep"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "aho-corasick",
  "bpaf",
