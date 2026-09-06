@@ -10,7 +10,7 @@ benchmark script: [`bench.sh`](bench.sh)
 corpus: Chromium codebase (~500k files)
 pattern: `TODO` (literal)
 rawgrep 0.1.8 vs ripgrep 15.2.0
-system: Intel i5-13400F, 16 threads, NVMe SSD (Crucial P2 250GB, ~994MB/s read / 736MB/s write), 16GB 3200MHz RAM (~15GB free), performance mode enabled, Debian 6.12
+system: Intel i5-13400F, 16 threads, ext4 file system, NVMe SSD (Crucial P2 250GB, ~994MB/s read / 736MB/s write), 16GB 3200MHz RAM (~15GB free), performance mode enabled, Debian 6.12
 ```
 
 | scenario | rawgrep | ripgrep | speedup |
