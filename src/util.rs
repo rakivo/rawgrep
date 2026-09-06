@@ -215,9 +215,12 @@ pub fn resolve_apfs_physical_store(virtual_device: &str) -> Result<String, Error
 #[inline]
 pub fn init_logging() {
     if let Ok(level) = std::env::var("RAWGREP_LOG") {
+        let Ok(rawgrep)    = format!("rawgrep={level}").parse() else { return };
+        let Ok(rawgrep_ui) = format!("rawgrep_ui={level}").parse() else { return };
+
         let filter = EnvFilter::new("off")
-            .add_directive(format!("rawgrep={level}").parse().unwrap())
-            .add_directive(format!("rawgrep_ui={level}").parse().unwrap());
+            .add_directive(rawgrep)
+            .add_directive(rawgrep_ui);
 
         tracing_subscriber::registry()
             .with(filter)
