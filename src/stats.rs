@@ -13,6 +13,8 @@ pub struct Stats {
     pub dirs_skipped_path_too_long: u32,
     pub files_skipped_by_cache: u32,
 
+    pub time_fragment_presence_checking_took_in_millis: u32,
+
     // Colder
     pub files_contained_matches: u32,
     pub files_skipped_large: u32,
@@ -93,6 +95,9 @@ impl Display for Stats {
             dir_row!("Skipped (path too long)", self.dirs_skipped_path_too_long);
         }
 
+        writeln_blue!(f, "\nTimings:")?;
+        writeln!(f, "  Fragment Presence Checks: {}ms", self.time_fragment_presence_checking_took_in_millis)?;
+
         Ok(())
     }
 }
@@ -111,6 +116,8 @@ impl Stats {
         shared.files_contained_matches.fetch_add(self.files_contained_matches as _, Ordering::Relaxed);
         shared.dirs_encountered.fetch_add(self.dirs_encountered as _, Ordering::Relaxed);
         shared.dirs_skipped_common.fetch_add(self.dirs_skipped_common as _, Ordering::Relaxed);
+        shared.dirs_skipped_path_too_long.fetch_add(self.dirs_skipped_path_too_long as _, Ordering::Relaxed);
+        shared.time_fragment_presence_checking_took_in_millis.fetch_add(self.time_fragment_presence_checking_took_in_millis as _, Ordering::Relaxed);
         shared.dirs_skipped_gitignore.fetch_add(self.dirs_skipped_gitignore as _, Ordering::Relaxed);
         shared.symlinks_followed.fetch_add(self.symlinks_followed as _, Ordering::Relaxed);
         shared.symlinks_broken.fetch_add(self.symlinks_broken as _, Ordering::Relaxed);
@@ -125,6 +132,7 @@ pub struct AtomicStats {
     pub dirs_encountered: AtomicU64,
     pub dirs_skipped_common: AtomicU64,
     pub dirs_skipped_gitignore: AtomicU64,
+    pub time_fragment_presence_checking_took_in_millis: AtomicU64,
     pub dirs_skipped_path_too_long: AtomicU64,
     pub files_skipped_large: AtomicU64,
     pub files_skipped_as_binary_due_to_ext: AtomicU64,
@@ -150,6 +158,7 @@ impl AtomicStats {
             bytes_searched: AtomicU64::new(0),
             dirs_encountered: AtomicU64::new(0),
             dirs_skipped_common: AtomicU64::new(0),
+            time_fragment_presence_checking_took_in_millis: AtomicU64::new(0),
             dirs_skipped_gitignore: AtomicU64::new(0),
             dirs_skipped_path_too_long: AtomicU64::new(0),
             files_skipped_large: AtomicU64::new(0),
@@ -165,6 +174,7 @@ impl AtomicStats {
     pub fn to_stats(&self) -> Stats {
         Stats {
             files_skipped_unreadable: 0,
+            time_fragment_presence_checking_took_in_millis: self.time_fragment_presence_checking_took_in_millis.load(Ordering::Relaxed) as _,
             dirs_skipped_path_too_long: self.dirs_skipped_path_too_long.load(Ordering::Relaxed) as _,
             files_encountered: self.files_encountered.load(Ordering::Relaxed) as _,
             files_searched: self.files_searched.load(Ordering::Relaxed) as _,

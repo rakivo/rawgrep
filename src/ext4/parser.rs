@@ -80,7 +80,9 @@ impl RawFs for Ext4Fs {
 
         let inode_offset = self.inode_disk_offset(file_id);
 
-        let mut inode_buf = [0u8; 512]; // inode_size is at most 512 bytes in practice
+        let mut inode_buf = [0u8; 256];  // Ext4 inode_size is 128 or 256 in virtually all real deployments
+        debug_assert!(self.sb.inode_size as usize <= inode_buf.len());
+
         let inode_size = self.sb.inode_size as usize;
         let to_read = inode_size.min(inode_buf.len());
         self.read_at_offset(&mut inode_buf[..to_read], inode_offset as _)?;          // @Cache @Syscall
@@ -89,9 +91,9 @@ impl RawFs for Ext4Fs {
             &inode_buf[..std::mem::size_of::<raw::Ext4Inode>().min(to_read)]
         ).map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid inode data"))?;
 
-        let mode = u16::from_le(raw.mode);
-        let size_low = u32::from_le(raw.size_lo);
-        let flags = u32::from_le(raw.flags);
+        let mode      = u16::from_le(raw.mode);
+        let size_low  = u32::from_le(raw.size_lo);
+        let flags     = u32::from_le(raw.flags);
         let mtime_sec = u32::from_le(raw.mtime) as i64;
 
         let size_high = if self.sb.inode_size > 128 {
@@ -105,23 +107,18 @@ impl RawFs for Ext4Fs {
         let raw_block = [raw.block];
         let block_bytes = bytemuck::cast_slice::<[[u8; 12]; 5], u8>(&raw_block);
 
-        let blocks = [
-            u32::from_le_bytes([block_bytes[ 0], block_bytes[ 1], block_bytes[ 2], block_bytes[ 3]]),
-            u32::from_le_bytes([block_bytes[ 4], block_bytes[ 5], block_bytes[ 6], block_bytes[ 7]]),
-            u32::from_le_bytes([block_bytes[ 8], block_bytes[ 9], block_bytes[10], block_bytes[11]]),
-            u32::from_le_bytes([block_bytes[12], block_bytes[13], block_bytes[14], block_bytes[15]]),
-            u32::from_le_bytes([block_bytes[16], block_bytes[17], block_bytes[18], block_bytes[19]]),
-            u32::from_le_bytes([block_bytes[20], block_bytes[21], block_bytes[22], block_bytes[23]]),
-            u32::from_le_bytes([block_bytes[24], block_bytes[25], block_bytes[26], block_bytes[27]]),
-            u32::from_le_bytes([block_bytes[28], block_bytes[29], block_bytes[30], block_bytes[31]]),
-            u32::from_le_bytes([block_bytes[32], block_bytes[33], block_bytes[34], block_bytes[35]]),
-            u32::from_le_bytes([block_bytes[36], block_bytes[37], block_bytes[38], block_bytes[39]]),
-            u32::from_le_bytes([block_bytes[40], block_bytes[41], block_bytes[42], block_bytes[43]]),
-            u32::from_le_bytes([block_bytes[44], block_bytes[45], block_bytes[46], block_bytes[47]]),
-            u32::from_le_bytes([block_bytes[48], block_bytes[49], block_bytes[50], block_bytes[51]]),
-            u32::from_le_bytes([block_bytes[52], block_bytes[53], block_bytes[54], block_bytes[55]]),
-            u32::from_le_bytes([block_bytes[56], block_bytes[57], block_bytes[58], block_bytes[59]]),
-        ];
+        #[cfg(target_endian = "little")]
+        let blocks: [u32; 15] = {
+            // On a little-endian host, on-disk LE u32s are already in native order.
+            let as_u32: &[u32] = bytemuck::cast_slice(block_bytes);
+            as_u32.try_into().expect("block array is always exactly 60 bytes / 15 u32s")
+        };
+
+        #[cfg(target_endian = "big")]
+        let blocks: [u32; 15] = {
+            let as_u32: &[u32] = bytemuck::cast_slice(block_bytes);
+            std::array::from_fn(|i| u32::from_le(as_u32[i]))
+        };
 
         Ok(Ext4Inode {
             inode_num: inode_num as u64,
@@ -160,23 +157,25 @@ impl RawFs for Ext4Fs {
             return self.read_inline_data(parser, node, size_to_read, kind, check_binary);
         }
 
-        let Some(chunks) = self.collect_file_chunks(
+        if !self.collect_file_chunks(
             &mut parser.scratch,
             &mut parser.scratch2,
+            &mut parser.scratch_chunks,
             node,
             size_to_read,
             check_binary,
             buf
-        )? else {
+        )? {
             parser.get_buf_mut(kind).clear();
             return Ok(false);
-        };
+        }
 
-        for (disk_offset, len) in &chunks {
-            let buf = parser.get_buf_mut(kind);
+        for &(disk_offset, len) in &parser.scratch_chunks {
+            let buf = Parser::get_buf_mut_impl(&mut parser.file, &mut parser.dir, &mut parser.gitignore, kind);
+
             let old_len = buf.len();
-            buf.resize(old_len + len, 0);
-            match self.read_at_offset(&mut buf[old_len..], *disk_offset) {
+            buf.resize(old_len + len as usize, 0);
+            match self.read_at_offset(&mut buf[old_len..], disk_offset) {
                 Ok(n) => buf.truncate(old_len + n),
                 Err(_) => { buf.truncate(old_len); break; }
             }
@@ -190,11 +189,12 @@ impl RawFs for Ext4Fs {
         &self,
         scratch: &mut Vec<u8>,
         scratch2: &mut Vec<u8>, // Probe buffer, only touched (and only sized) when check_binary
+        scratch_chunks: &mut Vec<(u64, u32)>,
         node: &Ext4Inode,
         max_size: usize,
         check_binary: bool,
         buf: &mut Vec<u8>,      // Destination buffer -- probed bytes get written straight in here
-    ) -> io::Result<Option<SmallVec<[(u64, usize); 32]>>> {
+    ) -> io::Result<bool> {
         let _span = tracy::span!("Ext4Fs::collect_file_chunks");
 
         let file_size = node.size as usize;
@@ -202,10 +202,11 @@ impl RawFs for Ext4Fs {
 
         // Inline data has no disk offsets - caller handles it via read_file_content
         if node.flags & EXT4_INLINE_DATA_FL != 0 {
-            return Ok(Some(SmallVec::new()));
+            return Ok(true);
         }
 
         scratch.clear();
+        scratch_chunks.clear();
 
         if node.flags & EXT4_EXTENTS_FL != 0 {
             //
@@ -231,18 +232,17 @@ impl RawFs for Ext4Fs {
                 match self.read_at_offset(scratch2, offset) {
                     Ok(n) => {
                         if binary_probe(&scratch2[..n], file_size) {
-                            return Ok(None);                    // binary
+                            return Ok(false);                    // binary
                         }
 
                         buf.extend_from_slice(&scratch2[..n]);
                         skip_first = n;
                     }
 
-                    Err(_) => return Ok(Some(SmallVec::new())), // unreadable
+                    Err(_) => return Ok(true), // unreadable
                 }
             }
 
-            let mut chunks = SmallVec::new();
             let mut total = 0usize;
 
             for extent in extents {
@@ -270,14 +270,15 @@ impl RawFs for Ext4Fs {
                         if to_read == 0 { continue; }
                     }
 
-                    chunks.push((disk_offset, to_read));
-
-                    extent_offset += to_read;
-                    total += to_read;
+                    if to_read > 0 {
+                        crate::parser::push_chunk(scratch_chunks, disk_offset, to_read as u32);
+                        total += to_read;
+                        extent_offset += to_read;
+                    }
                 }
             }
 
-            Ok(Some(chunks))
+            Ok(true)
         } else {
             //
             // Direct blocks
@@ -286,7 +287,7 @@ impl RawFs for Ext4Fs {
             let blocks = &node.blocks[..EXT4_BLOCK_POINTERS_COUNT];
 
             if blocks.iter().all(|&b| b == 0 || b as u64 >= self.max_block) {
-                return Ok(Some(SmallVec::new()));
+                return Ok(true);
             }
 
             let mut skip_first = 0usize;
@@ -298,18 +299,19 @@ impl RawFs for Ext4Fs {
                 scratch2.clear();
                 scratch2.resize(probe_len, 0);
 
+                //
                 // A failed probe read here is treated as "read nothing",
                 // not as "bail out", unlike the extents branch.
+                //
                 let n = self.read_at_offset(scratch2, first as u64 * block_size).unwrap_or(0);
                 if binary_probe(&scratch2[..n], file_size) {
-                    return Ok(None); // binary
+                    return Ok(false); // binary
                 }
 
                 buf.extend_from_slice(&scratch2[..n]);
                 skip_first = n;
             }
 
-            let mut chunks = SmallVec::new();
             let mut total = 0usize;
 
             for &block_num in blocks.iter() {
@@ -329,11 +331,11 @@ impl RawFs for Ext4Fs {
                     if to_read == 0 { continue; }
                 }
 
-                chunks.push((disk_offset, to_read));
+                crate::parser::push_chunk(scratch_chunks, disk_offset, to_read as _);
                 total += to_read;
             }
 
-            Ok(Some(chunks))
+            Ok(true)
         }
     }
 
@@ -348,33 +350,31 @@ impl RawFs for Ext4Fs {
         let entry_size = mem::size_of::<raw::Ext4DirEntry2>();
 
         while offset + entry_size <= buf.len() {
-            let entry = match bytemuck::try_from_bytes::<raw::Ext4DirEntry2>(
-                &buf[offset..offset + entry_size]
-            ) {
-                Ok(e) => e,
-                Err(_) => break,
-            };
+            let inode     = unsafe { (buf.as_ptr().add(offset) as *const u32).read_unaligned() }.to_le();
+            let rec_len   = unsafe { (buf.as_ptr().add(offset + 4) as *const u16).read_unaligned() }.to_le() as usize;
+            let name_len  = buf[offset + 6];
+            let file_type = buf[offset + 7];
 
-            let entry_inode = u32::from_le(entry.inode) as FileId;
-            let rec_len = u16::from_le(entry.rec_len);
-            let name_len = entry.name_len;
-            let file_type = entry.file_type;
-
-            if unlikely(rec_len == 0) {
+            //
+            // ext4 spec: rec_len is always a multiple of 4 and at least entry_size.
+            // Slack space can violate this. Bail the block rather than desync offset
+            // or crawl through garbage one byte at a time.
+            //
+            if unlikely(rec_len == 0 || rec_len < entry_size || rec_len & 3 != 0) {
                 break;
             }
 
             let old_offset = offset;
-            offset += rec_len as usize;
+            offset += rec_len;
 
-            if unlikely(entry_inode == 0 || name_len == 0) {
+            if unlikely(inode == 0 || name_len == 0) {
                 continue;
             }
 
             let name_start = old_offset + entry_size;
             let name_end = name_start + name_len as usize;
 
-            if name_end > old_offset + rec_len as usize || name_end > buf.len() {
+            if name_end > old_offset + rec_len || name_end > buf.len() {
                 continue;
             }
 
@@ -384,7 +384,7 @@ impl RawFs for Ext4Fs {
                 _ => FileType::Other,
             };
 
-            match callback(entry_inode, name_start, name_len as usize, file_type) {
+            match callback(inode as FileId, name_start, name_len as usize, file_type) {
                 ControlFlow::Break(b) => return Some(b),
                 ControlFlow::Continue(_) => {}
             }
@@ -496,38 +496,37 @@ impl Ext4Fs {
             return Ok(());
         }
 
-        let header = bytemuck::try_from_bytes::<raw::Ext4ExtentHeader>(
-            &data[..mem::size_of::<raw::Ext4ExtentHeader>()]
-        ).map_err(|_| io::Error::new(
-            io::ErrorKind::InvalidData, "Invalid extent header"
-        ))?;
-
-        if unlikely(u16::from_le(header.eh_magic) != EXT4_EXTENT_MAGIC) {
+        const EXT4_MAX_EXTENT_DEPTH: usize = 5;
+        if unlikely(level > EXT4_MAX_EXTENT_DEPTH) {
             return Ok(());
         }
 
-        let entries = u16::from_le(header.eh_entries);
-        let depth = u16::from_le(header.eh_depth);
+        //
+        // SAFETY: bounds checked above. read_unaligned makes the alignment
+        // of `data` irrelevant, so a stack allocated `probe` array
+        // (1 byte aligned) is fine here.
+        //
+        let eh_magic   = unsafe { read_u16_unaligned_le(data, 0) };
+        let eh_entries = unsafe { read_u16_unaligned_le(data, 2) };
+        let eh_depth   = unsafe { read_u16_unaligned_le(data, 6) };
 
-        if depth == 0 {
+        if unlikely(u16::from_le(eh_magic) != EXT4_EXTENT_MAGIC) {
+            return Ok(());
+        }
+
+        if eh_depth == 0 {
             let extent_size = mem::size_of::<raw::Ext4Extent>();
             let extents_start = mem::size_of::<raw::Ext4ExtentHeader>();
 
-            for i in 0..entries as usize {
+            for i in 0..eh_entries as usize {
                 let offset = extents_start + i * extent_size;
                 if unlikely(offset + extent_size > data.len()) {
                     break;
                 }
 
-                let extent = bytemuck::try_from_bytes::<raw::Ext4Extent>(
-                    &data[offset..offset + extent_size]
-                ).map_err(|_| {
-                    io::Error::new(io::ErrorKind::InvalidData, "Invalid extent data")
-                })?;
-
-                let ee_len = u16::from_le(extent.ee_len);
-                let ee_start_hi = u16::from_le(extent.ee_start_hi);
-                let ee_start_lo = u32::from_le(extent.ee_start_lo);
+                let ee_len      = unsafe { read_u16_unaligned_le(data, offset + 4) };
+                let ee_start_hi = unsafe { read_u16_unaligned_le(data, offset + 6) };
+                let ee_start_lo = unsafe { read_u32_unaligned_le(data, offset + 8) };
 
                 let start_block = ((ee_start_hi as u64) << 32) | (ee_start_lo as u64);
 
@@ -542,25 +541,19 @@ impl Ext4Fs {
                 }
             }
         } else {
-            let mut child_blocks = SmallVec::<[u64; 16]>::new();
+            let mut child_blocks = SmallVec::<[u64; 16]>::new(); // @Memory @Speed...?
 
-            let index_size = mem::size_of::<raw::Ext4ExtentIdx>();
+            let index_size    = mem::size_of::<raw::Ext4ExtentIdx>();
             let indices_start = mem::size_of::<raw::Ext4ExtentHeader>();
 
-            for i in 0..entries as usize {
+            for i in 0..eh_entries as usize {
                 let offset = indices_start + i * index_size;
                 if unlikely(offset + index_size > data.len()) {
                     break;
                 }
 
-                let idx = bytemuck::try_from_bytes::<raw::Ext4ExtentIdx>(
-                    &data[offset..offset + index_size]
-                ).map_err(|_| {
-                    io::Error::new(io::ErrorKind::InvalidData, "Couldn't parse extent idx")
-                })?;
-
-                let ei_leaf_hi = u16::from_le(idx.ei_leaf_hi);
-                let ei_leaf_lo = u32::from_le(idx.ei_leaf_lo);
+                let ei_leaf_lo = unsafe { read_u32_unaligned_le(data, offset + 4) };
+                let ei_leaf_hi = unsafe { read_u16_unaligned_le(data, offset + 8) };
 
                 let leaf_block = ((ei_leaf_hi as u64) << 32) | (ei_leaf_lo as u64);
                 child_blocks.push(leaf_block);
@@ -579,4 +572,14 @@ impl Ext4Fs {
 
         Ok(())
     }
+}
+
+#[inline(always)]
+unsafe fn read_u16_unaligned_le(data: &[u8], offset: usize) -> u16 {
+    unsafe { (data.as_ptr().add(offset) as *const u16).read_unaligned().to_le() }
+}
+
+#[inline(always)]
+unsafe fn read_u32_unaligned_le(data: &[u8], offset: usize) -> u32 {
+    unsafe { (data.as_ptr().add(offset) as *const u32).read_unaligned().to_le() }
 }

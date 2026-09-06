@@ -2,8 +2,6 @@ use std::path::{MAIN_SEPARATOR, MAIN_SEPARATOR_STR};
 use std::io::{self, Seek};
 use std::fs::{File, OpenOptions};
 
-use bumpalo::Bump;
-
 use crate::apfs::{ApfsFs, ApfsVolume, APFS_NX_MAGIC};
 use crate::cli::Cli;
 use crate::matcher::Matcher;
@@ -19,13 +17,18 @@ use crate::ext4::{
     EXT4_INODE_TABLE_OFFSET, EXT4_MAGIC_OFFSET, EXT4_SUPER_MAGIC, EXT4_SUPERBLOCK_OFFSET, EXT4_SUPERBLOCK_SIZE, Ext4Fs
 };
 
+use nohash_hasher::IntSet;
+
 pub struct RawGrepper<F: RawFs, S: MatchSink = NoSink> {
     cli: Cli,
     fs: F,
     matcher: Matcher,
     cache: Option<FragmentCache>,
+
     fragment_hashes: Vec<u32>,
+    fragment_index: IntSet<u32>,
     selected_fragment_hash_len: FragmentLen,
+
     pub sink: S
 }
 
@@ -39,6 +42,8 @@ impl<F: RawFs, S: MatchSink> RawGrepper<F, S> {
             Some((hashes, fragment_len)) => (hashes, FragmentLen::from_fragment_len(fragment_len)),
             None => (Vec::new(), FragmentLen::Four),
         };
+
+        let fragment_index = fragment_hashes.iter().copied().collect();
 
         let cache = if !cli.no_cache && !fragment_hashes.is_empty() {
             let mut config = CacheConfig::from_memory_mb(cli.cache_size_mb);
@@ -57,7 +62,16 @@ impl<F: RawFs, S: MatchSink> RawGrepper<F, S> {
             None
         };
 
-        Ok(RawGrepper { cli: cli.clone(), fs, matcher, cache, fragment_hashes, sink, selected_fragment_hash_len })
+        Ok(RawGrepper {
+            cli: cli.clone(),
+            fs,
+            matcher,
+            cache,
+            fragment_hashes,
+            sink,
+            selected_fragment_hash_len,
+            fragment_index
+        })
     }
 
     /// Resolve a path like "/usr/bin" or "etc" into a file ID.
@@ -69,8 +83,7 @@ impl<F: RawFs, S: MatchSink> RawGrepper<F, S> {
             return Ok(self.fs.root_id());
         }
 
-        let bump = Bump::new();
-        let mut parser = Parser::new(&bump);
+        let mut parser = Parser::new();
         let mut file_id = self.fs.root_id();
 
         for part in path.split(MAIN_SEPARATOR).filter(|p| !p.is_empty()) {
@@ -413,6 +426,11 @@ impl<F: RawFs, S: MatchSink> RawGrepper<F, S> {
     }
 
     #[inline]
+    pub fn fragment_index(&self) -> &IntSet<u32> {
+        &self.fragment_index
+    }
+
+    #[inline]
     pub fn fs(&self) -> &F {
         &self.fs
     }
@@ -454,11 +472,11 @@ impl<S: MatchSink> AnyGrepper<S> {
     }
 
     #[inline]
-    pub fn matcher(&self) -> &Matcher {
+    pub fn fragment_index(&self) -> &IntSet<u32> {
         match self {
-            AnyGrepper::Ext4(g) => g.matcher(),
-            AnyGrepper::Apfs(g) => g.matcher(),
-            AnyGrepper::Ntfs(g) => g.matcher(),
+            AnyGrepper::Ext4(g) => g.fragment_index(),
+            AnyGrepper::Apfs(g) => g.fragment_index(),
+            AnyGrepper::Ntfs(g) => g.fragment_index(),
         }
     }
 

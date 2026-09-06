@@ -5,6 +5,7 @@
 // TODO(#24): Support for searching in large file(s). (detect that)
 
 use crate::cache::{FileKey, FileMeta, FragmentCache};
+use crate::slab::{OutputSlab, SlotPool, SlotBuf};
 use crate::cli::{should_enable_ansi_coloring, Cli};
 use crate::ignore::{Gitignore, GitignoreChain};
 use crate::matcher::Matcher;
@@ -12,27 +13,22 @@ use crate::binary::is_binary_ext;
 use crate::path_buf::SmallPathBuf;
 use crate::fragments::FragmentLen;
 use crate::stats::Stats;
-use crate::stdout::RawStdout;
+use crate::stdout::{RawStdout, IOV_MAX};
 use crate::thin_path_arc::ThinPathArc;
 use crate::parser::{BufFatPtr, BufKind, FileId, FileNode, FileType, ParsedEntry, Parser, RawFs};
 use crate::util::{is_common_skip_dir, likely, truncate_utf8, unlikely};
-use crate::{
-    tracy,
-    COLOR_CYAN,
-    COLOR_GREEN,
-    COLOR_RED,
-    COLOR_RESET
-};
+use crate::{tracy, COLOR_CYAN, COLOR_GREEN, COLOR_RED, COLOR_RESET};
 
 use std::ops::Not;
 use std::path::MAIN_SEPARATOR;
 use std::sync::Arc;
-use std::time::Duration;
-use std::io::{self, BufWriter, Write};
+use std::time::{Duration, Instant};
+use std::io::{self, Write, IoSlice};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use bumpalo::collections::Vec as BumpVec;
+use nohash_hasher::IntSet;
 use crossbeam_channel::{Receiver, Sender};
+use smallvec::SmallVec;
 use parking_lot::{Mutex, Condvar};
 use crossbeam_deque::{Injector, Steal, Stealer};
 pub use crossbeam_deque::Worker as DequeWorker;
@@ -52,7 +48,7 @@ pub const LARGE_DIR_THRESHOLD:     usize = 256;              // Split dirs with 
 pub const FILE_BATCH_SIZE:         usize = 64;               // Process files in batches of 500 @Tune
 
 pub const WORKER_FLUSH_BATCH:      usize = 16 * 1024;        // @Tune
-pub const OUTPUTTER_FLUSH_BATCH:   usize = 16 * 1024;        // @Tune
+pub const OUTPUTTER_FLUSH_BATCH:   usize = 512 * 1024;       // @Tune
 
 pub const BINARY_CONTROL_COUNT:    usize = 51;               // @Tune
 pub const BINARY_PROBE_BYTE_SIZE:  usize = 0x1000;           // @Tune
@@ -172,64 +168,205 @@ where
 }
 
 pub enum OutputMessage {
-    Data(&'static [u8]),
+    Slot { slab: &'static OutputSlab, slot: u16, len: u32 },
+    Owned(Box<[u8]>),
     FlushReq,
+}
+
+pub enum PendingBuf {
+    Slot { slab: &'static OutputSlab, slot: u16, len: u32 },
+    Owned(Box<[u8]>),
+}
+
+impl PendingBuf {
+    #[inline]
+    pub unsafe fn as_slice(&self) -> &[u8] {
+        match self {
+            PendingBuf::Slot { slab, slot, len, .. } => unsafe {
+                &slab.slot(*slot as usize)[..*len as usize]
+            },
+
+            PendingBuf::Owned(v) => v,
+        }
+    }
 }
 
 pub struct OutputWorker {
     pub rx: Receiver<OutputMessage>,
     pub flush_ack_tx: Sender<()>,
-    pub writer: BufWriter<RawStdout>,
+    pub writer: RawStdout,
+
+    pub batch:       Vec<PendingBuf>,
+    pub batch_bytes: usize,
+    pub iov_scratch: Vec<IoSlice<'static>>,
+
+    #[cfg(unix)]
+    pub is_pipe: bool,
+
+    #[cfg(unix)]
+    pub raw_fd: std::os::unix::io::RawFd
 }
 
 impl OutputWorker {
     pub fn run(mut self) {
         let _span = tracy::span!("OutputThread::run");
-
         'outer: loop {
             match self.rx.recv() {
-                Ok(OutputMessage::Data(buf)) => {
-                    if self.write_and_maybe_flush(buf).is_err() {
-                        break 'outer;
-                    }
-
-                    //
-                    // Drain remaining output first
-                    //
+                Ok(msg) => {
+                    if !self.absorb(msg) { break 'outer }
 
                     while let Ok(msg) = self.rx.try_recv() {
-                        match msg {
-                            OutputMessage::Data(buf) => {
-                                if self.write_and_maybe_flush(buf).is_err() {
-                                    break 'outer;
-                                }
-                            }
-                            OutputMessage::FlushReq => {
-                                _ = self.writer.flush();
-                                _ = self.flush_ack_tx.send(());
-                            }
-                        }
+                        if !self.absorb(msg) { break 'outer } // absorb() already flushes when full
                     }
+
+                    if self.flush_batch().is_err() { break 'outer }
                 }
 
-                Ok(OutputMessage::FlushReq) => {
-                    _ = self.writer.flush();
-                    _ = self.flush_ack_tx.send(());
-                }
-
-                Err(_) => break,
+                Err(_) => break
             }
         }
 
-        _ = self.writer.flush();
+        _ = self.flush_batch();
     }
 
     #[inline]
-    fn write_and_maybe_flush(&mut self, buf: &[u8]) -> io::Result<()> {
-        self.writer.write_all(buf)?;
-        if self.writer.buffer().len() >= OUTPUTTER_FLUSH_BATCH {
-            self.writer.flush()?;
+    fn absorb(&mut self, msg: OutputMessage) -> bool {
+        match msg {
+            OutputMessage::Slot { slab, slot, len } => {
+                self.batch_bytes += len as usize;
+                self.batch.push(PendingBuf::Slot { slab, slot, len });
+            }
+
+            OutputMessage::Owned(v) => {
+                self.batch_bytes += v.len();
+                self.batch.push(PendingBuf::Owned(v));
+            }
+
+            OutputMessage::FlushReq => {
+                if self.flush_batch().is_err() { return false; }
+                _ = self.flush_ack_tx.send(());
+
+                return true;
+            }
         }
+
+        // Trigger check happens on every message now, not just in the outer loop.
+        if self.batch_bytes >= OUTPUTTER_FLUSH_BATCH || self.batch.len() >= IOV_MAX {
+            if self.flush_batch().is_err() {
+                return false;
+            }
+        }
+
+        true
+    }
+
+    #[inline]
+    fn flush_batch(&mut self) -> io::Result<()> {
+        if self.batch.is_empty() { return Ok(()) }
+
+        #[cfg(target_os = "linux")]
+        if self.is_pipe {
+            return self.flush_batch_pipe();
+        }
+
+        self.flush_batch_writev()
+    }
+
+    fn flush_batch_writev(&mut self) -> io::Result<()> {
+        self.iov_scratch.clear();
+
+        for b in &self.batch {
+            // SAFETY: Slot ownership moved to us via the channel send;
+            // the sender relinquished it and cannot touch it again until we release it below.
+            let bytes = unsafe { b.as_slice() };
+
+            // SAFETY: Every referent here is kept alive by an Arc/Vec still
+            // sitting in self.batch, which outlives this function's use of
+            // iov_scratch (we don't drain batch until after writev_all() returns Ok).
+            let bytes: &'static [u8] = unsafe { std::mem::transmute(bytes) };
+            self.iov_scratch.push(IoSlice::new(bytes));
+        }
+
+        self.writev_all()?;
+
+        for b in self.batch.drain(..) {
+            if let PendingBuf::Slot { slab, slot, .. } = b {
+                slab.release(slot as usize);
+            }
+        }
+        self.batch_bytes = 0;
+
+        Ok(())
+    }
+
+    // Fast path for pipes: vmsplice per buffer, falling back to a
+    // blocking write() for whatever vmsplice declines (pipe full, or any vmsplice error).
+    #[cfg(target_os = "linux")]
+    fn flush_batch_pipe(&mut self) -> io::Result<()> {
+        for b in self.batch.drain(..) {
+            // SAFETY: Same as in flush_batch_writev.
+            let bytes = unsafe { b.as_slice() };
+
+            match &b {
+                PendingBuf::Owned(_) => {
+                    //
+                    // Safe to vmsplice: this Vec is dropped right after, never
+                    // handed back to a pool, so nothing can write into these
+                    // pages again before the kernel is done with them.
+                    //
+
+                    let mut off = 0;
+                    while off < bytes.len() {
+                        match unsafe { crate::stdout::vmsplice::vmsplice_once(self.raw_fd, &bytes[off..]) } {
+                            Ok(0) => break,
+                            Ok(n) => off += n,
+
+                            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                            Err(_) => break,
+                        }
+                    }
+
+                    if off < bytes.len() {
+                        self.writer.write_all(&bytes[off..])?;
+                    }
+                }
+
+                PendingBuf::Slot { .. } => {
+                    //
+                    // Slab slots get reused within ~20 flushes. Sadly, vmsplice gives
+                    // no signal for when the pipe reader has actually drained
+                    // the pages, so reusing this slot could let a later write
+                    // land on memory the kernel still has queued.
+                    //
+                    // Therefore, we have to copy instead :(. Maybe I'll come up
+                    // with something better than this soon.
+                    //
+                    self.writer.write_all(bytes)?;
+                }
+            }
+
+            if let PendingBuf::Slot { slab, slot, .. } = b {
+                slab.release(slot as usize);
+            }
+        }
+
+        self.batch_bytes = 0;
+        Ok(())
+    }
+
+    #[inline]
+    fn writev_all(&mut self) -> io::Result<()> {
+        let mut slices = &mut self.iov_scratch[..];
+        while !slices.is_empty() {
+            match self.writer.write_vectored(slices) {
+                Ok(0) => return Err(io::Error::new(io::ErrorKind::WriteZero, "write_vectored wrote 0")),
+                Ok(n) => IoSlice::advance_slices(&mut slices, n),
+
+                Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e)                 => return Err(e),
+            }
+        }
+
         Ok(())
     }
 }
@@ -237,14 +374,14 @@ impl OutputWorker {
 /// Carry state for streaming match across chunk boundaries
 pub struct ChunkCarry {
     /// Incomplete last line carried from previous chunk
-    pub tail: Vec<u8>,
+    pub tail:        Vec<u8>,
     pub combine_buf: Vec<u8>,
 
     /// Any matches was found so far in this file
-    pub found_any: bool,
+    pub found_any:   bool,
 
     /// Line number counter across chunks
-    pub line_num: u32,
+    pub line_num:    u32,
 }
 
 impl ChunkCarry {
@@ -375,21 +512,22 @@ impl FragmentPresenceBits {
     }
 }
 
-pub struct WorkerResult<'a> {
+pub struct WorkerResult {
     pub stats: Box<Stats>,
 
-    pub parser: Parser<'a>,
+    pub parser: Parser,
 
     pub file_keys:  Vec<FileKey>,
     pub file_metas: Vec<FileMeta>,
 
     pub path_buf:      Box<SmallPathBuf>,
     pub swap_path_buf: Box<SmallPathBuf>,
+    pub output:        SlotBuf,
 
     // Reused across `find_and_print_matches` calls
     pub          newlines_scratch: Vec<u32>,
-    pub            ranges_scratch: Vec<(u32, u32)>,
-    pub fragment_presence_scratch: Vec<u64>,
+    pub            ranges_scratch: SmallVec<[(u32, u32); 4]>,
+    pub fragment_presence_scratch: SmallVec<[u64; 8]>,
 
     pub         path_arena: PathArena,
     pub file_entries_arena: FileEntryArena,
@@ -405,9 +543,13 @@ pub struct WorkerCtx<'a, 'output_arena, F: RawFs, S: MatchSink> {
     pub fragment_hashes: &'a [u32],
     pub matcher:         &'a Matcher,
     pub cli:             &'a Cli,
+    pub slot_pool:       &'output_arena mut SlotPool,
+    pub fragment_index:  &'a IntSet<u32>,
     pub selected_fragment_hash_len: FragmentLen,
+    pub stdout_is_being_redirected_to_dev_null: bool,
 
-    pub parser: Parser<'output_arena>,
+    pub parser: Parser,
+    pub output: SlotBuf,
 
     // ----- Hot
     pub         path_arena: PathArena,          // 24
@@ -421,8 +563,8 @@ pub struct WorkerCtx<'a, 'output_arena, F: RawFs, S: MatchSink> {
 
     // ----- Warm
     pub          newlines_scratch: Vec<u32>,
-    pub            ranges_scratch: Vec<(u32, u32)>,
-    pub fragment_presence_scratch: Vec<u64>,
+    pub            ranges_scratch: SmallVec<[(u32, u32); 4]>,
+    pub fragment_presence_scratch: SmallVec<[u64; 8]>,
 
     pub chunk_carry:               Option<Box<ChunkCarry>>,
 
@@ -446,13 +588,14 @@ impl<'a, 'output_arena, F: RawFs, S: MatchSink> WorkerCtx<'a, 'output_arena, F, 
     }
 
     #[inline(always)]
-    fn finish(mut self) -> WorkerResult<'output_arena> {
+    fn finish(mut self) -> WorkerResult {
         self.flush_output();
         WorkerResult {
             stats: self.stats,
             parser: self.parser,
             path_arena: self.path_arena,
             file_entries_arena: self.file_entries_arena,
+            output: self.output,
             path_buf: self.path_buf,
             swap_path_buf: self.swap_path_buf,
             subdirs_arena: self.subdirs_arena,
@@ -468,18 +611,16 @@ impl<'a, 'output_arena, F: RawFs, S: MatchSink> WorkerCtx<'a, 'output_arena, F, 
     #[inline(always)]
     pub fn flush_output(&mut self) {
         if S::STDOUT_NOP {
-            self.parser.output.clear();
+            self.output.clear();
             return;
         }
 
-        if self.parser.output.is_empty() {
+        if self.output.is_empty() {
             return;
         }
 
-        _ = self.output_tx.send(unsafe {  // @Cleanup
-            OutputMessage::Data(core::mem::transmute::<&[u8], &[u8]>(self.parser.output.as_slice()))
-        });
-        self.parser.output.clear();
+        let old = std::mem::replace(&mut self.output, self.slot_pool.acquire());
+        _ = self.output_tx.send(old.finish());
     }
 
     #[inline(always)]
@@ -765,7 +906,7 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, '_, F, S> {
 
             self.process_file(&node, name_fat_ptr, parent_path, gitignore_chain)?;
 
-            if self.parser.output.len() > WORKER_FLUSH_BATCH {
+            if self.output.len() > WORKER_FLUSH_BATCH {
                 self.flush_output();
             }
         }
@@ -841,7 +982,7 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, '_, F, S> {
             self.process_file_streaming(node, max_size, check_binary)?
         };
 
-        if let Some((file_key, file_meta)) = cache_key {
+        if !self.cli.no_cache_write && let Some((file_key, file_meta)) = cache_key {
             self.pending_file_keys.push(file_key);
             self.pending_file_metas.push(file_meta);
 
@@ -899,25 +1040,30 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, '_, F, S> {
         );
         buf.clear();
 
-        let Some(chunks) = self.fs.collect_file_chunks(
+        if !self.fs.collect_file_chunks(
             &mut self.parser.scratch,
             &mut self.parser.scratch2,
+            &mut self.parser.scratch_chunks,
             node,
             max_size,
             check_binary,
             buf
-        )? else {
+        )? {
             self.stats.files_skipped_as_binary_due_to_probe += 1;
             self.chunk_carry = Some(carry);
             return Ok(false);
-        };
+        }
 
         let mut bytes_searched = 0usize;
+        let chunks_len = self.parser.scratch_chunks.len();
 
-        for (disk_offset, len) in &chunks {
-            self.parser.chunk.resize(*len, 0);
+        for chunk_index in 0..chunks_len {
+            let (disk_offset, len) = self.parser.scratch_chunks[chunk_index];
+            let len = len as usize;
 
-            let n = match self.fs.read_at_offset(&mut self.parser.chunk[..*len], *disk_offset) {
+            self.parser.chunk.resize(len, 0);
+
+            let n = match self.fs.read_at_offset(&mut self.parser.chunk[..len], disk_offset) {
                 Ok(n) => n,
                 Err(_) => break,
             };
@@ -959,6 +1105,8 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, '_, F, S> {
     fn check_fragment_presence(&mut self) {
         let _span = tracy::span!("check_fragment_presence");
 
+        let t0 = Instant::now();
+
         // Reset all presence to false
         unsafe {
             std::ptr::write_bytes(
@@ -972,8 +1120,11 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, '_, F, S> {
             &self.parser.file,
             self.fragment_hashes,
             &mut self.fragment_presence_scratch,
+            self.fragment_index,
             self.selected_fragment_hash_len.as_usize()
         );
+
+        self.stats.time_fragment_presence_checking_took_in_millis += t0.elapsed().as_millis() as u32;
     }
 }
 
@@ -1015,22 +1166,23 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, '_, F, S> {
                     //
 
                     found_any = true;
-                    let needed = 4096 + buf_len.min(32 * 1024); // @Constant @Tune
-                    if self.parser.output.capacity() - self.parser.output.len() < needed {
-                        self.parser.output.reserve(needed);
+
+                    if !self.stdout_is_being_redirected_to_dev_null {
+                        Self::write_file_header(&mut self.output, self.cli, &self.path_buf, should_print_color);
                     }
-                    Self::write_file_header(&mut self.parser.output, self.cli, &self.path_buf, should_print_color);
                 }
 
-                Self::write_match_line(
-                    &mut self.parser.output,
-                    self.cli,
-                    &self.path_buf,
-                    line,
-                    line_num,
-                    self.ranges_scratch.iter().copied(),
-                    should_print_color,
-                );
+                if !self.stdout_is_being_redirected_to_dev_null {
+                    Self::write_match_line(
+                        &mut self.output,
+                        self.cli,
+                        &self.path_buf,
+                        line,
+                        line_num,
+                        self.ranges_scratch.iter().copied(),
+                        should_print_color,
+                    );
+                }
 
                 if S::STDOUT_NOP {  // @Memory
                     self.sink.push(self.path_buf.as_ref(), line_num as _, line, &self.ranges_scratch);
@@ -1077,7 +1229,6 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, '_, F, S> {
         self.newlines_scratch.clear();
         self.newlines_scratch.extend(memchr::memchr_iter(b'\n', data).map(|i| i as u32));
 
-        let data_len = data.len();
         let mut line_start = 0usize;
 
         for &newline_pos in self
@@ -1100,22 +1251,23 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, '_, F, S> {
                     //
 
                     carry.found_any = true;
-                    let needed = 4096 + data_len.min(32 * 1024); // @Constant @tune
-                    if self.parser.output.capacity() - self.parser.output.len() < needed {
-                        self.parser.output.reserve(needed);
+
+                    if !self.stdout_is_being_redirected_to_dev_null {
+                        Self::write_file_header(&mut self.output, self.cli, &self.path_buf, should_print_color);
                     }
-                    Self::write_file_header(&mut self.parser.output, self.cli, &self.path_buf, should_print_color);
                 }
 
-                Self::write_match_line(
-                    &mut self.parser.output,
-                    self.cli,
-                    &self.path_buf,
-                    line,
-                    carry.line_num,
-                    self.ranges_scratch.iter().copied(),
-                    should_print_color,
-                );
+                if !self.stdout_is_being_redirected_to_dev_null {
+                    Self::write_match_line(
+                        &mut self.output,
+                        self.cli,
+                        &self.path_buf,
+                        line,
+                        carry.line_num,
+                        self.ranges_scratch.iter().copied(),
+                        should_print_color,
+                    );
+                }
 
                 if S::STDOUT_NOP { // @Memory @Cutnpaste from find_and_print_matches
                     self.sink.push(self.path_buf.as_ref(), carry.line_num as _, line, &self.ranges_scratch);
@@ -1137,7 +1289,7 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, '_, F, S> {
 
     #[inline(always)]
     fn write_match_line(
-        output:            &mut BumpVec<u8>,
+        output:            &mut SlotBuf,
         cli:               &Cli,
         path:              &[u8],
         line:              &[u8],
@@ -1190,7 +1342,7 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, '_, F, S> {
 
     #[inline(always)]
     fn write_file_header(
-        output:            &mut BumpVec<u8>,
+        output:            &mut SlotBuf,
         cli:               &Cli,
         path:              &[u8],
         should_print_color: bool,
@@ -1248,7 +1400,7 @@ impl<'a, 'output_arena, F: RawFs, S: MatchSink> WorkerCtx<'a, 'output_arena, F, 
         injector: &Injector<WorkItem>,
         stealers: &[Stealer<WorkItem>],
         local_worker: &DequeWorker<WorkItem>,
-    ) -> WorkerResult<'output_arena> {
+    ) -> WorkerResult {
         self.init();
 
         let mut consecutive_steals = 0;

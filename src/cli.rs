@@ -106,6 +106,10 @@ pub struct Cli {
     #[bpaf(long("no-cache"))]
     pub no_cache: bool,
 
+    /// Don't write/update cache
+    #[bpaf(long("no-cache-write"))]
+    pub no_cache_write: bool,
+
     /// Fragment cache memory budget in MB (default: 100)
     #[bpaf(long("cache-size"), argument("MB"), fallback(100))]
     pub cache_size_mb: usize,

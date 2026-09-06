@@ -202,6 +202,7 @@ pub fn check_fragment_presence(
     buf: &[u8],
     fragment_hashes: &[u32],
     fragment_presence_scratch: &mut [u64],
+    fragment_index: &IntSet<u32>,
     fragment_len: usize,
 ) {
     let num_frags = fragment_hashes.len();
@@ -228,17 +229,14 @@ pub fn check_fragment_presence(
         }
     }
 
-    check_fragment_presence_scalar(buf, fragment_hashes, fragment_presence_scratch, mask)
+    check_fragment_presence_scalar(buf, fragment_hashes, fragment_presence_scratch, fragment_index, mask)
 }
 
 /// Scalar fallback for fragment presence checking
 #[inline]
-fn check_fragment_presence_scalar(buf: &[u8], fragment_hashes: &[u32], fragment_presence_scratch: &mut [u64], mask: u32) {
+fn check_fragment_presence_scalar(buf: &[u8], fragment_hashes: &[u32], fragment_presence_scratch: &mut [u64], fragment_index: &IntSet<u32>, mask: u32) {
     let num_frags = fragment_hashes.len();
     let stride = stride_heuristic(buf.len());
-
-    // Build a set of pattern fragment hashes for O(1) lookup
-    let pattern_frag_set = fragment_hashes.iter().copied().collect::<IntSet<_>>();
 
     let mut found_count = 0;
 
@@ -247,7 +245,7 @@ fn check_fragment_presence_scalar(buf: &[u8], fragment_hashes: &[u32], fragment_
         let raw = u32::from_le_bytes([buf[i], buf[i+1], buf[i+2], buf[i+3]]) & mask;
         let hash = hash_fragment_u32(raw);
 
-        if pattern_frag_set.contains(&hash) {
+        if fragment_index.contains(&hash) {
             for (idx, &frag_hash) in fragment_hashes.iter().enumerate() {
                 if frag_hash == hash {
                     let (word, bit) = (idx / 64, 1u64 << (idx % 64));

@@ -56,7 +56,6 @@ bytemuck = { version = "1.24", features = ["derive"] }
 dhat = { version = "0.3.3", default-features = false, optional = true }
 nohash-hasher = { version = "0.2.0", default-features = false, features = ["std"] }
 parking_lot = { version =  "0.12.5", default-features = false }
-bumpalo = { version = "3.20.2", features = ["collections"] }
 bpaf = { version = "0.9.27", features = ["derive"], default-features = false }
 memmap2 = { version = "0.9.11", default-features = false }
 

@@ -37,6 +37,7 @@ pub mod path_buf;
 pub mod cache;
 pub mod fragments;
 pub mod platform;
+pub mod slab;
 pub mod thin_path_arc;
 
 #[cfg(feature = "small")]
@@ -116,6 +117,7 @@ pub struct RawGrepConfig {
 
     // ---- cache ----------------------------------------------------------
     pub no_cache:      bool,
+    pub no_cache_write:bool,
     pub cache_size_mb: usize,
     pub cache_dir:     Option<Box<Path>>,
     pub rebuild_cache: bool,
@@ -131,6 +133,7 @@ impl RawGrepConfig {
             no_ignore:        false,
             binary:           false,
             large:            false,
+            no_cache_write:   false,
             all:              false,
             unrestricted:     0,
             no_color:         false,
@@ -156,6 +159,7 @@ impl RawGrepConfig {
     pub fn large(mut self)                              -> Self { self.large         = true;       self }
     pub fn force_literal(mut self)                      -> Self { self.force_literal = true;       self }
     pub fn no_cache(mut self)                           -> Self { self.no_cache      = true;       self }
+    pub fn no_cache_write(mut self)                     -> Self { self.no_cache_write= true;       self }
     pub fn rebuild_cache(mut self)                      -> Self { self.rebuild_cache = true;       self }
     pub fn unrestricted(mut self, n: u8)                -> Self { self.unrestricted  = n;          self }
     pub fn threads(mut self, n: NonZeroUsize)           -> Self { self.threads    = n;             self }
@@ -172,6 +176,7 @@ impl RawGrepConfig {
             binary:           c.binary,
             large:            c.large,
             all:              c.all,
+            no_cache_write:   c.no_cache_write,
             unrestricted:     c.unrestricted,
             no_color:         c.no_color,
             jump:             c.jump,
@@ -188,6 +193,7 @@ impl RawGrepConfig {
     #[inline]
     pub fn to_cli(&self) -> cli::Cli {
         cli::Cli {
+            no_cache_write:   self.no_cache_write,
             pattern:          self.pattern.clone().into_string(),
             search_root_path: self.search_root_path.clone().into_string(),
             device:           self.device.clone().map(String::from),
@@ -235,8 +241,8 @@ pub fn run_with_inspect<S: MatchSink + 'static>(
 ) -> Result<(Stats, Option<CacheStats>)> {
     let threads = config.threads.get();
     let mut ctx = RawGrepCtx::new(threads, running);
-    ctx.search(config, sink, inspect_before_search)?;
-    Ok(ctx.wait_and_save_cache())
+    ctx.search(&config, sink, inspect_before_search)?;
+    Ok(ctx.wait_and_save_cache(&config))
 }
 
 #[inline]

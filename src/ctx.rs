@@ -1,18 +1,19 @@
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
-use std::io::{self, BufWriter};
+use std::io::{self};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use bumpalo::Bump;
 use parking_lot::{Condvar, Mutex, RwLock};
 
 use ::tracing::debug;
+use smallvec::SmallVec;
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use crossbeam_deque::{Injector, Stealer, Worker as DequeWorker};
 
 use crate::error::Error;
+use crate::slab::SlotPool;
 use crate::RawGrepConfig;
 use crate::path_buf::SmallPathBuf;
 use crate::stdout::RawStdout;
@@ -21,7 +22,7 @@ use crate::parser::Parser;
 use crate::cache::{FileKey, FileMeta, CacheStats};
 use crate::stats::{AtomicStats, Stats};
 use crate::grep::{AnyGrepper, FsType, RawGrepper, open_device_and_detect_fs};
-use crate::worker::{DirWork, FileWork, MatchSink, OutputWorker, WorkItem, WorkerCtx, PathArena, FileEntryArena, SubdirsArena, FragmentPresenceBits, OUTPUTTER_FLUSH_BATCH, OutputMessage};
+use crate::worker::{DirWork, FileWork, MatchSink, OutputWorker, WorkItem, WorkerCtx, PathArena, FileEntryArena, SubdirsArena, FragmentPresenceBits, OutputMessage};
 
 #[derive(Default)]
 struct CacheAccumulator {
@@ -46,6 +47,7 @@ struct SearchJob<S: MatchSink> {
 #[derive(Clone)]
 pub struct RawGrepCtx<S: MatchSink> {
     worker_count:   usize,
+    stdout_is_being_redirected_to_dev_null: bool,
 
     injector:       Arc<Injector<WorkItem>>,
     running:        Arc<AtomicBool>,
@@ -76,13 +78,23 @@ impl<S: MatchSink + 'static> RawGrepCtx<S> {
         let (output_tx, output_rx)       = unbounded();
         let (flush_ack_tx, flush_ack_rx) = unbounded();
 
-        _ = std::thread::spawn(move || {
-            OutputWorker {
-                rx: output_rx,
-                flush_ack_tx,
-                writer: BufWriter::with_capacity(OUTPUTTER_FLUSH_BATCH * 2, RawStdout::new()), // @Contant @Tune
-            }.run();
-        });
+        let raw_stdout = RawStdout::new();
+        let stdout_is_being_redirected_to_dev_null = raw_stdout.is_none();
+
+        if let Some((raw_stdout, is_pipe, raw_fd)) = raw_stdout {
+            _ = std::thread::spawn(move || {
+                OutputWorker {
+                    rx: output_rx,
+                    raw_fd,
+                    is_pipe,
+                    flush_ack_tx,
+                    batch_bytes: 0,
+                    writer: raw_stdout, // was BufWriter::with_capacity(...)
+                    batch: Vec::with_capacity(256),       // one-time alloc, amortized forever
+                    iov_scratch: Vec::with_capacity(256), // same
+                }.run();
+            });
+        }
 
         let ctx = Self {
             injector,
@@ -94,6 +106,7 @@ impl<S: MatchSink + 'static> RawGrepCtx<S> {
             current_job: job,
             output_tx,
             worker_count: num_threads,
+            stdout_is_being_redirected_to_dev_null,
             flush_ack_rx: Arc::new(Mutex::new(flush_ack_rx)),
         };
 
@@ -105,12 +118,15 @@ impl<S: MatchSink + 'static> RawGrepCtx<S> {
             local_workers.push(w);
         }
 
+        let mut slot_pools = SlotPool::new_for_workers(num_threads);
+
         let num_cores = crate::util::num_physical_cores_or(num_threads);
 
         let stealers = Arc::new(stealers);
         for (worker_id, local) in local_workers.into_iter().enumerate() {
             let ctx = ctx.clone();
             let stealers = stealers.clone();
+            let slot_pool = slot_pools.pop().unwrap();
 
             std::thread::spawn(move || {
                 crate::util::pin_thread_to_core(worker_id % num_cores);
@@ -120,6 +136,7 @@ impl<S: MatchSink + 'static> RawGrepCtx<S> {
                     ctx,
                     &stealers,
                     local,
+                    slot_pool
                 );
             });
         }
@@ -165,17 +182,22 @@ impl<S: MatchSink + 'static> RawGrepCtx<S> {
     }
 
     #[inline]
-    pub fn wait_and_save_cache(&mut self) -> (Stats, Option<CacheStats>) {
+    pub fn wait_and_save_cache(&mut self, config: &RawGrepConfig) -> (Stats, Option<CacheStats>) {
         let stats = self.wait();
 
-        self.save_cache();
+        self.save_cache(config);
 
         stats
     }
 
     #[inline]
-    pub fn save_cache(&mut self) {
+    pub fn save_cache(&mut self, config: &RawGrepConfig) {
         debug!("[ctx] trying to save cache..");
+
+        if !config.no_cache_write && !config.no_cache {
+            debug!("[ctx] cache is disabled, exiting..");
+            return;
+        }
 
         let mut guard = self.current_job.write();
 
@@ -212,7 +234,7 @@ impl<S: MatchSink + 'static> RawGrepCtx<S> {
     /// resolution) fails before any work starts.
     pub fn search(
         &self,
-        config: RawGrepConfig,
+        config: &RawGrepConfig,
         sink: S,
         inspect_before_search: impl FnOnce(&Path, &str, FsType, &str) // (search root, device, fs, pattern)
     ) -> Result<(), Error> {
@@ -377,22 +399,22 @@ fn worker_thread_main<S: MatchSink + 'static>(
     ctx:       RawGrepCtx<S>,
     stealers:  &[Stealer<WorkItem>],
     local:     DequeWorker<WorkItem>,
+    mut slot_pool: SlotPool
 ) {
     debug!("[ctx] worker {worker_id} started, waiting on condvar");
 
-    let output_buffer_arena = Bump::new();
-
     // Parser buffers are owned by the thread and reused across searches,
     // saving allocations on every search restart.
-    let mut parser                    = Parser::new(&output_buffer_arena);
+    let mut parser                    = Parser::new();
     let mut path_buf                  = Box::new(SmallPathBuf::new());
     let mut swap_path_buf             = Box::new(SmallPathBuf::new());
     let mut newlines_scratch          = Vec::new();
-    let mut ranges_scratch            = Vec::new();
-    let mut fragment_presence_scratch = Vec::new();
+    let mut ranges_scratch            = SmallVec::new();
+    let mut fragment_presence_scratch = SmallVec::new();
     let mut path_arena                = PathArena::new();
     let mut file_entries_arena        = FileEntryArena::new();
     let mut subdirs_arena             = SubdirsArena::new();
+    let mut output                    = slot_pool.acquire();
 
     let mut file_keys                 = Vec::new();
     let mut file_metas                = Vec::new();
@@ -431,6 +453,8 @@ fn worker_thread_main<S: MatchSink + 'static>(
 
         debug!("[ctx] worker {worker_id} got job device={:?}", job.device);
 
+        let cli = job.grepper.cli();
+
         //
         // Reset the buffers
         //
@@ -451,14 +475,18 @@ fn worker_thread_main<S: MatchSink + 'static>(
                 WorkerCtx {
                     worker_id,
                     cache:            $g.cache(),
+                    stdout_is_being_redirected_to_dev_null: ctx.stdout_is_being_redirected_to_dev_null,
                     fragment_hashes:  $g.fragment_hashes(),
                     fs:               $g.fs(),
                     matcher:          $g.matcher(),
+                    fragment_index:   $g.fragment_index(),
                     selected_fragment_hash_len: $g.selected_fragment_hash_len(),
                     cli:              $g.cli(),
+                    slot_pool:        &mut slot_pool,
                     sink:             $g.sink.clone(),
                     output_tx:        ctx.output_tx.clone(),
                     stats:            Default::default(),
+                    output,
                     parser,
                     path_buf,
                     subdirs_arena,
@@ -492,10 +520,11 @@ fn worker_thread_main<S: MatchSink + 'static>(
 
         debug!(
             "[ctx] worker {worker_id} search #{search_count} done - \
-             files_encountered={} files_searched={} files_with_matches={}",
+             files_encountered={} files_searched={} files_with_matches={} slot_pool_spill_count={}",
             result.stats.files_encountered,
             result.stats.files_searched,
             result.stats.files_contained_matches,
+            slot_pool.spill_count()
         );
 
         parser = result.parser;
@@ -507,19 +536,20 @@ fn worker_thread_main<S: MatchSink + 'static>(
         fragment_presence_scratch = result.fragment_presence_scratch;
         path_buf = result.path_buf;
         swap_path_buf = result.swap_path_buf;
+        output = result.output;
         result.stats.merge_into(&job.stats);
 
         // Deposit cache data
-        {
+        if !cli.no_cache_write && !cli.no_cache {
             let mut acc = job.cache_acc.lock();
             acc.file_keys.extend_from_slice(&result.file_keys);
             acc.file_metas.extend_from_slice(&result.file_metas);
             acc.fragment_presence.extend_from_slice(&result.fragment_presence.words);
-
-            file_keys = result.file_keys;
-            file_metas = result.file_metas;
-            fragment_presence = result.fragment_presence;
         }
+
+        file_keys = result.file_keys;
+        file_metas = result.file_metas;
+        fragment_presence = result.fragment_presence;
 
         {
             let (lock, cvar) = &*ctx.job_done;

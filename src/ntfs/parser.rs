@@ -88,24 +88,25 @@ impl RawFs for NtfsFs {
             return self.read_resident_data(parser, attr_slice, size_to_read, file_size, kind, check_binary);
         }
 
-        let Some(chunks) = self.collect_file_chunks(
+        if !self.collect_file_chunks(
             &mut parser.scratch,
             &mut parser.scratch2,
+            &mut parser.scratch_chunks,
             node,
             size_to_read,
             check_binary,
             buf
-        )? else {
+        )? {
             parser.get_buf_mut(kind).clear();
             return Ok(false); // binary
-        };
+        }
 
-        for (disk_offset, len) in &chunks {
-            let buf = parser.get_buf_mut(kind);
+        for &(disk_offset, len) in &parser.scratch_chunks {
+            let buf = Parser::get_buf_mut_impl(&mut parser.file, &mut parser.dir, &mut parser.gitignore, kind);
 
             let old_len = buf.len();
-            buf.resize(old_len + len, 0);
-            match self.read_at_offset(&mut buf[old_len..], *disk_offset) {
+            buf.resize(old_len + len as usize, 0);
+            match self.read_at_offset(&mut buf[old_len..], disk_offset) {
                 Ok(n)  => buf.truncate(old_len + n),
                 Err(_) => { buf.truncate(old_len); break; }
             }
@@ -119,11 +120,12 @@ impl RawFs for NtfsFs {
         &self,
         _scratch: &mut Vec<u8>,    // unused for NTFS cuz runlists are decoded inline
         _scratch2: &mut Vec<u8>,   // unused for NTFS cuz runlists are decoded inline
+        scratch_chunks: &mut Vec<(u64, u32)>,
         node: &NtfsNode,
         max_size: usize,
         check_binary: bool,
         buf: &mut Vec<u8>
-    ) -> io::Result<Option<SmallVec<[(u64, usize); 32]>>> {
+    ) -> io::Result<bool> {
         let _span = tracy::span!("NtfsFs::collect_file_chunks");
 
         let file_size = node.size as usize;
@@ -131,14 +133,14 @@ impl RawFs for NtfsFs {
 
         if node.is_dir() {
             // Directories are handled separately via `read_dir_linearised`
-            return Ok(Some(SmallVec::new()));
+            return Ok(true);
         }
 
         let mut record = vec![0u8; self.sb.mft_record_size as usize]; // @Heap
         self.read_mft_record(node.record_num, &mut record)?;
 
         let Some((is_resident, attr_slice)) = find_attribute(&record, NTFS_ATTR_DATA, None) else {
-            return Ok(Some(SmallVec::new())); // no $DATA, metadata-only or empty
+            return Ok(true); // no $DATA, metadata-only or empty
         };
 
         debug_assert!(!is_resident);
@@ -153,14 +155,15 @@ impl RawFs for NtfsFs {
 
             let n = self.read_at_offset(&mut probe, first.lcn * cluster_size).unwrap_or(0);
             if binary_probe(&probe[..n], file_size) {
-                return Ok(None);
+                return Ok(false);
             }
             buf.extend_from_slice(&probe[..n]);
             skip_first = n;
         }
 
-        let mut chunks = SmallVec::<[_; 32]>::new();
         let mut total = 0usize;
+
+        scratch_chunks.clear();
 
         for run in &runs {
             if total >= max_size { break; }
@@ -192,13 +195,15 @@ impl RawFs for NtfsFs {
                     if to_read == 0 { continue; }
                 }
 
-                chunks.push((disk_offset, to_read));
-                run_offset += to_read;
-                total      += to_read;
+                if to_read > 0 {
+                    crate::parser::push_chunk(scratch_chunks, disk_offset, to_read as _);
+                    run_offset += to_read;
+                    total      += to_read;
+                }
             }
         }
 
-        Ok(Some(chunks))
+        Ok(true)
     }
 
     #[inline]

@@ -8,9 +8,7 @@ use std::fs::File;
 use std::io;
 use std::ops::ControlFlow;
 
-use bumpalo::Bump;
 use smallvec::SmallVec;
-use bumpalo::collections::Vec as BumpVec;
 
 #[repr(u8)]
 #[derive(Copy, Clone)]
@@ -98,12 +96,13 @@ pub trait RawFs: Sync + Send {
         &self,
         _scratch: &mut Vec<u8>,
         _scratch2: &mut Vec<u8>,
+        _scratch_chunks: &mut Vec<(u64, u32)>,
         _node: &Self::Node,
         _max_size: usize,
         _check_binary: bool,
         _buf: &mut Vec<u8>
-    ) -> io::Result<Option<SmallVec<[(u64, usize); 32]>>> {
-        Ok(None)
+    ) -> io::Result<bool> {
+        Ok(false)
     }
 
     /// Iterate directory entries from buffer
@@ -123,7 +122,7 @@ pub struct DirScanResult<const N: usize = 64> {
 }
 
 /// Filesystem-agnostic parser with reusable buffers
-pub struct Parser<'a> {
+pub struct Parser {
     pub file:      Vec<u8>,                // 0
 
     // Filesystem-specific scratch space
@@ -134,24 +133,22 @@ pub struct Parser<'a> {
 
     pub dir:       Vec<u8>,                // 72
     pub gitignore: Vec<u8>,                // 96
-    pub output:    BumpVec<'a, u8>,        // 120
-
-    // =============== Cache line ======================
-
     pub chunk:     Vec<u8>,
+
+    pub scratch_chunks: Vec<(u64, u32)>,
 }
 
-impl<'a> Parser<'a> {
+impl Parser {
     #[inline(always)]
-    pub fn new(bump: &'a Bump) -> Self {
+    pub fn new() -> Self {
         Self {
             file: Vec::new(),
             dir: Vec::new(),
             gitignore: Vec::new(),
-            output: BumpVec::new_in(bump),
             scratch: Vec::new(),
+            scratch_chunks: Vec::new(),
             scratch2: Vec::new(),
-            chunk: Vec::new()
+            chunk: Vec::new(),
         }
     }
 
@@ -159,7 +156,6 @@ impl<'a> Parser<'a> {
     pub fn init(&mut self, config: &BufferConfig) {
         self.dir.reserve(config.dir_buf);
         self.file.reserve(config.file_buf);
-        self.output.reserve(config.output_buf);
         self.gitignore.reserve(config.gitignore_buf);
         self.scratch.reserve(config.extent_buf * 8); // extents are ~8 bytes each
     }
@@ -274,4 +270,24 @@ impl<'a> Parser<'a> {
 pub fn binary_probe(block: &[u8], file_size: usize) -> bool {
     let probe_size = file_size.min(BINARY_PROBE_BYTE_SIZE).min(block.len());
     is_binary_chunk(&block[..probe_size])
+}
+
+/// Appends a (disk_offset, len) chunk, merging with the previous chunk when
+/// it's exactly contiguous on disk.
+///
+/// Chunks are generated in strictly ascending disk-offset order per node,
+/// so only the tail entry is ever a merge candidate -- no need to scan or re-sort.
+#[inline]
+pub fn push_chunk(scratch_chunks: &mut Vec<(u64, u32)>, disk_offset: u64, len: u32) {
+    if len == 0 { return }
+
+    if let Some(last) = scratch_chunks.last_mut() {
+        let merged_len = last.1 as u64 + len as u64;
+        if last.0 + last.1 as u64 == disk_offset && merged_len <= crate::worker::STREAMING_CHUNK_SIZE as u64 {
+            last.1 = merged_len as u32;
+            return;
+        }
+    }
+
+    scratch_chunks.push((disk_offset, len));
 }
