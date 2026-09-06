@@ -83,17 +83,27 @@ impl FragmentLen {
 /// use a degenerate 1- or 2-byte window.
 pub const MIN_FRAGMENT_LEN: usize = 3;
 
+pub const FRAGMENT_HASH_MULTIPLIER: u32 = 0x9e3779b9;
+
 /// Hash a 4-byte fragment to u32. For fragments shorter than 4 bytes, the caller is expected
 /// to zero-pad the unused trailing bytes (see [`extract_pattern_fragments_with_fragment`]) so
 /// this always operates on a consistent 4-byte value.
 #[inline(always)]
 pub const fn hash_fragment(frag: [u8; 4]) -> u32 {
-    u32::from_le_bytes(frag).wrapping_mul(0x9e3779b9)
+    // SAFETY: 0x9e3779b9 is odd, so multiplication by it is a
+    // bijection on Z/2^32Z (odd constants are units mod 2^32). This means
+    // hash_fragment can NEVER produce a collision for distinct 4-byte inputs.
+    //
+    // FragmentCache relies on this: it treats hash equality as fragment
+    // identity (see find_fragment_index / add_fragment) with no fallback
+    // verification. If this constant is ever changed, it MUST remain odd,
+    // or FragmentCache's collision-free assumption breaks silently.
+    u32::from_le_bytes(frag).wrapping_mul(FRAGMENT_HASH_MULTIPLIER)
 }
 
 #[inline(always)]
 pub const fn hash_fragment_u32(frag: u32) -> u32 {
-    frag.wrapping_mul(0x9e3779b9)
+    frag.wrapping_mul(FRAGMENT_HASH_MULTIPLIER)
 }
 
 /// Byte mask that zeroes out everything past `fragment_len` bytes in a little-endian u32, so a

@@ -56,6 +56,7 @@ pub struct CacheStats {
     pub hits: u32,
     pub misses: u32,
     pub invalidations: u32,
+    pub dropped_at_capacity: u32,
 }
 
 #[derive(Debug, Default)]
@@ -63,6 +64,7 @@ pub struct AtomicCacheStats {
     pub hits: AtomicU32,
     pub misses: AtomicU32,
     pub invalidations: AtomicU32,
+    pub dropped_at_capacity: AtomicU32,
 }
 
 impl AtomicCacheStats {
@@ -71,6 +73,7 @@ impl AtomicCacheStats {
             hits: self.hits.load(Ordering::Relaxed),
             misses: self.misses.load(Ordering::Relaxed),
             invalidations: self.invalidations.load(Ordering::Relaxed),
+            dropped_at_capacity: self.dropped_at_capacity.load(Ordering::Relaxed),
         }
     }
 }
@@ -94,6 +97,10 @@ impl Display for CacheStats {
 
         if self.invalidations > 0 {
             writeln!(f, "  {:<25} {:>8}", "Invalidations", self.invalidations)?;
+        }
+
+        if self.dropped_at_capacity > 0 {
+            writeln!(f, "  Files dropped at capacity {:>8} -- These files will never be cached until max_files is increased", self.dropped_at_capacity)?;
         }
 
         Ok(())
@@ -1266,10 +1273,30 @@ impl<S: CacheStorage> FragmentCache<S> {
         // ------- Track the original num_files to know which files are new
         let original_num_files = self.num_files.load(Ordering::Relaxed) as usize;
 
+        //
+        // Guards against a single merge_updates() batch containing the same
+        // file_key twice. If that happens, the second occurrence's
+        // needs_full_reset pass would zero and clobber bits the first
+        // occurrence just wrote for fragments outside the current batch silently.
+        //
+        // Callers are expected to de-duplicate by file_key before calling merge_updates,
+        // which they don't right now... Not sure if this might actually happen.
+        //
+        #[cfg(debug_assertions)]
+        let mut seen_file_ids: std::collections::HashSet<usize> = std::collections::HashSet::with_capacity(file_keys.len());
+
+        let mut dropped = 0u32;
+
         for file_idx in 0..file_keys.len() {
             let num_files = self.num_files.load(Ordering::Relaxed) as usize;
             if num_files >= self.file_capacity {
-                break; // At capacity (will grow on next merge if more files)
+                //
+                // self.file_capacity is capped at self.max_files (see ensure_capacity),
+                // so once it's reached, every subsequent file in this batch, and every future
+                // merge_updates call, will drop new files the same way until max_files is raised.
+                //
+                dropped = (file_keys.len() - file_idx) as u32;
+                break;
             }
 
             let file_key = file_keys[file_idx];
@@ -1293,7 +1320,23 @@ impl<S: CacheStorage> FragmentCache<S> {
                 }
             };
 
+            #[cfg(debug_assertions)]
+            debug_assert!(
+                seen_file_ids.insert(file_id),
+                "merge_updates: file_id {} (file_key {:?}) appears more than once in a single batch; \
+                 second occurrence's bitset reset would clobber the first's bits for fragments \
+                 outside this batch. Caller must de-duplicate by file_key before calling merge_updates.",
+                file_id, file_key,
+            );
+
+
             // --------- Update metadata
+            //
+            // A meta mismatch means every previously-recorded bit for this file
+            // (including bits from fragments outside this batch) is now stale.
+            //
+            let old_meta = self.owned_file_metas.as_ref().unwrap()[file_id];
+            let meta_changed = !old_meta.matches(file_meta);
             self.owned_file_metas.as_mut().unwrap()[file_id] = file_meta;
 
             // --------- Add fragments and collect indices with their presence status
@@ -1308,9 +1351,19 @@ impl<S: CacheStorage> FragmentCache<S> {
                 fragment_data.push((frag_idx, is_present));
             }
 
-            // Track if this is a new file (needs bitset initialization)
-            let is_new = file_id >= original_num_files;
-            file_updates.push((file_id, fragment_data, is_new));
+            // Full row reset is needed for brand-new files AND for files whose
+            // content changed since we last saw them, not just new files.
+            let needs_full_reset = file_id >= original_num_files || meta_changed;
+            file_updates.push((file_id, fragment_data, needs_full_reset));
+        }
+
+        if dropped > 0 {
+            self.stats.dropped_at_capacity.fetch_add(dropped, Ordering::Relaxed);
+            eprintln!(
+                "FragmentCache dropped {} file(s), max_files ({}) reached; \
+                 these files will never be cached until max_files is increased",
+                dropped, self.max_files
+            );
         }
 
         //
@@ -1323,10 +1376,10 @@ impl<S: CacheStorage> FragmentCache<S> {
         let bits_per_file_u64 = num_fragments.div_ceil(64).max(1);
         let owned_file_bitsets = self.owned_file_bitsets.as_mut().unwrap();
 
-        for (file_id, fragment_data, is_new) in file_updates {
+        for (file_id, fragment_data, needs_full_reset) in file_updates {
             let offset = file_id * bits_per_file_u64;
 
-            if is_new {
+            if needs_full_reset {
                 for i in 0..bits_per_file_u64 {
                     let idx = offset + i;
                     if idx < owned_file_bitsets.len() {
@@ -1448,6 +1501,8 @@ impl<S: CacheStorage> FragmentCache<S> {
         let mask = self.file_lookup.len() - 1;
         let mut idx = (hash as usize) & mask;
 
+        // @Note: This might silently fail, which means this file will always
+        // miss the cache, maybe we should return like a boolean or something.
         for _ in 0..16 {
             let existing = self.file_lookup[idx].compare_exchange(
                 FILE_LOOKUP_EMPTY,
@@ -1457,7 +1512,7 @@ impl<S: CacheStorage> FragmentCache<S> {
             );
 
             if existing.is_ok() {
-                // successfully inserted
+                // Successfully inserted
                 return;
             }
 

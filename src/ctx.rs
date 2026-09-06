@@ -223,7 +223,7 @@ impl<S: MatchSink + 'static> RawGrepCtx<S> {
 
             debug!("[ctx] successfully saved cache");
         } else {
-            debug!("job.grepper.cache is None... (pattern < 4 bytes)");
+            debug!("job.grepper.cache is None... (pattern < 3 bytes)");
         }
     }
 
