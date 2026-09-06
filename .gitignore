@@ -4,3 +4,9 @@ linux-*
 /result/
 /.idea/
 /ntfs_test.img
+*.cpp
+*.svg
+*.json
+benchmark_*
+*benches
+*.new
