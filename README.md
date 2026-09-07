@@ -15,27 +15,13 @@ system: Intel i5-13400F, 16 threads, ext4 file system, NVMe SSD (Crucial P2 250G
 
 | scenario | rawgrep | ripgrep | speedup |
 |---|---|---|---|
-| warm cache + fragment cache | 214.8ms ± 2.4ms | 373.9ms ± 4.3ms | 1.74x |
-| cold cache + fragment cache | 3.492s ± 0.034s | 11.860s ± 0.069s | 3.40x |
-| cold cache, no fragment cache | 9.167s ± 0.132s | 11.885s ± 0.073s | 1.30x |
-| warm cache, no fragment cache | 652.5ms ± 3.7ms | 375.2ms ± 6.6ms | 0.58x (@Incomplete, slower) |
+| warm cache + fragment cache | 233.4ms ± 10.9ms | 359.6ms ± 3.6ms | 1.54x |
+| warm cache + fragment cache, no gitignore | 204.0ms ± 9.3ms | 347.6ms ± 5.4ms | 1.70x |
+| warm cache, no fragment cache | 696.7ms ± 7.9ms | 361.4ms ± 6.5ms | 0.52x (@Incomplete, slower) |
+| cold cache, no fragment cache | 9.499s ± 0.089s | 11.907s ± 0.091s | 1.25x |
+| cold cache + fragment cache | 3.453s ± 0.020s | 11.926s ± 0.142s | 3.45x |
 
 With *fragment cache* -- rawgrep's intended mode -- it's fast, anywhere from 1.5x to ~60x faster than ripgrep. The larger the corpus, the more of an advantage rawgrep tends to have relative to ripgrep. Using *fragment cache* rawgrep is doing much less I/O, which means it can stay in the page cache on much larger corpora, while ripgrep can't. That's what behind the 60x number -- the corpus used for that benchmark is my 1.27M-file home directory.
-
-### Correctness notes
-
-`rawgrep` and `ripgrep` differ in which files they search by design:
-
-| | count |
-|---|---|
-| files matched by ripgrep only | 60 |
-| files matched by rawgrep only | 257 |
-
-**files ripgrep found that rawgrep missed:** mostly `.github/` yaml files, python venv files,
-and large test data files. these are gitignore/binary detection policy differences rather than missed matches.
-
-**files rawgrep found that ripgrep missed:** `.recording` files and other files ripgrep
-treats as binary. rawgrep searches these by default.
 
 ## How is `rawgrep` so fast?
 
@@ -192,7 +178,7 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 
 ## Roadmap
 
-- [ ] Support for Windows. (Some physical partition stuff needs to get fixed on Windows, besides that everything should be already working)
+- [ ] Support for Windows. (Some physical partition reading/parsing stuff needs to get redesigned for Windows, besides that the NTFS parser is already working, although it's nearly not as optimized as the ext4 parser)
 - [ ] Support for OSX+APFS.
 - [ ] Symlink support
 
