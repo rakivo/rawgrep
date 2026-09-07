@@ -232,8 +232,8 @@ impl Parser {
         DirScanResult {
             file_count,
             dir_count,
+            entries_start,
             entries_end: entries_arena.len(),
-            entries_start: entries_start
         }
     }
 

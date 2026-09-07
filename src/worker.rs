@@ -341,6 +341,7 @@ impl OutputWorker {
     }
 
     #[cfg(target_os = "linux")]
+    #[allow(clippy::manual_unwrap_or_default, clippy::manual_unwrap_or)]
     fn flush_batch_pipe(&mut self) -> io::Result<()> {
         if self.batch.is_empty() { return Ok(()); }
 
@@ -1194,6 +1195,7 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, '_, F, S> {
     }
 
     #[inline(never)]
+    #[allow(clippy::uninit_vec)]
     fn process_file_streaming(
         &mut self,
         node: &F::Node,

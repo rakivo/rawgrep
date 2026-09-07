@@ -137,6 +137,7 @@ impl RawFs for Ext4Fs {
     }
 
     #[inline]
+    #[allow(clippy::uninit_vec)]
     fn read_file_content(
         &self,
         parser: &mut Parser,
@@ -191,6 +192,7 @@ impl RawFs for Ext4Fs {
         Ok(true)
     }
 
+    #[allow(clippy::uninit_vec)]
     fn collect_file_chunks(
         &self,
         scratch: &mut Vec<u8>,
