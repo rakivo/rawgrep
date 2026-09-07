@@ -279,9 +279,7 @@ use std::sync::atomic::AtomicUsize;
 static CURSOR_HIDDEN_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Clone)]
-pub struct CursorHide {
-    active: bool,
-}
+pub struct CursorHide;
 
 impl CursorHide {
     #[inline]
@@ -294,17 +292,13 @@ impl CursorHide {
             out.flush()?;
         }
 
-        Ok(CursorHide { active: true })
+        Ok(CursorHide)
     }
 }
 
 impl Drop for CursorHide {
     #[inline]
     fn drop(&mut self) {
-        if !self.active {
-            return;
-        }
-
         // fetch_sub returns the PREVIOUS value; if it was 1, we just brought
         // it to 0, so we're the last handle out and should restore the cursor.
         if CURSOR_HIDDEN_COUNT.fetch_sub(1, Ordering::AcqRel) == 1 {
