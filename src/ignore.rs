@@ -934,7 +934,7 @@ mod chain_tests {
         let chain = GitignoreChain::from_root(root);
 
         let sub = Gitignore::from_bytes(b"*.tmp\n");
-        let chain = chain.with_gitignore(1, sub);
+        let chain = chain.with_gitignore(1, 0, sub);
 
         // Both patterns should match
         assert!(chain.is_ignored(b"test.log", false));
@@ -948,10 +948,10 @@ mod chain_tests {
         let chain = GitignoreChain::from_root(root);
 
         let depth1 = Gitignore::from_bytes(b"*.tmp\n");
-        let chain = chain.with_gitignore(1, depth1);
+        let chain = chain.with_gitignore(1, 0, depth1);
 
         let depth2 = Gitignore::from_bytes(b"*.bak\n");
-        let chain = chain.with_gitignore(2, depth2);
+        let chain = chain.with_gitignore(2, 0, depth2);
 
         // All three patterns should match
         assert!(chain.is_ignored(b"test.log", false));
@@ -966,14 +966,14 @@ mod chain_tests {
         let chain = GitignoreChain::from_root(root);
 
         let depth2 = Gitignore::from_bytes(b"*.tmp\n");
-        let chain = chain.with_gitignore(2, depth2);
+        let chain = chain.with_gitignore(2, 0, depth2);
 
         let depth3 = Gitignore::from_bytes(b"*.bak\n");
-        let chain = chain.with_gitignore(3, depth3);
+        let chain = chain.with_gitignore(3, 0, depth3);
 
         // Now add at depth 1 - should prune depth 2 and 3
         let depth1_new = Gitignore::from_bytes(b"*.cache\n");
-        let chain = chain.with_gitignore(1, depth1_new);
+        let chain = chain.with_gitignore(1, 0, depth1_new);
 
         // Root (depth 0) and new depth 1 should remain
         assert!(chain.is_ignored(b"test.log", false));    // depth 0
@@ -990,11 +990,11 @@ mod chain_tests {
         let chain = GitignoreChain::from_root(root);
 
         let first = Gitignore::from_bytes(b"*.tmp\n");
-        let chain = chain.with_gitignore(1, first);
+        let chain = chain.with_gitignore(1, 0, first);
 
         // Add another at same depth - first one should be pruned
         let second = Gitignore::from_bytes(b"*.bak\n");
-        let chain = chain.with_gitignore(1, second);
+        let chain = chain.with_gitignore(1, 0, second);
 
         assert!(chain.is_ignored(b"test.log", false));   // root remains
         assert!(chain.is_ignored(b"test.bak", false));   // new depth 1
@@ -1011,11 +1011,11 @@ mod chain_tests {
         let chain = GitignoreChain::from_root(root);
 
         let depth1 = Gitignore::from_bytes(b"*.tmp\n");
-        let chain = chain.with_gitignore(1, depth1);
+        let chain = chain.with_gitignore(1, 0, depth1);
 
         // Add at deeper depth - shouldn't prune anything
         let depth5 = Gitignore::from_bytes(b"*.bak\n");
-        let chain = chain.with_gitignore(5, depth5);
+        let chain = chain.with_gitignore(5, 0, depth5);
 
         assert!(chain.is_ignored(b"test.log", false));
         assert!(chain.is_ignored(b"test.tmp", false));
@@ -1044,7 +1044,7 @@ mod chain_tests {
 
         // Subdirectory negates important.log
         let sub = Gitignore::from_bytes(b"!important.log\n");
-        let chain = chain.with_gitignore(1, sub);
+        let chain = chain.with_gitignore(1, 0, sub);
 
         assert!(chain.is_ignored(b"test.log", false));
         assert!(chain.is_ignored(b"debug.log", false));
@@ -1057,11 +1057,11 @@ mod chain_tests {
         let chain = GitignoreChain::from_root(root);
 
         let depth1 = Gitignore::from_bytes(b"!important.log\n");
-        let chain = chain.with_gitignore(1, depth1);
+        let chain = chain.with_gitignore(1, 0, depth1);
 
         // Re-ignore at deeper level
         let depth2 = Gitignore::from_bytes(b"important.log\n");
-        let chain = chain.with_gitignore(2, depth2);
+        let chain = chain.with_gitignore(2, 0, depth2);
 
         // Last match wins
         assert!(chain.is_ignored(b"important.log", false));
@@ -1074,7 +1074,7 @@ mod chain_tests {
         let chain = GitignoreChain::from_root(root);
 
         let sub = Gitignore::from_bytes(b"node_modules\n");
-        let chain = chain.with_gitignore(1, sub);
+        let chain = chain.with_gitignore(1, 0, sub);
 
         // Both should match
         assert!(chain.is_ignored(b"target", true));
@@ -1091,7 +1091,7 @@ mod chain_tests {
 
         // This gitignore has negation
         let sub = Gitignore::from_bytes(b"!readme.txt\n*.md\n");
-        let chain = chain.with_gitignore(1, sub);
+        let chain = chain.with_gitignore(1, 0, sub);
 
         assert!(chain.is_ignored(b"test.txt", false));
         assert!(!chain.is_ignored(b"readme.txt", false));  // Negated
@@ -1123,7 +1123,7 @@ mod chain_tests {
         let chain = GitignoreChain::from_root(root);
 
         // No other references - should mutate in place (COW)
-        let chain = chain.with_gitignore(1, Gitignore::from_bytes(b"*.tmp\n"));
+        let chain = chain.with_gitignore(1, 0, Gitignore::from_bytes(b"*.tmp\n"));
 
         assert!(chain.is_ignored(b"test.log", false));
         assert!(chain.is_ignored(b"test.tmp", false));
@@ -1138,7 +1138,7 @@ mod chain_tests {
         let chain_clone = chain.clone();
 
         // This should clone the stack (COW)
-        let chain_modified = chain.with_gitignore(1, Gitignore::from_bytes(b"*.tmp\n"));
+        let chain_modified = chain.with_gitignore(1, 0, Gitignore::from_bytes(b"*.tmp\n"));
 
         // Original clone unchanged
         assert!(chain_clone.is_ignored(b"test.log", false));
@@ -1169,7 +1169,7 @@ node_modules/
 generated/
 *.generated.rs
 ");
-        let chain = chain.with_gitignore(1, src);
+        let chain = chain.with_gitignore(1, 0, src);
 
         // src/tests/.gitignore
         let tests = Gitignore::from_bytes(b"
@@ -1177,7 +1177,7 @@ fixtures/
 *.snapshot
 !important.snapshot
 ");
-        let chain = chain.with_gitignore(2, tests);
+        let chain = chain.with_gitignore(2, 0, tests);
 
         // Test root patterns
         assert!(chain.is_ignored(b"target", true));
@@ -1215,7 +1215,7 @@ dist/
 node_modules/
 .next/
 ");
-        let frontend_chain = chain.clone().with_gitignore(2, frontend);
+        let frontend_chain = chain.clone().with_gitignore(2, 0, frontend);
 
         // packages/backend
         let backend = Gitignore::from_bytes(b"
@@ -1223,7 +1223,7 @@ target/
 *.pyc
 __pycache__/
 ");
-        let backend_chain = chain.clone().with_gitignore(2, backend);
+        let backend_chain = chain.clone().with_gitignore(2, 0, backend);
 
         // Frontend chain
         assert!(frontend_chain.is_ignored(b"dist", true));
@@ -1248,11 +1248,11 @@ __pycache__/
     fn test_chain_deep_nesting() {
         let chain = GitignoreChain::from_root(Gitignore::from_bytes(b"*.log\n"));
 
-        let chain = chain.with_gitignore(1, Gitignore::from_bytes(b"*.tmp\n"));
-        let chain = chain.with_gitignore(2, Gitignore::from_bytes(b"*.bak\n"));
-        let chain = chain.with_gitignore(3, Gitignore::from_bytes(b"*.old\n"));
-        let chain = chain.with_gitignore(4, Gitignore::from_bytes(b"*.cache\n"));
-        let chain = chain.with_gitignore(5, Gitignore::from_bytes(b"*.swp\n"));
+        let chain = chain.with_gitignore(1, 0, Gitignore::from_bytes(b"*.tmp\n"));
+        let chain = chain.with_gitignore(2, 0, Gitignore::from_bytes(b"*.bak\n"));
+        let chain = chain.with_gitignore(3, 0, Gitignore::from_bytes(b"*.old\n"));
+        let chain = chain.with_gitignore(4, 0, Gitignore::from_bytes(b"*.cache\n"));
+        let chain = chain.with_gitignore(5, 0, Gitignore::from_bytes(b"*.swp\n"));
 
         assert!(chain.is_ignored(b"test.log", false));
         assert!(chain.is_ignored(b"test.tmp", false));
@@ -1274,15 +1274,15 @@ __pycache__/
 
         // Enter src/lib/ (has .gitignore)
         let lib_gi = Gitignore::from_bytes(b"generated/\n");
-        let chain_lib = chain_src.clone().with_gitignore(2, lib_gi);
+        let chain_lib = chain_src.clone().with_gitignore(2, 0, lib_gi);
 
         // Enter src/lib/utils/ (has .gitignore)
         let utils_gi = Gitignore::from_bytes(b"*.generated.rs\n");
-        let chain_utils = chain_lib.clone().with_gitignore(3, utils_gi);
+        let chain_utils = chain_lib.clone().with_gitignore(3, 0, utils_gi);
 
         // Now go back up to src/tests/ (should NOT have lib's patterns)
         let tests_gi = Gitignore::from_bytes(b"fixtures/\n");
-        let chain_tests = chain_src.clone().with_gitignore(2, tests_gi);
+        let chain_tests = chain_src.clone().with_gitignore(2, 0, tests_gi);
 
         // chain_utils has: root + lib + utils
         assert!(chain_utils.is_ignored(b"target", true));
@@ -1324,7 +1324,7 @@ __pycache__/
         let chain = GitignoreChain::default();
 
         let gi = Gitignore::from_bytes(b"*.log\n");
-        let chain = chain.with_gitignore(5, gi);
+        let chain = chain.with_gitignore(5, 0, gi);
 
         assert!(!chain.is_empty());
         assert!(chain.is_ignored(b"test.log", false));
@@ -1335,7 +1335,7 @@ __pycache__/
         let chain = GitignoreChain::default();
 
         let gi = Gitignore::from_bytes(b"*.log\n");
-        let chain = chain.with_gitignore(0, gi);
+        let chain = chain.with_gitignore(0, 0, gi);
 
         assert!(chain.is_ignored(b"test.log", false));
     }
@@ -1345,7 +1345,7 @@ __pycache__/
         let chain = GitignoreChain::default();
 
         let gi = Gitignore::from_bytes(b"*.log\n");
-        let chain = chain.with_gitignore(u16::MAX, gi);
+        let chain = chain.with_gitignore(u16::MAX, 0, gi);
 
         assert!(chain.is_ignored(b"test.log", false));
     }
@@ -1405,7 +1405,7 @@ __pycache__/
         for i in 0..100u16 {
             let pattern = format!("pattern{}.txt\n", i);
             let gi = Gitignore::from_bytes(pattern.as_bytes());
-            chain = chain.with_gitignore(i, gi);
+            chain = chain.with_gitignore(i, 0, gi);
         }
 
         assert!(chain.is_ignored(b"pattern0.txt", false));
@@ -1448,7 +1448,7 @@ __pycache__/
         let mut chains = Vec::new();
         for i in 0..10u16 {
             let gi = Gitignore::from_bytes(format!("dir{}/\n", i).as_bytes());
-            chains.push(chain.clone().with_gitignore(i + 1, gi));
+            chains.push(chain.clone().with_gitignore(i + 1, 0, gi));
         }
 
         // Each chain should have root + its own pattern
