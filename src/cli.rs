@@ -64,10 +64,18 @@ pub struct Cli {
     #[bpaf(long)]
     pub binary: bool,
 
+    /// Search files and directories that start with "." (dont's skip them)
+    #[bpaf(long)]
+    pub hidden: bool,
+
     /// Search large files and large directories (don't skip them)
     /// Default FILE_MAX_SIZE is 8 MB and DIRECTORY_MAX_SIZE is 16 MB
     #[bpaf(long)]
     pub large: bool,
+
+    /// Search directories usually reserved by tools, i.e. /node_modules, /__py_cache__, etc (Don't skip them)
+    #[bpaf(long)]
+    pub reserved_tool_dirs: bool,
 
     /// Disable all filtering (search everything)
     ///
@@ -145,6 +153,12 @@ impl Cli {
     #[inline(always)]
     pub const fn should_ignore_size_filter(&self) -> bool {
         self.unrestricted >= 1 || self.large || self.all
+    }
+
+    /// Returns true if should search directories reserved by tools (See is_reserved_tool_dir)
+    #[inline(always)]
+    pub const fn should_ignore_reserved_tool_dir_filter(&self) -> bool {
+        self.unrestricted >= 1 || self.reserved_tool_dirs
     }
 
     /// Returns true if .gitignore files should be ignored

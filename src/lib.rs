@@ -35,10 +35,12 @@ pub mod binary;
 pub mod matcher;
 pub mod path_buf;
 pub mod cache;
+pub mod pacer;
 pub mod fragments;
 pub mod platform;
 pub mod slab;
 pub mod thin_path_arc;
+pub mod liner;
 
 #[cfg(feature = "small")]
 pub(crate) extern crate regex_tiny as regex;
@@ -101,8 +103,10 @@ pub struct RawGrepConfig {
     pub no_ignore:    bool,
     pub binary:       bool,
     pub large:        bool,
+    pub should_ignore_reserved_tool_dir_filter: bool,
     pub all:          bool,
     pub unrestricted: u8,
+    pub hidden:       bool,
 
     // ---- output ---------------------------------------------------------
     pub no_color:       bool,
@@ -130,6 +134,7 @@ impl RawGrepConfig {
             pattern:          pattern.into(),
             search_root_path: search_root_path.into(),
             device:           None,
+            hidden:           false,
             no_ignore:        false,
             binary:           false,
             large:            false,
@@ -140,6 +145,7 @@ impl RawGrepConfig {
             jump:             false,
             stats:            false,
             force_literal:    false,
+            should_ignore_reserved_tool_dir_filter: false,
             threads:          std::thread::available_parallelism()
                                   .unwrap_or(unsafe { NonZeroUsize::new_unchecked(1) }),
             no_cache:         false,
@@ -157,6 +163,7 @@ impl RawGrepConfig {
     pub fn binary(mut self)                             -> Self { self.binary        = true;       self }
     pub fn no_ignore(mut self)                          -> Self { self.no_ignore     = true;       self }
     pub fn large(mut self)                              -> Self { self.large         = true;       self }
+    pub fn should_ignore_reserved_tool_dir_filter(mut self)-> Self { self.should_ignore_reserved_tool_dir_filter = true; self }
     pub fn force_literal(mut self)                      -> Self { self.force_literal = true;       self }
     pub fn no_cache(mut self)                           -> Self { self.no_cache      = true;       self }
     pub fn no_cache_write(mut self)                     -> Self { self.no_cache_write= true;       self }
@@ -169,12 +176,14 @@ impl RawGrepConfig {
     #[inline]
     pub fn from_cli(c: cli::Cli) -> Self {
         RawGrepConfig {
+            should_ignore_reserved_tool_dir_filter: c.should_ignore_reserved_tool_dir_filter(),
             pattern:          c.pattern.into_boxed_str(),
             search_root_path: c.search_root_path.into_boxed_str(),
             device:           c.device.map(Into::into),
             no_ignore:        c.no_ignore,
             binary:           c.binary,
             large:            c.large,
+            hidden:           c.hidden,
             all:              c.all,
             no_cache_write:   c.no_cache_write,
             unrestricted:     c.unrestricted,
@@ -193,7 +202,9 @@ impl RawGrepConfig {
     #[inline]
     pub fn to_cli(&self) -> cli::Cli {
         cli::Cli {
+            hidden: self.hidden,
             no_cache_write:   self.no_cache_write,
+            reserved_tool_dirs: self.should_ignore_reserved_tool_dir_filter,
             pattern:          self.pattern.clone().into_string(),
             search_root_path: self.search_root_path.clone().into_string(),
             device:           self.device.clone().map(String::from),

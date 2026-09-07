@@ -1,7 +1,7 @@
 //! ext4 filesystem implementation of RawFs trait
 
 use crate::tracy;
-use crate::util::{likely, unlikely};
+use crate::util::{likely, unlikely, read_u16_unaligned_le, read_u32_unaligned_le};
 use crate::parser::{BufFatPtr, BufKind, FileId, FileNode, FileType, Parser, RawFs, binary_probe};
 use crate::worker::STREAMING_CHUNK_SIZE;
 
@@ -19,6 +19,7 @@ pub struct Ext4Fs {
     pub sb: Ext4SuperBlock,
     pub device_id: u64,
     pub max_block: u64,
+    pub dont_skip_dot_entries: bool,
     pub inode_table_blocks: Vec<u64>,
 }
 
@@ -174,7 +175,12 @@ impl RawFs for Ext4Fs {
             let buf = Parser::get_buf_mut_impl(&mut parser.file, &mut parser.dir, &mut parser.gitignore, kind);
 
             let old_len = buf.len();
-            buf.resize(old_len + len as usize, 0);
+            let new_len = old_len + len as usize;
+
+            buf.clear();
+            buf.reserve(new_len);
+            unsafe { buf.set_len(new_len); }  // @ProbablySafe...
+
             match self.read_at_offset(&mut buf[old_len..], disk_offset) {
                 Ok(n) => buf.truncate(old_len + n),
                 Err(_) => { buf.truncate(old_len); break; }
@@ -226,13 +232,14 @@ impl RawFs for Ext4Fs {
 
                 let probe_len = (block_size as usize).min(max_size);
                 scratch2.clear();
-                scratch2.resize(probe_len, 0);
+                scratch2.reserve(probe_len);
+                unsafe { scratch2.set_len(probe_len); }  // @ProbablySafe...
 
                 let offset = first.start * block_size;
                 match self.read_at_offset(scratch2, offset) {
                     Ok(n) => {
                         if binary_probe(&scratch2[..n], file_size) {
-                            return Ok(false);                    // binary
+                            return Ok(false);  // binary
                         }
 
                         buf.extend_from_slice(&scratch2[..n]);
@@ -297,7 +304,8 @@ impl RawFs for Ext4Fs {
 
                 let probe_len = (block_size as usize).min(max_size);
                 scratch2.clear();
-                scratch2.resize(probe_len, 0);
+                scratch2.reserve(probe_len);
+                unsafe { scratch2.set_len(probe_len); }  // @ProbablySafe...
 
                 //
                 // A failed probe read here is treated as "read nothing",
@@ -391,6 +399,13 @@ impl RawFs for Ext4Fs {
         }
 
         None
+    }
+
+    #[inline]
+    fn directory_entry_count_hint(&self, buf: &[u8]) -> usize {
+        // 8-byte fixed header + 1-byte name, rounded up to ext4's 4-byte rec_len alignment.
+        const MIN_ENTRY: usize = 12;
+        buf.len() / MIN_ENTRY
     }
 }
 
@@ -506,16 +521,16 @@ impl Ext4Fs {
         // of `data` irrelevant, so a stack allocated `probe` array
         // (1 byte aligned) is fine here.
         //
-        let eh_magic   = unsafe { read_u16_unaligned_le(data, 0) };
-        let eh_entries = unsafe { read_u16_unaligned_le(data, 2) };
-        let eh_depth   = unsafe { read_u16_unaligned_le(data, 6) };
+        let eh_magic   = read_u16_unaligned_le(data, 0);
+        let eh_entries = read_u16_unaligned_le(data, 2);
+        let eh_depth   = read_u16_unaligned_le(data, 6);
 
         if unlikely(u16::from_le(eh_magic) != EXT4_EXTENT_MAGIC) {
             return Ok(());
         }
 
         if eh_depth == 0 {
-            let extent_size = mem::size_of::<raw::Ext4Extent>();
+            let extent_size   = mem::size_of::<raw::Ext4Extent>();
             let extents_start = mem::size_of::<raw::Ext4ExtentHeader>();
 
             for i in 0..eh_entries as usize {
@@ -524,9 +539,9 @@ impl Ext4Fs {
                     break;
                 }
 
-                let ee_len      = unsafe { read_u16_unaligned_le(data, offset + 4) };
-                let ee_start_hi = unsafe { read_u16_unaligned_le(data, offset + 6) };
-                let ee_start_lo = unsafe { read_u32_unaligned_le(data, offset + 8) };
+                let ee_len      = read_u16_unaligned_le(data, offset + 4);
+                let ee_start_hi = read_u16_unaligned_le(data, offset + 6);
+                let ee_start_lo = read_u32_unaligned_le(data, offset + 8);
 
                 let start_block = ((ee_start_hi as u64) << 32) | (ee_start_lo as u64);
 
@@ -543,17 +558,17 @@ impl Ext4Fs {
         } else {
             let mut child_blocks = SmallVec::<[u64; 16]>::new(); // @Memory @Speed...?
 
-            let index_size    = mem::size_of::<raw::Ext4ExtentIdx>();
-            let indices_start = mem::size_of::<raw::Ext4ExtentHeader>();
+            const INDEX_SIZE:    usize = mem::size_of::<raw::Ext4ExtentIdx>();
+            const INDICES_START: usize = mem::size_of::<raw::Ext4ExtentHeader>();
 
             for i in 0..eh_entries as usize {
-                let offset = indices_start + i * index_size;
-                if unlikely(offset + index_size > data.len()) {
+                let offset = INDICES_START + i * INDEX_SIZE;
+                if unlikely(offset + INDEX_SIZE > data.len()) {
                     break;
                 }
 
-                let ei_leaf_lo = unsafe { read_u32_unaligned_le(data, offset + 4) };
-                let ei_leaf_hi = unsafe { read_u16_unaligned_le(data, offset + 8) };
+                let ei_leaf_lo = read_u32_unaligned_le(data, offset + 4);
+                let ei_leaf_hi = read_u16_unaligned_le(data, offset + 8);
 
                 let leaf_block = ((ei_leaf_hi as u64) << 32) | (ei_leaf_lo as u64);
                 child_blocks.push(leaf_block);
@@ -572,14 +587,4 @@ impl Ext4Fs {
 
         Ok(())
     }
-}
-
-#[inline(always)]
-unsafe fn read_u16_unaligned_le(data: &[u8], offset: usize) -> u16 {
-    unsafe { (data.as_ptr().add(offset) as *const u16).read_unaligned().to_le() }
-}
-
-#[inline(always)]
-unsafe fn read_u32_unaligned_le(data: &[u8], offset: usize) -> u32 {
-    unsafe { (data.as_ptr().add(offset) as *const u32).read_unaligned().to_le() }
 }

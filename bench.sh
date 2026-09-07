@@ -88,8 +88,8 @@ echo "kernel:  $(uname -r)" | tee -a "$RESULTS_DIR/system.txt"
 echo "rawgrep: $(rawgrep --version 2>/dev/null || echo unknown)" | tee -a "$RESULTS_DIR/system.txt"
 echo "ripgrep: $(rg --version | head -1)" | tee -a "$RESULTS_DIR/system.txt"
 
-CMD_RAWGREP="rawgrep '$PATTERN' '$SEARCH_DIR' --jump --no-color --threads $THREADS"
-CMD_RAWGREP_NOCACHE="rawgrep '$PATTERN' '$SEARCH_DIR' --jump --no-color --threads $THREADS --no-cache --no-cache-write"
+CMD_RAWGREP="rawgrep '$PATTERN' '$SEARCH_DIR' --jump --no-color --reserved-tool-dirs --large --threads $THREADS"
+CMD_RAWGREP_NOCACHE="rawgrep '$PATTERN' '$SEARCH_DIR' --jump --no-color --threads $THREADS --reserved-tool-dirs --large --no-cache --no-cache-write"
 CMD_RG="rg '$PATTERN' '$SEARCH_DIR' --no-heading --color=never -n --threads $THREADS"
 
 # Correctness check
@@ -97,22 +97,32 @@ CMD_RG="rg '$PATTERN' '$SEARCH_DIR' --no-heading --color=never -n --threads $THR
 echo ""
 echo "=== correctness check ===" | tee "$RESULTS_DIR/correctness.txt"
 
+# Strip ANSI codes, carriage returns, trailing/leading spaces, and empty lines
 eval "$CMD_RAWGREP_NOCACHE" 2>/dev/null \
     | tr -d '\r' \
+    | sed -E 's/\x1B\[[0-9;]*[a-zA-R]//g' \
     | sed 's/:\([0-9]*\): /:\1:/' \
+    | sed 's/[[:space:]]*$//' \
+    | grep -v '^$' \
     | LC_ALL=C sort > /tmp/bench_rawgrep.txt
 
 eval "$CMD_RG" 2>/dev/null \
     | tr -d '\r' \
+    | sed -E 's/\x1B\[[0-9;]*[a-zA-R]//g' \
+    | sed 's/[[:space:]]*$//' \
+    | grep -v '^$' \
     | LC_ALL=C sort > /tmp/bench_rg.txt
 
-cut -d: -f1 /tmp/bench_rawgrep.txt | LC_ALL=C sort -u > /tmp/bench_files_rawgrep.txt
-cut -d: -f1 /tmp/bench_rg.txt | LC_ALL=C sort -u > /tmp/bench_files_rg.txt
+cut -d: -f1 /tmp/bench_rawgrep.txt | grep -v '^$' | LC_ALL=C sort -u > /tmp/bench_files_rawgrep.txt
+cut -d: -f1 /tmp/bench_rg.txt | grep -v '^$' | LC_ALL=C sort -u > /tmp/bench_files_rg.txt
 
-MISSED_LINES=$(LC_ALL=C comm -23 /tmp/bench_rawgrep.txt /tmp/bench_rg.txt | wc -l)
-EXTRA_LINES=$(LC_ALL=C comm -13 /tmp/bench_rawgrep.txt /tmp/bench_rg.txt | wc -l)
-MISSED_FILES=$(LC_ALL=C comm -23 /tmp/bench_files_rawgrep.txt /tmp/bench_files_rg.txt | wc -l)
-EXTRA_FILES=$(LC_ALL=C comm -13 /tmp/bench_files_rawgrep.txt /tmp/bench_files_rg.txt | wc -l)
+# File 1 = rg, File 2 = rawgrep across all comparisons
+# comm -23 file1 file2 -> items in file1 (rg) but NOT file2 (rawgrep)
+# comm -13 file1 file2 -> items in file2 (rawgrep) but NOT file1 (rg)
+MISSED_LINES=$(LC_ALL=C comm -23 /tmp/bench_rg.txt /tmp/bench_rawgrep.txt | wc -l)
+EXTRA_LINES=$(LC_ALL=C comm -13 /tmp/bench_rg.txt /tmp/bench_rawgrep.txt | wc -l)
+MISSED_FILES=$(LC_ALL=C comm -23 /tmp/bench_files_rg.txt /tmp/bench_files_rawgrep.txt | wc -l)
+EXTRA_FILES=$(LC_ALL=C comm -13 /tmp/bench_files_rg.txt /tmp/bench_files_rawgrep.txt | wc -l)
 
 {
     echo "line-level diff:"
@@ -145,6 +155,22 @@ hyperfine \
     --export-markdown "$RESULTS_DIR/warm_with_cache.md" \
     --command-name "rawgrep" "$CMD_RAWGREP" \
     --command-name "ripgrep" "$CMD_RG"
+
+# Warm cache - with fragment cache - no gitignore
+
+echo ""
+echo "=== warm cache + fragment cache + no gitignore ==="
+
+eval "$CMD_RAWGREP" > /dev/null 2>&1 || true
+eval "$CMD_RG" > /dev/null 2>&1 || true
+
+hyperfine \
+    --warmup "$WARMUP" \
+    --runs "$WARM_RUNS" \
+    --export-json "$RESULTS_DIR/warm_with_cache_no_gitignore.json" \
+    --export-markdown "$RESULTS_DIR/warm_with_cache_no_gitignore.md" \
+    --command-name "rawgrep" "$CMD_RAWGREP --no-ignore" \
+    --command-name "ripgrep" "$CMD_RG --no-ignore"
 
 # Warm cache - no fragment cache
 
@@ -198,6 +224,9 @@ echo "========================================"
 echo ""
 echo "warm cache + fragment cache:"
 cat "$RESULTS_DIR/warm_with_cache.md"
+echo ""
+echo "warm cache + fragment cache + no gitignore"
+cat "$RESULTS_DIR/warm_with_cache_no_gitignore.md"
 echo ""
 echo "warm cache, no fragment cache:"
 cat "$RESULTS_DIR/warm_no_cache.md"

@@ -83,7 +83,7 @@ impl<F: RawFs, S: MatchSink> RawGrepper<F, S> {
             return Ok(self.fs.root_id());
         }
 
-        let mut parser = Parser::new();
+        let mut parser = Parser::new(false);
         let mut file_id = self.fs.root_id();
 
         for part in path.split(MAIN_SEPARATOR).filter(|p| !p.is_empty()) {
@@ -170,7 +170,7 @@ impl<S: MatchSink> RawGrepper<Ext4Fs, S> {
             inode_table_blocks.push(inode_table_block as u64);
         }
 
-        let fs = Ext4Fs { sb, device_id, max_block, file, inode_table_blocks };
+        let fs = Ext4Fs { sb, device_id, max_block, file, inode_table_blocks, dont_skip_dot_entries: cli.hidden };
         Self::new_with_fs(cli, fs, sink).map(AnyGrepper::Ext4)
     }
 }
@@ -211,7 +211,7 @@ impl<S: MatchSink> RawGrepper<NtfsFs, S> {
         }
 
         let device_id = device_id(&file)?;
-        let fs = NtfsFs::new(file, device_id)?;
+        let fs = NtfsFs::new(file, device_id, cli)?;
         Self::new_with_fs(cli, fs, sink).map(AnyGrepper::Ntfs)
     }
 }

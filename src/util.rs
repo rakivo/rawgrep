@@ -5,14 +5,14 @@ use std::{fs::File, io, sync::Arc};
 use smallvec::SmallVec;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
-#[inline]
-pub fn read_u32_le(buf: &[u8], offset: usize) -> u32 {
-    u32::from_le_bytes(buf[offset..offset+4].try_into().unwrap())
+#[inline(always)]
+pub fn read_u16_unaligned_le(data: &[u8], offset: usize) -> u16 {
+    unsafe { (data.as_ptr().add(offset) as *const u16).read_unaligned().to_le() }
 }
 
-#[inline]
-pub fn read_u16_le(buf: &[u8], offset: usize) -> u16 {
-    u16::from_le_bytes(buf[offset..offset+2].try_into().unwrap())
+#[inline(always)]
+pub fn read_u32_unaligned_le(data: &[u8], offset: usize) -> u32 {
+    unsafe { (data.as_ptr().add(offset) as *const u32).read_unaligned().to_le() }
 }
 
 #[cfg(windows)]
@@ -52,21 +52,6 @@ pub fn read_at_offset(file: &File, buf: &mut [u8], offset: u64) -> io::Result<us
 
         Ok(to_copy)
     }
-}
-
-#[inline(always)]
-pub const fn is_dot_entry(name: &[u8]) -> bool {
-    name.len() == 1 && name[0] == b'.' ||
-    name.len() == 2 && name[0] == b'.' && name[1] == b'.'
-}
-
-#[inline(always)]
-pub const fn is_common_skip_dir(dir: &[u8]) -> bool {
-    matches!(
-        dir,
-        b"node_modules" | b"target" | b".git" | b".hg" | b".svn" |
-        b"dist" | b"build" | b"out" | b"bin" | b"tmp" | b".cache"
-    )
 }
 
 #[inline(always)]

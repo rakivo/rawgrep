@@ -1975,7 +1975,7 @@ mod tests {
 
             let keys:   Vec<FileKey>  = (0..num_files).map(|i| key(seed ^ i as u64)).collect();
             let metas:  Vec<FileMeta> = (0..num_files).map(|i| meta(i as i64, i as u64)).collect();
-            let presences: Vec<bool> = (0..num_files).map(|_| false).collect();
+            let presences: vec<bool> = (0..num_files).map(|_| false).collect();
 
             cache.merge_updates_bool(keys.clone(), metas.clone(), &[hash], presences).unwrap();
 

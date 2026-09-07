@@ -1,3 +1,16 @@
+use crate::pacer::FlushPacer;
+use crate::error::Error;
+use crate::slab::SlotPool;
+use crate::RawGrepConfig;
+use crate::path_buf::SmallPathBuf;
+use crate::stdout::{RawStdout, OutputKind};
+use crate::{cli, ignore, platform};
+use crate::parser::Parser;
+use crate::cache::{FileKey, FileMeta, CacheStats};
+use crate::stats::{AtomicStats, Stats};
+use crate::grep::{AnyGrepper, FsType, RawGrepper, open_device_and_detect_fs};
+use crate::worker::{DirWork, FileWork, MatchSink, OutputWorker, WorkItem, WorkerCtx, PathArena, FileEntryArena, SubdirsArena, FragmentPresenceBits, OutputMessage, EntriesArena};
+
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
@@ -5,24 +18,11 @@ use std::io::{self};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use parking_lot::{Condvar, Mutex, RwLock};
-
 use ::tracing::debug;
 use smallvec::SmallVec;
+use parking_lot::{Condvar, Mutex, RwLock};
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use crossbeam_deque::{Injector, Stealer, Worker as DequeWorker};
-
-use crate::error::Error;
-use crate::slab::SlotPool;
-use crate::RawGrepConfig;
-use crate::path_buf::SmallPathBuf;
-use crate::stdout::RawStdout;
-use crate::{cli, ignore, platform};
-use crate::parser::Parser;
-use crate::cache::{FileKey, FileMeta, CacheStats};
-use crate::stats::{AtomicStats, Stats};
-use crate::grep::{AnyGrepper, FsType, RawGrepper, open_device_and_detect_fs};
-use crate::worker::{DirWork, FileWork, MatchSink, OutputWorker, WorkItem, WorkerCtx, PathArena, FileEntryArena, SubdirsArena, FragmentPresenceBits, OutputMessage};
 
 #[derive(Default)]
 struct CacheAccumulator {
@@ -78,20 +78,32 @@ impl<S: MatchSink + 'static> RawGrepCtx<S> {
         let (output_tx, output_rx)       = unbounded();
         let (flush_ack_tx, flush_ack_rx) = unbounded();
 
-        let raw_stdout = RawStdout::new();
+        let (raw_stdout, output_kind) = RawStdout::new();
         let stdout_is_being_redirected_to_dev_null = raw_stdout.is_none();
 
-        if let Some((raw_stdout, is_pipe, raw_fd)) = raw_stdout {
+        if let Some((raw_stdout, raw_fd)) = raw_stdout {
             _ = std::thread::spawn(move || {
                 OutputWorker {
                     rx: output_rx,
                     raw_fd,
-                    is_pipe,
                     flush_ack_tx,
                     batch_bytes: 0,
-                    writer: raw_stdout, // was BufWriter::with_capacity(...)
-                    batch: Vec::with_capacity(256),       // one-time alloc, amortized forever
-                    iov_scratch: Vec::with_capacity(256), // same
+                    is_pipe: output_kind == OutputKind::Pipe,
+                    writer: raw_stdout,
+                    batch: Vec::with_capacity(256),
+                    iov_scratch: Vec::with_capacity(256),
+
+                    #[cfg(target_os = "linux")]
+                    pipe_bytes_written: 0,
+
+                    #[cfg(target_os = "linux")]
+                    iov_pipe_scratch: Default::default(),
+
+                    #[cfg(target_os = "linux")]
+                    fionread_broken: false,
+
+                    #[cfg(target_os = "linux")]
+                    pending_release: Default::default()
                 }.run();
             });
         }
@@ -122,10 +134,14 @@ impl<S: MatchSink + 'static> RawGrepCtx<S> {
 
         let num_cores = crate::util::num_physical_cores_or(num_threads);
 
+        let pacer_enabled = !stdout_is_being_redirected_to_dev_null && output_kind == OutputKind::Tty;
+        let pacer = Arc::new(FlushPacer::new(pacer_enabled));
         let stealers = Arc::new(stealers);
+
         for (worker_id, local) in local_workers.into_iter().enumerate() {
             let ctx = ctx.clone();
             let stealers = stealers.clone();
+            let pacer = pacer.clone();
             let slot_pool = slot_pools.pop().unwrap();
 
             std::thread::spawn(move || {
@@ -136,7 +152,8 @@ impl<S: MatchSink + 'static> RawGrepCtx<S> {
                     ctx,
                     &stealers,
                     local,
-                    slot_pool
+                    &pacer,
+                    slot_pool,
                 );
             });
         }
@@ -407,13 +424,14 @@ fn worker_thread_main<S: MatchSink + 'static>(
     ctx:       RawGrepCtx<S>,
     stealers:  &[Stealer<WorkItem>],
     local:     DequeWorker<WorkItem>,
-    mut slot_pool: SlotPool
+    pacer:     &FlushPacer,
+    mut slot_pool: SlotPool,
 ) {
     debug!("[ctx] worker {worker_id} started, waiting on condvar");
 
     // Parser buffers are owned by the thread and reused across searches,
     // saving allocations on every search restart.
-    let mut parser                    = Parser::new();
+    let mut parser                    = Parser::new(false);
     let mut path_buf                  = Box::new(SmallPathBuf::new());
     let mut swap_path_buf             = Box::new(SmallPathBuf::new());
     let mut newlines_scratch          = Vec::new();
@@ -422,6 +440,7 @@ fn worker_thread_main<S: MatchSink + 'static>(
     let mut path_arena                = PathArena::new();
     let mut file_entries_arena        = FileEntryArena::new();
     let mut subdirs_arena             = SubdirsArena::new();
+    let mut entries_arena             = EntriesArena::new();
     let mut output                    = slot_pool.acquire();
 
     let mut file_keys                 = Vec::new();
@@ -472,6 +491,8 @@ fn worker_thread_main<S: MatchSink + 'static>(
         ranges_scratch.clear();
         subdirs_arena.clear();
         path_arena.clear();
+        entries_arena.clear();
+        parser.dont_skip_dot_entries = cli.hidden;
         if fragment_presence_scratch.is_empty() {
             let fragment_hash_count = job.grepper.fragment_hashes().len();
             fragment_presence_scratch.resize(fragment_hash_count.div_ceil(64), 0);
@@ -494,9 +515,11 @@ fn worker_thread_main<S: MatchSink + 'static>(
                     sink:             $g.sink.clone(),
                     output_tx:        ctx.output_tx.clone(),
                     stats:            Default::default(),
+                    pacer,
                     output,
                     parser,
                     path_buf,
+                    entries_arena,
                     subdirs_arena,
                     newlines_scratch,
                     ranges_scratch,
@@ -505,6 +528,8 @@ fn worker_thread_main<S: MatchSink + 'static>(
                     swap_path_buf,
                     fragment_presence_scratch,
 
+                    batch_size_cached: 0,
+                    check_mask: 0x001F,
                     chunk_carry:      None, // @Memory: Cache this as well.
 
                     pending_file_keys: file_keys,
@@ -538,6 +563,7 @@ fn worker_thread_main<S: MatchSink + 'static>(
         parser = result.parser;
         file_entries_arena = result.file_entries_arena;
         subdirs_arena = result.subdirs_arena;
+        entries_arena = result.entries_arena;
         path_arena = result.path_arena;
         newlines_scratch = result.newlines_scratch;
         ranges_scratch = result.ranges_scratch;
@@ -555,8 +581,8 @@ fn worker_thread_main<S: MatchSink + 'static>(
             acc.fragment_presence.extend_from_slice(&result.fragment_presence.words);
         }
 
-        file_keys = result.file_keys;
-        file_metas = result.file_metas;
+        file_keys         = result.file_keys;
+        file_metas        = result.file_metas;
         fragment_presence = result.fragment_presence;
 
         {

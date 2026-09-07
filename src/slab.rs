@@ -9,22 +9,34 @@
 // B) Held by its owning worker thread as the "currently filling" buffer
 //
 // C) in flight to OutputWorker via an OutputMessage::Slot. Never two of these at once.
+//
+// Plus, once handed to OutputWorker on a pipe: possibly
+//
+// D) referenced by an in-flight vmsplice (page pinned into the pipe's ring buffer).
+// That's why storage below is allocated page-aligned: vmsplice pins whole pages,
+// and if a slot boundary didn't line up with a page boundary,
+// two adjacent (and independently owned/reused) slots could share a physical page,
+// letting a live producer write into slot N+1 corrupt a page the kernel still holds open for slot N's vmsplice.
 
 use crate::worker::OutputMessage;
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::cell::UnsafeCell;
 
 pub const SLOT_CAP:         usize = 64 * 1024;
 pub const SLOTS_PER_WORKER: usize = 20;
 
+const PAGE_SIZE: usize = 4096;
+
+const _: () = assert!(SLOTS_PER_WORKER <= 32, "bitmask claim needs SLOTS_PER_WORKER <= 32");
+
 // Padded to a cache line per worker so OutputWorker releasing worker A's
 // slot doesn't bounce a cache line that worker B is also polling via
-// try_claim. At SLOTS_PER_WORKER=16 and AtomicBool=1 byte, this block is
-// 16 bytes -- comfortably within one 64-byte line, and the alignment
-// guarantees it never shares a line with a neighboring worker's block.
+// try_claim. One AtomicU32 per worker (bit i == slot i is free) fits
+// comfortably within one 64-byte line, and the alignment guarantees it
+// never shares a line with a neighboring worker's block.
 #[repr(align(64))]
-struct WorkerSlotFlags([AtomicBool; SLOTS_PER_WORKER]);
+struct WorkerSlotFlags(AtomicU32);
 
 pub struct OutputSlab {
     storage: Box<[UnsafeCell<u8>]>,
@@ -36,21 +48,43 @@ unsafe impl Sync for OutputSlab {}
 impl OutputSlab {
     fn new(num_workers: usize) -> &'static Self {
         let num_slots = num_workers * SLOTS_PER_WORKER;
-        let v = vec![0u8; num_slots * SLOT_CAP];
-        let mut v = std::mem::ManuallyDrop::new(v);
+        let total_bytes = num_slots * SLOT_CAP;
+
+        debug_assert_eq!(
+            SLOT_CAP % PAGE_SIZE, 0,
+            "SLOT_CAP must be a whole number of pages for vmsplice slot isolation"
+        );
+        debug_assert!(num_workers > 0, "need at least one worker to size the slab");
+
+        // SAFETY: PAGE_SIZE (4096) is a nonzero power-of-two alignment;
+        // total_bytes is nonzero as long as num_workers > 0, upheld above.
+        // alloc_zeroed gives zeroed memory starting at a page-aligned
+        // address directly from the allocator (unlike Vec<u8>, which only
+        // guarantees align_of::<u8>() and merely happens to be page-aligned
+        // on some allocators for large sizes). Since SLOT_CAP is itself a
+        // whole multiple of PAGE_SIZE, every slot boundary (k * SLOT_CAP)
+        // is therefore also a page boundary -- no slot ever shares a
+        // physical page with its neighbor.
+        let layout = std::alloc::Layout::from_size_align(total_bytes, PAGE_SIZE).expect("slab size/alignment overflow");
+        let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+        assert!(!ptr.is_null(), "slab allocation failed ({total_bytes} bytes)");
+        debug_assert_eq!(ptr as usize % PAGE_SIZE, 0, "allocator did not honor requested alignment");
 
         // SAFETY: UnsafeCell<u8> is #[repr(transparent)] over u8, so this
-        // reinterpret is layout-valid. v's allocation is never freed
-        // through `v` again (ManuallyDrop), only through the Box we
-        // construct here, which owns it from this point on.
+        // reinterpret is layout-valid. `ptr` came from alloc_zeroed with
+        // exactly this layout and length, and -- same leak philosophy as
+        // before -- is never freed: the OutputSlab this becomes part of is
+        // Box::leak'd below for the process lifetime, so no mismatched
+        // dealloc (global allocator vs. this Layout) ever happens because
+        // no dealloc happens at all.
         let storage = unsafe {
             Box::from_raw(std::ptr::slice_from_raw_parts_mut(
-                v.as_mut_ptr() as *mut UnsafeCell<u8>, v.len()
+                ptr as *mut UnsafeCell<u8>, total_bytes
             ))
         };
 
         let free = (0..num_workers)
-            .map(|_| WorkerSlotFlags(std::array::from_fn(|_| AtomicBool::new(true))))
+            .map(|_| WorkerSlotFlags(AtomicU32::new((1u32 << SLOTS_PER_WORKER) - 1)))
             .collect();
 
         //
@@ -80,21 +114,37 @@ impl OutputSlab {
         std::slice::from_raw_parts(base, SLOT_CAP)
     }
 
-    /// Called only by OutputWorker, only after writev has confirmed every
-    /// byte of `slot` was handed to the kernel. The Release store here
-    /// pairs with try_claim's Acquire swap: everything this thread did to
-    /// the slot's memory happens-before the next thread that observes the
-    /// flag flip back to `true`.
+    /// Called by OutputWorker: pairs with try_claim's Acquire swap; see that
+    /// doc for the ordering argument.
     #[inline(always)]
     pub fn release(&self, slot: usize) {
         let (w, i) = (slot / SLOTS_PER_WORKER, slot % SLOTS_PER_WORKER);
-        self.free[w].0[i].store(true, Ordering::Release);
+        self.free[w].0.fetch_or(1 << i, Ordering::Release);
     }
 
     /// Called only by the owning worker thread, scanning its own block.
+    /// Returns the claimed local index, or None if the worker's block is
+    /// fully spoken for.
     #[inline(always)]
-    fn try_claim(&self, worker: usize, local: usize) -> bool {
-        self.free[worker].0[local].swap(false, Ordering::Acquire)
+    fn try_claim(&self, worker: usize) -> Option<usize> {
+        let flags = &self.free[worker].0;
+        loop {
+            let mask = flags.load(Ordering::Relaxed);
+            if mask == 0 { return None; }
+
+            let idx = mask.trailing_zeros() as usize;
+
+            //
+            // Only this thread ever clears bits (releases only ever set them),
+            // so no other claimer can race this CAS -- but another release()
+            // can still flip an unrelated bit between load and here, so we
+            // still need compare_exchange rather than a plain fetch_and.
+            //
+            let new_mask = mask & !(1 << idx);
+            if flags.compare_exchange_weak(mask, new_mask, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+                return Some(idx);
+            }
+        }
     }
 }
 
@@ -113,17 +163,10 @@ impl SlotPool {
 
     #[inline]
     pub fn acquire(&mut self) -> SlotBuf {
-        for local in 0..SLOTS_PER_WORKER {
-            if self.slab.try_claim(self.worker, local) {
-                let slot = (self.worker * SLOTS_PER_WORKER + local) as u16;
-                return SlotBuf::Slab { slab: self.slab, slot, len: 0 };
-            }
+        if let Some(local) = self.slab.try_claim(self.worker) {
+            let slot = (self.worker * SLOTS_PER_WORKER + local) as u16;
+            return SlotBuf::Slab { slab: self.slab, slot, len: 0 };
         }
-
-        //
-        // Pool exhausted (OutputWorker behind draining): don't stall the
-        // worker thread, spill this one flush to the heap instead.
-        //
 
         self.spills += 1;
         SlotBuf::Owned(Vec::with_capacity(SLOT_CAP))

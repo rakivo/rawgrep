@@ -190,6 +190,9 @@ impl RawFs for ApfsFs {
 
         result
     }
+
+    #[inline]
+    fn directory_entry_count_hint(&self, _buf: &[u8]) -> usize { 0 } // @Incomplete
 }
 
 // -----------------------------------------------------------------------------

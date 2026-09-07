@@ -4,22 +4,25 @@
 // TODO(#1): Implement symlinks
 // TODO(#24): Support for searching in large file(s). (detect that)
 
+use crate::liner::*;
+use crate::pacer::FlushPacer;
 use crate::cache::{FileKey, FileMeta, FragmentCache};
-use crate::slab::{OutputSlab, SlotPool, SlotBuf};
+use crate::slab::{OutputSlab, SlotPool, SlotBuf, SLOTS_PER_WORKER};
 use crate::cli::{should_enable_ansi_coloring, Cli};
 use crate::ignore::{Gitignore, GitignoreChain};
 use crate::matcher::Matcher;
-use crate::binary::is_binary_ext;
+use crate::binary::{is_binary_ext, is_reserved_tool_dir};
 use crate::path_buf::SmallPathBuf;
 use crate::fragments::FragmentLen;
 use crate::stats::Stats;
 use crate::stdout::{RawStdout, IOV_MAX};
 use crate::thin_path_arc::ThinPathArc;
 use crate::parser::{BufFatPtr, BufKind, FileId, FileNode, FileType, ParsedEntry, Parser, RawFs};
-use crate::util::{is_common_skip_dir, likely, truncate_utf8, unlikely};
+use crate::util::{likely, truncate_utf8, unlikely};
 use crate::{tracy, COLOR_CYAN, COLOR_GREEN, COLOR_RED, COLOR_RESET};
 
 use std::ops::Not;
+use std::collections::VecDeque;
 use std::path::MAIN_SEPARATOR;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -55,7 +58,13 @@ pub const BINARY_PROBE_BYTE_SIZE:  usize = 0x1000;           // @Tune
 
 pub const MAX_EXTENTS_UNTIL_SPILL: usize = 64;               // @Tune
 
-pub const __MAX_FILE_BYTE_SIZE:    usize = 8 * 1024 * 1024;  // @Tune
+pub const __MAX_FILE_BYTE_SIZE:    usize = 30 * 1024 * 1024; // @Tune
+
+// Below this size, a non-ASCII-encoded file is decoded to UTF-8 in one
+// pass instead of line by line. Past it we keep the streaming
+// decode_line-per-line path so a huge UTF-16 file doesn't get decoded
+// into a second huge allocation up front.
+const SMALL_FILE_DECODE_THRESHOLD: usize =       512 * 1024; // @Tune
 
 pub enum WorkItem {
     File(FileWork),
@@ -167,6 +176,12 @@ where
     }
 }
 
+#[cfg(target_os = "linux")]
+pub enum PendingRelease {
+    Slot(&'static OutputSlab, u16),
+    Owned(Box<[u8]>), // kept alive here, not dropped, until confirmed drained
+}
+
 pub enum OutputMessage {
     Slot { slab: &'static OutputSlab, slot: u16, len: u32 },
     Owned(Box<[u8]>),
@@ -206,10 +221,38 @@ pub struct OutputWorker {
     pub is_pipe: bool,
 
     #[cfg(unix)]
-    pub raw_fd: std::os::unix::io::RawFd
+    pub raw_fd: std::os::unix::io::RawFd,
+
+    // vmsplice() into a pipe doesn't copy bytes, it hands the kernel a page
+    // reference into our own slab memory. That page isn't safe to reuse
+    // (i.e. slab.release()'d and re-claimed by a producer thread) until the
+    // reader has actually drained it out of the pipe. The kernel gives no
+    // per-buffer completion callback for this, so we reconstruct one:
+    // FIONREAD (valid on either end of a pipe fd, per pipe(7)) reports total
+    // unread bytes still sitting in the pipe's ring buffer.
+    //
+    // Since a pipe is strictly FIFO, `pipe_bytes_written - unread` is a monotonic watermark
+    // for "bytes the reader has confirmed consumed" -- we only release a slot once
+    // that watermark has passed the slot's end offset.
+    #[cfg(target_os = "linux")]
+    pub pipe_bytes_written: u64,
+
+    #[cfg(target_os = "linux")]
+    pub pending_release: VecDeque<(u64, PendingRelease)>,
+
+    #[cfg(target_os = "linux")]
+    pub iov_pipe_scratch: Vec<crate::stdout::vmsplice::IoVec>,
+
+    // If FIONREAD ever fails (unexpected fd type, permission stuff, whatever),
+    // we cannot trust the drain watermark at all. Rather than propagate an io::Error
+    // and have `absorb()` kill the whole worker thread on the next flush,
+    // we permanently fall back to the original safe behavior for the rest of this worker's life...
+    #[cfg(target_os = "linux")]
+    pub fionread_broken: bool,
 }
 
 impl OutputWorker {
+    #[inline]
     pub fn run(mut self) {
         let _span = tracy::span!("OutputThread::run");
 
@@ -221,7 +264,6 @@ impl OutputWorker {
             }
 
             if self.flush_batch().is_err() { break 'outer }
-
         }
 
         _ = self.flush_batch();
@@ -270,6 +312,7 @@ impl OutputWorker {
         self.flush_batch_writev()
     }
 
+    #[inline]
     fn flush_batch_writev(&mut self) -> io::Result<()> {
         self.iov_scratch.clear();
 
@@ -297,59 +340,150 @@ impl OutputWorker {
         Ok(())
     }
 
-    // Fast path for pipes: vmsplice per buffer, falling back to a
-    // blocking write() for whatever vmsplice declines (pipe full, or any vmsplice error).
     #[cfg(target_os = "linux")]
     fn flush_batch_pipe(&mut self) -> io::Result<()> {
-        for b in self.batch.drain(..) {
-            // SAFETY: Same as in flush_batch_writev.
+        if self.batch.is_empty() { return Ok(()); }
+
+        if self.fionread_broken {
+            //
+            // Can't trust the drain watermark at all anymore -- copy
+            // everything via write_all, same as the writev path.
+            //
+            return self.flush_batch_writev();
+        }
+
+        // SAFETY: every PendingBuf in self.batch is exclusively ours (moved
+        // in via the channel) and stays alive in self.batch for the duration
+        // of this function -- we don't drain it until after the syscalls
+        // below return.
+        self.iov_pipe_scratch.clear();
+        for b in &self.batch {
             let bytes = unsafe { b.as_slice() };
+            self.iov_pipe_scratch.push(crate::stdout::vmsplice::IoVec {
+                iov_base: bytes.as_ptr() as *mut _,
+                iov_len: bytes.len(),
+            });
+        }
 
-            match &b {
-                PendingBuf::Owned(_) => {
-                    //
-                    // Safe to vmsplice: this Vec is dropped right after, never
-                    // handed back to a pool, so nothing can write into these
-                    // pages again before the kernel is done with them.
-                    //
+        let spliced = match unsafe {
+            crate::stdout::vmsplice::vmsplice_vectored(self.raw_fd, &self.iov_pipe_scratch)
+        } {
+            Ok(n) => n,
+            // Pipe full or any vmsplice error: treat as "took nothing",
+            // fall through to write_all below for the whole batch. Matches
+            // the old per-buffer fallback behavior, just resolved once for
+            // the batch instead of per buffer.
+            Err(_) => 0,
+        };
 
-                    let mut off = 0;
-                    while off < bytes.len() {
-                        match unsafe { crate::stdout::vmsplice::vmsplice_once(self.raw_fd, &bytes[off..]) } {
-                            Ok(0) => break,
-                            Ok(n) => off += n,
+        //
+        // Walk iovec lengths to find which buffer boundary `spliced` landed
+        // on: full buffers [0, copy_from) were entirely accepted, buffer
+        // copy_from (if any) was partially accepted at partial_off, and
+        // everything after copy_from was not touched by vmsplice at all.
+        //
+        let mut remaining = spliced;
+        let mut copy_from = self.iov_pipe_scratch.len();
+        let mut partial_off = 0usize;
+        for (i, iov) in self.iov_pipe_scratch.iter().enumerate() {
+            if remaining >= iov.iov_len { remaining -= iov.iov_len; }
+            else { copy_from = i; partial_off = remaining; break; }
+        }
 
-                            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                            Err(_) => break,
-                        }
-                    }
+        //
+        // Everything vmsplice didn't fully place goes through writev
+        //
+        if copy_from < self.iov_pipe_scratch.len() {
+            self.iov_scratch.clear();
+            for (i, b) in self.batch[copy_from..].iter().enumerate() {
+                let bytes = unsafe { b.as_slice() };
+                let off = if i == 0 { partial_off } else { 0 };
 
-                    if off < bytes.len() {
-                        self.writer.write_all(&bytes[off..])?;
-                    }
-                }
-
-                PendingBuf::Slot { .. } => {
-                    //
-                    // Slab slots get reused within ~20 flushes. Sadly, vmsplice gives
-                    // no signal for when the pipe reader has actually drained
-                    // the pages, so reusing this slot could let a later write
-                    // land on memory the kernel still has queued.
-                    //
-                    // Therefore, we have to copy instead :(. Maybe I'll come up
-                    // with something better than this soon.
-                    //
-                    self.writer.write_all(bytes)?;
-                }
+                // SAFETY: same lifetime argument as flush_batch_writev --
+                // every referent is kept alive by self.batch until we drain
+                // it below, which is after writev_all returns Ok.
+                let bytes: &'static [u8] = unsafe { std::mem::transmute(&bytes[off..]) };
+                self.iov_scratch.push(IoSlice::new(bytes));
             }
 
-            if let PendingBuf::Slot { slab, slot, .. } = b {
+            self.writev_all()?; // blocks -- correct backpressure, pipe was full
+        }
+
+        for (i, b) in self.batch.drain(..).enumerate() {
+            let len = self.iov_pipe_scratch[i].iov_len;
+            self.pipe_bytes_written += len as u64;
+
+            //
+            // How much of *this* buffer went out via vmsplice
+            // (kernel holds a live page reference, not a copy)
+            // vs
+            // write_all (kernel has its own copy already, safe to release now)?
+            //
+            let spliced_amount = if i < copy_from {
+                len
+            } else if i == copy_from {
+                partial_off
+            } else {
+                0
+            };
+
+            if spliced_amount > 0 {
+                let pending = match b {
+                    PendingBuf::Owned(v) => PendingRelease::Owned(v),
+                    PendingBuf::Slot { slab, slot, .. } => PendingRelease::Slot(slab, slot),
+                };
+                self.pending_release.push_back((self.pipe_bytes_written, pending));
+            } else if let PendingBuf::Slot { slab, slot, .. } = b {
                 slab.release(slot as usize);
             }
+
+            // Owned with spliced_amount == 0: drops here normally, no
+            // outstanding kernel reference.
         }
 
         self.batch_bytes = 0;
+        self.reclaim_drained();
         Ok(())
+    }
+
+    // Releases every queued Slot the reader has actually drained.
+    // Deliberately infallible: an ioctl error here must never take down
+    // the worker thread (see `fionread_broken` doc comment above). If
+    // FIONREAD fails, we stop trusting the watermark for the rest of this
+    // worker's life -- flush_batch_pipe then stops attempting vmsplice on
+    // Slot buffers, and everything queued so far simply never gets an
+    // independent completion signal. To avoid leaking those slots forever,
+    // we also drain the backlog by falling back to the always-safe
+    // assumption that a full pipe capacity's worth of *newer* writes
+    // implies the oldest entries were read (pipes are bounded and FIFO);
+    // see the `pending_release.len()` guard below.
+    #[cfg(target_os = "linux")]
+    fn reclaim_drained(&mut self) {
+        if self.pending_release.len() < SLOTS_PER_WORKER / 2 { return; }
+
+        if self.fionread_broken {
+            // Already stopped attempting vmsplice entirely once this trips.
+            // Whatever's already queued may still be pinned -- for a
+            // short-lived CLI process, leaving it until exit is fine.
+            return;
+        }
+
+        let mut unread: libc::c_int = 0;
+        if unsafe { libc::ioctl(self.raw_fd, libc::FIONREAD, &mut unread as *mut libc::c_int) } != 0 {
+            self.fionread_broken = true;
+            return;
+        }
+
+        let confirmed = self.pipe_bytes_written.saturating_sub(unread as u64);
+
+        while let Some(&(end, _)) = self.pending_release.front() {
+            if end > confirmed { break; }
+            let (_, pending) = self.pending_release.pop_front().unwrap();
+            match pending {
+                PendingRelease::Slot(slab, slot) => slab.release(slot as usize),
+                PendingRelease::Owned(_) => {}
+            }
+        }
     }
 
     #[inline]
@@ -371,21 +505,24 @@ impl OutputWorker {
 
 /// Carry state for streaming match across chunk boundaries
 pub struct ChunkCarry {
-    /// Incomplete last line carried from previous chunk
-    pub tail:        Vec<u8>,
-    pub combine_buf: Vec<u8>,
-
     /// Any matches was found so far in this file
     pub found_any:   bool,
 
     /// Line number counter across chunks
     pub line_num:    u32,
+
+    pub encoding:    Option<Encoding>,
+
+    /// Incomplete last line carried from previous chunk
+    pub tail:        Vec<u8>,
+    pub combine_buf: Vec<u8>,
 }
 
 impl ChunkCarry {
     #[inline]
     pub fn new() -> Self {
         Self {
+            encoding: None,
             tail: Vec::new(),
             combine_buf: Vec::new(),
             found_any: false,
@@ -403,6 +540,7 @@ impl ChunkCarry {
 
 pub type FileEntryArena = Vec<(FileId, BufFatPtr)>;
 pub type SubdirsArena   = Vec<PendingSubdir>;
+pub type EntriesArena   = Vec<ParsedEntry>;
 
 #[repr(transparent)]
 pub struct PathArena {
@@ -524,12 +662,13 @@ pub struct WorkerResult {
 
     // Reused across `find_and_print_matches` calls
     pub          newlines_scratch: Vec<u32>,
-    pub            ranges_scratch: SmallVec<[(u32, u32); 4]>,
+    pub            ranges_scratch: SmallVec<[(u32, u32); 16]>,
     pub fragment_presence_scratch: SmallVec<[u64; 8]>,
 
     pub         path_arena: PathArena,
     pub file_entries_arena: FileEntryArena,
     pub      subdirs_arena: SubdirsArena,
+    pub      entries_arena: EntriesArena,
 
     pub fragment_presence:  FragmentPresenceBits,
 }
@@ -543,6 +682,7 @@ pub struct WorkerCtx<'a, 'output_arena, F: RawFs, S: MatchSink> {
     pub cli:             &'a Cli,
     pub slot_pool:       &'output_arena mut SlotPool,
     pub fragment_index:  &'a IntSet<u32>,
+    pub pacer:           &'a FlushPacer,
     pub selected_fragment_hash_len: FragmentLen,
     pub stdout_is_being_redirected_to_dev_null: bool,
 
@@ -553,15 +693,18 @@ pub struct WorkerCtx<'a, 'output_arena, F: RawFs, S: MatchSink> {
     pub         path_arena: PathArena,          // 24
     pub file_entries_arena: FileEntryArena,     // 24
     pub      subdirs_arena: SubdirsArena,       // 24
+    pub      entries_arena: EntriesArena,       // 24
 
     pub      path_buf:      Box<SmallPathBuf>,  // 8
     pub swap_path_buf:      Box<SmallPathBuf>,  // 8
 
+    pub batch_size_cached:  u32,
+    pub check_mask:         usize,
     pub stats:              Box<Stats>,         // 8
 
     // ----- Warm
     pub          newlines_scratch: Vec<u32>,
-    pub            ranges_scratch: SmallVec<[(u32, u32); 4]>,
+    pub            ranges_scratch: SmallVec<[(u32, u32); 16]>,
     pub fragment_presence_scratch: SmallVec<[u64; 8]>,
 
     pub chunk_carry:               Option<Box<ChunkCarry>>,
@@ -588,8 +731,10 @@ impl<'a, 'output_arena, F: RawFs, S: MatchSink> WorkerCtx<'a, 'output_arena, F, 
     #[inline(always)]
     fn finish(mut self) -> WorkerResult {
         self.flush_output();
+
         WorkerResult {
             stats: self.stats,
+            entries_arena: self.entries_arena,
             parser: self.parser,
             path_arena: self.path_arena,
             file_entries_arena: self.file_entries_arena,
@@ -617,8 +762,11 @@ impl<'a, 'output_arena, F: RawFs, S: MatchSink> WorkerCtx<'a, 'output_arena, F, 
             return;
         }
 
+        debug_assert!(!self.stdout_is_being_redirected_to_dev_null);
+
         let old = std::mem::replace(&mut self.output, self.slot_pool.acquire());
         _ = self.output_tx.send(old.finish());
+        self.pacer.record_flush();
     }
 
     #[inline(always)]
@@ -707,7 +855,7 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, '_, F, S> {
                 .map(|pos| &bytes[pos + 1..])
                 .unwrap_or(bytes);
 
-            if is_common_skip_dir(last_segment) {
+            if !self.cli.should_ignore_reserved_tool_dir_filter() && is_reserved_tool_dir(last_segment) {
                 self.stats.dirs_skipped_common += 1;
                 return Ok(());
             }
@@ -718,14 +866,20 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, '_, F, S> {
         self.stats.dirs_encountered += 1;
 
         let new_gitignore_chain = self.cli.should_ignore_gitignore().not().then(|| {
+            let prefix_len = self.path_buf.len() as u32;
             self.find_gitignore_file_id_in_buf(BufKind::Dir)
                 .and_then(|gi_file_id| self.try_load_gitignore(gi_file_id))
-                .map(|gi| gitignore_chain.clone().with_gitignore(depth, gi))
+                .map(|gi| gitignore_chain.clone().with_gitignore(depth, prefix_len, gi))
         }).flatten().unwrap_or_else(|| gitignore_chain.clone());
 
-        let scan = self.parser.scan_directory_entries(self.fs);
+        let scan = self.parser.scan_directory_entries(self.fs, &mut self.entries_arena);
 
-        self.process_directory(depth, new_gitignore_chain, &scan.entries, local, injector)?;
+        self.process_directory(
+            depth,
+            new_gitignore_chain,
+            scan.entries_start, scan.entries_end,
+            local, injector
+        )?;
 
         Ok(())
     }
@@ -734,7 +888,8 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, '_, F, S> {
         &mut self,
         depth: u16,
         gitignore_chain: GitignoreChain,
-        entries: &[ParsedEntry<FileId>],
+        entries_start: usize,
+        entries_end: usize,
         local: &DequeWorker<WorkItem>,
         injector: &Injector<WorkItem>,
     ) -> io::Result<()> {
@@ -746,7 +901,12 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, '_, F, S> {
         let   file_mark = self.file_entries_arena.len();
         let   path_mark = self.path_arena.len();
 
-        for entry in entries {
+        let check_gitignore = !self.cli.should_ignore_gitignore() && !gitignore_chain.is_empty();
+        let skip_reserved   = !self.cli.should_ignore_reserved_tool_dir_filter();
+
+        for i in entries_start..entries_end {
+            let entry = self.entries_arena[i];
+
             let name_bytes = unsafe {
                 self.parser.dir.get_unchecked(
                     entry.name_offset as usize..entry.name_offset as usize + entry.name_len as usize
@@ -771,18 +931,16 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, '_, F, S> {
 
             match ft {
                 FileType::Dir => {
-                    if is_common_skip_dir(name_bytes) {
+                    if skip_reserved && is_reserved_tool_dir(name_bytes) {
                         continue;
                     }
 
                     let (start, end) = self.path_arena.push_path(&self.path_buf, needs_slash, name_bytes);
 
-                    if !self.cli.should_ignore_gitignore() && !gitignore_chain.is_empty() {
-                        if gitignore_chain.is_ignored(self.path_arena.slice(start, end), true) {
-                            self.stats.dirs_skipped_gitignore += 1;
-                            self.path_arena.truncate(start);
-                            continue;
-                        }
+                    if check_gitignore && gitignore_chain.is_ignored(self.path_arena.slice(start, end), true) {
+                        self.stats.dirs_skipped_gitignore += 1;
+                        self.path_arena.truncate(start);
+                        continue;
                     }
 
                     let Ok(path_len) = u16::try_from(end - start) else {
@@ -882,6 +1040,7 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, '_, F, S> {
 
         self.subdirs_arena.truncate(subdir_mark);
         self.path_arena.truncate(path_mark);
+        self.entries_arena.truncate(entries_start);
 
         if let Some(e) = first_err { Err(e) } else { Ok(()) }
     }
@@ -904,12 +1063,28 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, '_, F, S> {
 
             self.process_file(&node, name_fat_ptr, parent_path, gitignore_chain)?;
 
-            if self.output.len() > WORKER_FLUSH_BATCH {
+            if i & self.check_mask == 0 {
+                let (should_flush, batch_hint, next_mask) = self.pacer.poll(!self.output.is_empty());
+                self.batch_size_cached = batch_hint;
+                self.check_mask = next_mask;
+                if should_flush {
+                    self.cold_flush();
+                    continue;
+                }
+            }
+
+            if self.output.len() as u32 > self.batch_size_cached {
                 self.flush_output();
             }
         }
 
         Ok(())
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn cold_flush(&mut self) {
+        self.flush_output();
     }
 
     fn process_file(
@@ -1059,7 +1234,9 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, '_, F, S> {
             let (disk_offset, len) = self.parser.scratch_chunks[chunk_index];
             let len = len as usize;
 
-            self.parser.chunk.resize(len, 0);
+            self.parser.chunk.clear();
+            self.parser.chunk.reserve(len);
+            unsafe { self.parser.chunk.set_len(len); }
 
             let n = match self.fs.read_at_offset(&mut self.parser.chunk[..len], disk_offset) {
                 Ok(n) => n,
@@ -1126,17 +1303,43 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, '_, F, S> {
     }
 }
 
-// impl block for printng matches
+// impl block for printing matches
 impl<F: RawFs, S: MatchSink> WorkerCtx<'_, '_, F, S> {
+    #[inline]
     fn find_and_print_matches(&mut self) -> io::Result<bool> {
         let _span = tracy::span!("find_and_print_matches");
 
-        let buf = &self.parser.file;
+        if self.parser.file.is_empty() { return Ok(false); }
+
+        match crate::binary::detect_byte_order_leading_mark_len(&self.parser.file) {
+            Some(Encoding::Utf8)    => self.find_and_print_matches_impl::<RawCodec    >(3),
+            Some(Encoding::Utf16LE) => self.find_and_print_matches_impl::<Utf16LeCodec>(2),
+            Some(Encoding::Utf16BE) => self.find_and_print_matches_impl::<Utf16BeCodec>(2),
+            Some(Encoding::Utf32LE) => self.find_and_print_matches_impl::<Utf32LeCodec>(4),
+            Some(Encoding::Utf32BE) => self.find_and_print_matches_impl::<Utf32BeCodec>(4),
+            None                    => self.find_and_print_matches_impl::<RawCodec    >(0),
+        }
+    }
+
+    fn find_and_print_matches_impl<C: LineCodec>(&mut self, skip: usize) -> io::Result<bool> {
+        let buf = &self.parser.file[skip..];
+
         let buf_len = buf.len();
         if buf_len == 0 { return Ok(false); }
 
+        if !C::RAW_PASSTHROUGH && buf_len <= SMALL_FILE_DECODE_THRESHOLD {
+            return self.find_and_print_matches_small_decode::<C>(skip);
+        }
+
+        // Collect every raw newline offset up front, so UTF-16/32 "\n"
+        // sequences are found at the right stride instead of assuming one byte/line.
         self.newlines_scratch.clear();
-        self.newlines_scratch.extend(memchr::memchr_iter(b'\n', buf).map(|i| i as u32));
+        let mut scan_pos = 0usize;
+        while let Some(rel) = C::find_newline(&buf[scan_pos..]) {
+            let abs = scan_pos + rel;
+            self.newlines_scratch.push(abs as u32);
+            scan_pos = abs + C::UNIT_WIDTH;
+        }
 
         let should_print_color = should_enable_ansi_coloring();
 
@@ -1150,7 +1353,19 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, '_, F, S> {
             .chain([&(buf_len as u32)])
         {
             let line_end = newline_pos as usize;
-            let line = &buf[line_start..line_end];
+            let raw_line = C::strip_trailing_cr(&buf[line_start..line_end]);
+
+            //
+            // Non-UTF-8 sources get transcoded one line at a time into a
+            // small reusable buffer, so that a huge UTF-16 file doesn't cost a second huge allocation.
+            //
+            let line: &[u8] = if C::RAW_PASSTHROUGH {
+                raw_line
+            } else {
+                self.parser.scratch.clear();
+                C::decode_line(raw_line, &mut self.parser.scratch);
+                &self.parser.scratch[..]
+            };
 
             self.ranges_scratch.clear();
             self.ranges_scratch.extend(
@@ -1188,7 +1403,7 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, '_, F, S> {
             }
 
             if line_end >= buf_len { break }
-            line_start = line_end + 1;
+            line_start = line_end + C::UNIT_WIDTH;
             line_num += 1;
         }
 
@@ -1199,23 +1414,65 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, '_, F, S> {
         Ok(found_any)
     }
 
+    #[inline]
     fn find_and_print_matches_in_chunk(
         &mut self,
         data: &[u8],
         carry: &mut ChunkCarry,
         is_last: bool,
     ) -> io::Result<()> {
-        let _span = tracy::span!("match_chunk");
+        let _span = tracy::span!("find_and_print_matches_in_chunk");
 
         if data.is_empty() { return Ok(()); }
 
+        //
+        // The encoding is only knowable from the very first chunk (that's where a BOM would live),
+        // so sniff it once and remember it on the carry for every later chunk of this file.
+        //
+        let (encoding, skip) = match carry.encoding {
+            Some(e) => (e, 0),
+            None => match crate::binary::detect_byte_order_leading_mark_len(data) {
+                Some(e) => { carry.encoding = Some(e); (e, e.bom_len()) }
+                None    => { carry.encoding = Some(Encoding::Utf8); (Encoding::Utf8, 0) }
+            },
+        };
+
+        match encoding {
+            Encoding::Utf8    => self.find_and_print_matches_in_chunk_impl::<RawCodec    >(data, skip, carry, is_last),
+            Encoding::Utf16LE => self.find_and_print_matches_in_chunk_impl::<Utf16LeCodec>(data, skip, carry, is_last),
+            Encoding::Utf16BE => self.find_and_print_matches_in_chunk_impl::<Utf16BeCodec>(data, skip, carry, is_last),
+            Encoding::Utf32LE => self.find_and_print_matches_in_chunk_impl::<Utf32LeCodec>(data, skip, carry, is_last),
+            Encoding::Utf32BE => self.find_and_print_matches_in_chunk_impl::<Utf32BeCodec>(data, skip, carry, is_last),
+        }
+    }
+
+    fn find_and_print_matches_in_chunk_impl<C: LineCodec>(
+        &mut self,
+        data: &[u8],
+        skip: usize,
+        carry: &mut ChunkCarry,
+        is_last: bool,
+    ) -> io::Result<()> {
+        let data = &data[skip..];
+        if data.is_empty() { return Ok(()) }
+
         let should_print_color = should_enable_ansi_coloring();
+
+        //
+        // Chunk reads must land on a multiple of C::UNIT_WIDTH bytes
+        // (1 raw/UTF-8, 2 UTF-16, 4 UTF-32) for every chunk except the last,
+        // otherwise a multi-byte code unit could straddle two chunks and
+        // neither find_newline nor decode_line could see it whole. Round
+        // the chunk-read size down to a multiple of 4 at the call site
+        // and this holds for every encoding we support.
+        //
+        debug_assert!(is_last || data.len() % C::UNIT_WIDTH == 0);
 
         let process_until = if is_last {
             data.len()
         } else {
-            match memchr::memrchr(b'\n', data) {
-                Some(pos) => pos + 1,
+            match C::rfind_newline(data) {
+                Some(pos) => pos + C::UNIT_WIDTH,
                 None => {
                     carry.tail.clear();
                     carry.tail.extend_from_slice(data);
@@ -1225,7 +1482,12 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, '_, F, S> {
         };
 
         self.newlines_scratch.clear();
-        self.newlines_scratch.extend(memchr::memchr_iter(b'\n', data).map(|i| i as u32));
+        let mut scan_pos = 0usize;
+        while let Some(rel) = C::find_newline(&data[scan_pos..]) {
+            let abs = scan_pos + rel;
+            self.newlines_scratch.push(abs as u32);
+            scan_pos = abs + C::UNIT_WIDTH;
+        }
 
         let mut line_start = 0usize;
 
@@ -1235,7 +1497,15 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, '_, F, S> {
             .chain([&(process_until as u32)])
         {
             let line_end = newline_pos as usize;
-            let line = &data[line_start..line_end];
+            let raw_line = C::strip_trailing_cr(&data[line_start..line_end]);
+
+            let line: &[u8] = if C::RAW_PASSTHROUGH {
+                raw_line
+            } else {
+                self.parser.scratch.clear();
+                C::decode_line(raw_line, &mut self.parser.scratch);
+                &self.parser.scratch[..]
+            };
 
             self.ranges_scratch.clear();
             self.ranges_scratch.extend(
@@ -1267,13 +1537,13 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, '_, F, S> {
                     );
                 }
 
-                if S::STDOUT_NOP { // @Memory @Cutnpaste from find_and_print_matches
+                if S::STDOUT_NOP {  // @Memory @Cutnpaste from find_and_print_matches
                     self.sink.push(self.path_buf.as_ref(), carry.line_num as _, line, &self.ranges_scratch);
                 }
             }
 
             if line_end >= process_until { break; }
-            line_start = line_end + 1;
+            line_start = line_end + C::UNIT_WIDTH;
             carry.line_num += 1;
         }
 
@@ -1285,6 +1555,94 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, '_, F, S> {
         Ok(())
     }
 
+    #[inline(never)]
+    fn find_and_print_matches_small_decode<C: LineCodec>(&mut self, skip: usize) -> io::Result<bool> {
+        let buf = &self.parser.file[skip..];
+        let buf_len = buf.len();
+        if buf_len == 0 { return Ok(false); }
+
+        self.parser.scratch.clear();
+        C::decode_line(buf, &mut self.parser.scratch);
+
+        let decoded_len = self.parser.scratch.len();
+        if decoded_len == 0 { return Ok(false); }
+
+        //
+        // Plain '\n' scan against decoded bytes
+        //
+        self.newlines_scratch.clear();
+        {
+            let decoded = &self.parser.scratch[..];
+            let mut scan_pos = 0usize;
+            while let Some(rel) = memchr::memchr(b'\n', &decoded[scan_pos..]) {
+                let abs = scan_pos + rel;
+                self.newlines_scratch.push(abs as u32);
+                scan_pos = abs + 1;
+            }
+        }
+
+        let should_print_color = should_enable_ansi_coloring();
+        let mut found_any = false;
+        let mut line_start = 0;
+        let mut line_num = 1u32;
+
+        for &newline_pos in self
+            .newlines_scratch
+            .iter()
+            .chain([&(decoded_len as u32)])
+        {
+            let line_end = newline_pos as usize;
+            let raw_line = &self.parser.scratch[line_start..line_end];
+            let line = if raw_line.last() == Some(&0x0D) {
+                &raw_line[..raw_line.len() - 1]
+            } else {
+                raw_line
+            };
+
+            self.ranges_scratch.clear();
+            self.ranges_scratch.extend(
+                self.matcher.find_matches(line).map(|(s, e)| (s as u32, e as u32))
+            );
+
+            if !self.ranges_scratch.is_empty() {
+                if !found_any {
+                    found_any = true;
+                    if !self.stdout_is_being_redirected_to_dev_null {
+                        Self::write_file_header(&mut self.output, self.cli, &self.path_buf, should_print_color);
+                    }
+                }
+
+                if !self.stdout_is_being_redirected_to_dev_null {
+                    Self::write_match_line(
+                        &mut self.output,
+                        self.cli,
+                        &self.path_buf,
+                        line,
+                        line_num,
+                        self.ranges_scratch.iter().copied(),
+                        should_print_color,
+                    );
+                }
+
+                if S::STDOUT_NOP {
+                    self.sink.push(self.path_buf.as_ref(), line_num as _, line, &self.ranges_scratch);
+                }
+            }
+
+            if line_end >= decoded_len { break }
+            line_start = line_end + 1;
+            line_num += 1;
+        }
+
+        if found_any {
+            self.stats.files_contained_matches += 1;
+        }
+
+        Ok(found_any)
+    }
+}
+
+impl<F: RawFs, S: MatchSink> WorkerCtx<'_, '_, F, S> {
     #[inline(always)]
     fn write_match_line(
         output:            &mut SlotBuf,

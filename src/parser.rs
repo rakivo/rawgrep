@@ -1,14 +1,11 @@
 use crate::tracy;
-use crate::binary::is_binary_chunk;
+use crate::binary::{is_binary_chunk, is_dot_entry, is_hidden_entry};
 use crate::worker::BINARY_PROBE_BYTE_SIZE;
 use crate::cli::BufferConfig;
-use crate::util::is_dot_entry;
 
 use std::fs::File;
 use std::io;
 use std::ops::ControlFlow;
-
-use smallvec::SmallVec;
 
 #[repr(u8)]
 #[derive(Copy, Clone)]
@@ -26,8 +23,8 @@ pub struct BufFatPtr {
 }
 
 #[derive(Clone, Copy)]
-pub struct ParsedEntry<Id> {
-    pub file_id: Id,
+pub struct ParsedEntry {
+    pub file_id: FileId,
     pub name_offset: u32,
     pub name_len: u16,
     pub file_type: FileType
@@ -111,18 +108,22 @@ pub trait RawFs: Sync + Send {
         buf: &[u8],
         callback: impl FnMut(FileId, usize, usize, FileType) -> ControlFlow<R>
     ) -> Option<R>;
+
+    fn directory_entry_count_hint(&self, buf: &[u8]) -> usize;
 }
 
 /// Result of scanning directory entries
-#[allow(dead_code, reason = "@Incomplete")]
-pub struct DirScanResult<const N: usize = 64> {
-    pub file_count: u32,
-    pub dir_count: u32,
-    pub entries: SmallVec<[ParsedEntry<FileId>; N]>,
+pub struct DirScanResult {
+    pub file_count:    u32,
+    pub dir_count:     u32,
+    pub entries_start: usize,
+    pub entries_end:  usize,
 }
 
 /// Filesystem-agnostic parser with reusable buffers
 pub struct Parser {
+    pub dont_skip_dot_entries: bool,
+
     pub file:      Vec<u8>,                // 0
 
     // Filesystem-specific scratch space
@@ -140,8 +141,9 @@ pub struct Parser {
 
 impl Parser {
     #[inline(always)]
-    pub fn new() -> Self {
+    pub fn new(dont_skip_dot_entries: bool) -> Self {
         Self {
+            dont_skip_dot_entries,
             file: Vec::new(),
             dir: Vec::new(),
             gitignore: Vec::new(),
@@ -183,12 +185,15 @@ impl Parser {
     }
 
     #[inline]
-    pub fn scan_directory_entries<F: RawFs>(&self, fs: &F) -> DirScanResult {
+    pub fn scan_directory_entries<F: RawFs>(&self, fs: &F, entries_arena: &mut Vec<ParsedEntry>) -> DirScanResult {
         let _span = tracy::span!("scan_directory_entries");
 
         let mut file_count = 0;
-        let mut dir_count = 0;
-        let mut entries = SmallVec::new();
+        let mut  dir_count = 0;
+
+        let entries_start = entries_arena.len();
+        let hint = fs.directory_entry_count_hint(&self.dir);
+        entries_arena.reserve(hint);
 
         fs.with_directory_entries(
             &self.dir,
@@ -200,26 +205,36 @@ impl Parser {
                     self.dir.get_unchecked(name_start..name_end)
                 };
 
-                if !is_dot_entry(name_bytes) {
-                    entries.push(ParsedEntry {
-                        file_id: entry_id,
-                        name_offset: name_start as _,
-                        name_len: name_len as _,
-                        file_type,
-                    });
+                let skip = (
+                    !self.dont_skip_dot_entries && is_hidden_entry(name_bytes)
+                ) || is_dot_entry(name_bytes);
+                if skip {
+                    return ControlFlow::<()>::Continue(());
+                }
 
-                    match file_type {
-                        FileType::Dir => dir_count += 1,
-                        FileType::File => file_count += 1,
-                        FileType::Other => file_count += 1,
-                    }
+                entries_arena.push(ParsedEntry {
+                    file_id: entry_id,
+                    name_offset: name_start as _,
+                    name_len: name_len as _,
+                    file_type,
+                });
+
+                match file_type {
+                    FileType::Dir   =>  dir_count += 1,
+                    FileType::File  => file_count += 1,
+                    FileType::Other => file_count += 1,
                 }
 
                 ControlFlow::<()>::Continue(())
             }
         );
 
-        DirScanResult { file_count, dir_count, entries }
+        DirScanResult {
+            file_count,
+            dir_count,
+            entries_end: entries_arena.len(),
+            entries_start: entries_start
+        }
     }
 
     #[inline(always)]

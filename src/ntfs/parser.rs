@@ -3,7 +3,9 @@
 use smallvec::SmallVec;
 
 use crate::tracy;
-use crate::util::{is_dot_entry, read_at_offset, read_u16_le, read_u32_le};
+use crate::cli::Cli;
+use crate::binary::{is_dot_entry, is_hidden_entry};
+use crate::util::{read_at_offset, read_u32_unaligned_le};
 use crate::parser::{BufKind, FileId, FileNode, FileType, Parser, RawFs, binary_probe};
 use crate::worker::STREAMING_CHUNK_SIZE;
 
@@ -21,6 +23,7 @@ pub struct NtfsFs {
     pub sb: NtfsSuperBlock,
     pub device_id: u64,
     pub mft_runs: SmallVec<[NtfsExtent; 8]>,
+    pub dont_skip_dot_entries: bool,
 }
 
 impl FileNode for NtfsNode {
@@ -192,7 +195,10 @@ impl RawFs for NtfsFs {
                     run_offset  += skip;
                     total       += skip;
                     skip_first  -= skip;
-                    if to_read == 0 { continue; }
+                    if to_read == 0 {
+                        crate::parser::push_chunk(scratch_chunks, disk_offset, skip as _);
+                        continue;
+                    }
                 }
 
                 if to_read > 0 {
@@ -234,7 +240,12 @@ impl RawFs for NtfsFs {
             let file_type = if is_dir { FileType::Dir } else { FileType::File };
             pos += name_len;
 
-            if is_dot_entry(name_bytes) { continue; }
+            let skip = (
+                !self.dont_skip_dot_entries && is_hidden_entry(name_bytes)
+            ) || is_dot_entry(name_bytes);
+            if skip {
+                continue;
+            }
 
             match callback(record_num, pos - name_len, name_len, file_type) {
                 ControlFlow::Break(b) => return Some(b),
@@ -244,11 +255,16 @@ impl RawFs for NtfsFs {
 
         None
     }
+
+    #[inline]
+    fn directory_entry_count_hint(&self, buf: &[u8]) -> usize {
+        u32::from_le_bytes(buf[0..4].try_into().unwrap()) as _
+    }
 }
 
 impl NtfsFs {
     #[inline]
-    pub fn new(file: File, device_id: u64) -> io::Result<Self> {
+    pub fn new(file: File, device_id: u64, cli: &Cli) -> io::Result<Self> {
         let mut boot = [0u8; 512];
         read_at_offset(&file, &mut boot, 0)?;
         let sb = parse_boot_sector(&boot)?;
@@ -265,7 +281,7 @@ impl NtfsFs {
             _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "Could not find $MFT $DATA attribute")),
         };
 
-        Ok(NtfsFs { file, sb, device_id, mft_runs })
+        Ok(NtfsFs { file, sb, device_id, mft_runs, dont_skip_dot_entries: cli.hidden })
     }
 
     #[inline]
@@ -291,8 +307,8 @@ impl NtfsFs {
     ) -> io::Result<bool> {
         let _span = tracy::span!("NtfsFs::read_resident_data");
 
-        let value_len = read_u32_le(attr_slice, NTFS_ATTR_RES_VALUE_LEN_OFFSET) as usize;
-        let value_off = read_u16_le(attr_slice, NTFS_ATTR_RES_VALUE_OFF_OFFSET) as usize;
+        let value_len = read_u32_unaligned_le(attr_slice, NTFS_ATTR_RES_VALUE_LEN_OFFSET) as usize;
+        let value_off = read_u32_unaligned_le(attr_slice, NTFS_ATTR_RES_VALUE_OFF_OFFSET) as usize;
         let end = (value_off + value_len).min(attr_slice.len());
         if value_off >= end { return Ok(true); }
 
@@ -335,8 +351,8 @@ impl NtfsFs {
             Some(&I30)
         ) else { return; };
 
-        let val_off = read_u16_le(attr_slice, NTFS_ATTR_RES_VALUE_OFF_OFFSET) as usize;
-        let val_len = read_u32_le(attr_slice, NTFS_ATTR_RES_VALUE_LEN_OFFSET) as usize;
+        let val_off = read_u32_unaligned_le(attr_slice, NTFS_ATTR_RES_VALUE_OFF_OFFSET) as usize;
+        let val_len = read_u32_unaligned_le(attr_slice, NTFS_ATTR_RES_VALUE_LEN_OFFSET) as usize;
         if val_off + 0x20 > attr_slice.len() { return; }
 
         let value = &attr_slice[val_off..(val_off + val_len).min(attr_slice.len())];
@@ -344,8 +360,8 @@ impl NtfsFs {
 
         let node_hdr = &value[0x10..];
 
-        let first_entry_off = read_u32_le(node_hdr, 0) as usize;
-        let used_size       = read_u32_le(node_hdr, 4) as usize;
+        let first_entry_off = read_u32_unaligned_le(node_hdr, 0) as usize;
+        let used_size       = read_u32_unaligned_le(node_hdr, 4) as usize;
         let end = used_size.min(node_hdr.len());
         if first_entry_off >= end { return; }
 
@@ -367,10 +383,10 @@ impl NtfsFs {
         let index_block_size = find_attribute(record, NTFS_ATTR_INDEX_ROOT, Some(&I30)).and_then(|(resident, ir)| {
             if !resident { return None; }
 
-            let val_off = read_u16_le(ir, NTFS_ATTR_RES_VALUE_OFF_OFFSET) as usize;
+            let val_off = read_u32_unaligned_le(ir, NTFS_ATTR_RES_VALUE_OFF_OFFSET) as usize;
             if val_off + 12 > ir.len() { return None; }
 
-            Some(read_u32_le(ir, val_off + 8) as u64)
+            Some(read_u32_unaligned_le(ir, val_off + 8) as u64)
         }).unwrap_or(self.sb.cluster_size as u64).max(512);
 
         let runs = decode_runlist(attr_slice, &self.sb)?;
@@ -417,8 +433,8 @@ impl NtfsFs {
 
             let node_hdr = &indx[0x18..];
 
-            let first_entry_off = read_u32_le(node_hdr, 0) as usize;
-            let used_size       = read_u32_le(node_hdr, 4) as usize;
+            let first_entry_off = read_u32_unaligned_le(node_hdr, 0) as usize;
+            let used_size       = read_u32_unaligned_le(node_hdr, 4) as usize;
             let end = used_size.min(node_hdr.len());
             if first_entry_off >= end { continue; }
 
@@ -510,7 +526,7 @@ fn parse_mft_record(record: &[u8], record_num: u64) -> io::Result<NtfsNode> {
 
     let mut mtime_sec = 0i64;
     if let Some((true, si)) = find_attribute(record, NTFS_ATTR_STANDARD_INFORMATION, None) {
-        let val_off = read_u16_le(si, NTFS_ATTR_RES_VALUE_OFF_OFFSET) as usize;
+        let val_off = read_u32_unaligned_le(si, NTFS_ATTR_RES_VALUE_OFF_OFFSET) as usize;
         if val_off + NTFS_SI_MTIME_OFFSET + 8 <= si.len() {
             let ft = &si[val_off + NTFS_SI_MTIME_OFFSET..val_off + NTFS_SI_MTIME_OFFSET + 8];
             let ft = u64::from_le_bytes(ft.try_into().unwrap());
@@ -525,7 +541,7 @@ fn parse_mft_record(record: &[u8], record_num: u64) -> io::Result<NtfsNode> {
 #[inline]
 fn find_data_size(record: &[u8]) -> u64 {
     match find_attribute(record, NTFS_ATTR_DATA, None) {
-        Some((true,  attr)) => read_u32_le(attr, NTFS_ATTR_RES_VALUE_LEN_OFFSET) as u64,
+        Some((true,  attr)) => read_u32_unaligned_le(attr, NTFS_ATTR_RES_VALUE_LEN_OFFSET) as u64,
         Some((false, attr)) if attr.len() >= 56 => u64::from_le_bytes(attr[48..56].try_into().unwrap()), // data_size at +0x30
         _ => 0,
     }
@@ -544,10 +560,10 @@ fn find_attribute<'a>(
     loop {
         if offset + 8 > record.len() { return None; }
 
-        let a_type = read_u32_le(record, offset);
+        let a_type = read_u32_unaligned_le(record, offset);
         if a_type == NTFS_ATTR_END || a_type == 0 { return None; }
 
-        let a_len = read_u32_le(record, offset + 4) as usize;
+        let a_len = read_u32_unaligned_le(record, offset + 4) as usize;
         if a_len < 8 || offset + a_len > record.len() { return None; }
 
         if a_type == attr_type {
@@ -557,7 +573,7 @@ fn find_attribute<'a>(
                 None => name_len == 0,
 
                 Some(wanted) => name_len == wanted.len() && {
-                    let name_off = read_u16_le(attr, NTFS_ATTR_NAME_OFF_OFFSET) as usize;
+                    let name_off = read_u32_unaligned_le(attr, NTFS_ATTR_NAME_OFF_OFFSET) as usize;
                     let nbytes = name_len * 2;
                     let name_bytes = &attr[name_off..name_off+nbytes];
                     name_off + nbytes <= attr.len() && name_bytes == bytemuck::cast_slice(wanted)

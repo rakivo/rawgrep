@@ -13,8 +13,12 @@ pub struct GitignoreChain {
 }
 
 struct GitignoreChainInner {
-    /// Stack of (depth, gitignore) pairs
-    stack: SmallVec<[(u16, Arc<Gitignore>); 8]>,
+    /// (depth, path_prefix_len, gitignore). `path_prefix_len` is the byte
+    /// length of the path to the directory that *contains* this .gitignore
+    /// -- what we strip off `path` before handing it to this file's
+    /// anchored-pattern matcher, since anchored patterns are relative to
+    /// the gitignore's own directory, not the walk root.
+    stack: SmallVec<[(u16, u32, Arc<Gitignore>); 8]>,
 
     /// Pre-computed: any gitignore in chain has negations?
     has_any_negations: bool,
@@ -32,7 +36,7 @@ impl GitignoreChain {
     pub fn from_root(gi: Gitignore) -> Self {
         let has_negations = gi.has_negations;
         let mut stack = SmallVec::new();
-        stack.push((0, Arc::new(gi)));
+        stack.push((0, 0, Arc::new(gi)));
         Self {
             inner: Some(Arc::new(GitignoreChainInner {
                 stack,
@@ -44,7 +48,7 @@ impl GitignoreChain {
     /// Add a gitignore at the given depth
     /// Only clones the stack if there are other references (Cow)
     #[inline]
-    pub fn with_gitignore(self, depth: u16, gi: Gitignore) -> Self {
+    pub fn with_gitignore(self, depth: u16, path_prefix_len: u32, gi: Gitignore) -> Self {
         let _span = tracy::span!("GitignoreChain::with_gitignore");
 
         let has_negations = gi.has_negations;
@@ -52,7 +56,7 @@ impl GitignoreChain {
 
         let Some(inner) = self.inner else {
             let mut stack = SmallVec::new();
-            stack.push((depth, new_gi));
+            stack.push((depth, path_prefix_len, new_gi));
             return Self {
                 inner: Some(Arc::new(GitignoreChainInner {
                     stack,
@@ -64,28 +68,29 @@ impl GitignoreChain {
         match Arc::try_unwrap(inner) {
             Ok(mut owned) => {
                 // We have exclusive ownership - mutate in place
-                owned.stack.retain(|(d, _)| *d <= depth);
-                owned.stack.push((depth, new_gi));
+                owned.stack.retain(|(d, ..)| *d <= depth);
+                owned.stack.push((depth, path_prefix_len, new_gi));
                 owned.has_any_negations |= has_negations;
                 Self {
                     inner: Some(Arc::new(owned)),
                 }
             }
+
             Err(shared) => {
                 // Other references exist - must clone
                 let mut new_stack: SmallVec<[_; 8]> = shared
                     .stack
                     .iter()
-                    .filter(|(d, _)| *d <= depth)
+                    .filter(|(d, ..)| *d <= depth)
                     .cloned()
                     .collect();
 
                 let mut has_any_negations = has_negations;
-                for (_, gi) in &new_stack {
+                for (.., gi) in &new_stack {
                     has_any_negations |= gi.has_negations;
                 }
 
-                new_stack.push((depth, new_gi));
+                new_stack.push((depth, path_prefix_len, new_gi));
 
                 Self {
                     inner: Some(Arc::new(GitignoreChainInner {
@@ -113,14 +118,16 @@ impl GitignoreChain {
         let filename_hash = fnv1a(filename);
 
         if inner.stack.len() == 1 {
-            let gi = unsafe { &inner.stack.get_unchecked(0).1 };
-            return gi.is_ignored_with_filename_hashed(path, filename, is_dir, filename_hash)
+            let (_, prefix_len, gi) = unsafe { inner.stack.get_unchecked(0) };
+            let rel = relative_path(path, *prefix_len);
+            return gi.is_ignored_with_filename_hashed(rel, filename, is_dir, filename_hash)
         }
 
         if !inner.has_any_negations {
             // -------- NO NEGATIONS - early exit on first match
-            for (_, gi) in inner.stack.iter() {
-                if gi.is_ignored_with_filename_hashed(path, filename, is_dir, filename_hash) {
+            for (_, prefix_len, gi) in inner.stack.iter() {
+                let rel = relative_path(path, *prefix_len);
+                if gi.is_ignored_with_filename_hashed(rel, filename, is_dir, filename_hash) {
                     return true;
                 }
             }
@@ -130,8 +137,9 @@ impl GitignoreChain {
 
         // ---------- HAS NEGATIONS - must check all, last match wins
         let mut result = false;
-        for (_, gi) in inner.stack.iter() {
-            match gi.check_ignored_with_filename(path, filename, is_dir, filename_hash) {
+        for (_, prefix_len, gi) in inner.stack.iter() {
+            let rel = relative_path(path, *prefix_len);
+            match gi.check_ignored_with_filename(rel, filename, is_dir, filename_hash) {
                 MatchResult::Ignored => result = true,
                 MatchResult::Negated => result = false,
                 MatchResult::NoMatch => {}
@@ -852,6 +860,24 @@ pub fn build_gitignore_from_file(gitignore_path: &str) -> Option<Gitignore> {
     let content = fs::read(path).ok()?;
 
     Some(Gitignore::from_bytes(&content))
+}
+
+/// Path relative to the directory that owns a given stack entry's gitignore.
+#[inline(always)]
+fn relative_path(path: &[u8], prefix_len: u32) -> &[u8] {
+    let prefix_len = prefix_len as usize;
+    if prefix_len == 0 {
+        // Root gitignore: nothing to strip, and there's no leading
+        // separator to skip since the first path segment is pushed with
+        // needs_slash = false.
+        path
+    } else if path.len() <= prefix_len {
+        &[]
+    } else {
+        // Skip the owning directory's path *and* the separator that was
+        // inserted when descending into its first child.
+        unsafe { path.get_unchecked(prefix_len + 1..) }
+    }
 }
 
 //

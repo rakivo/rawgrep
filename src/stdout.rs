@@ -1,3 +1,5 @@
+use crate::slab::{SLOTS_PER_WORKER, SLOT_CAP};
+
 use std::fs::File;
 use std::mem::ManuallyDrop;
 use std::io::{self, Write, IoSlice};
@@ -8,9 +10,8 @@ use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 #[cfg(windows)]
 use std::os::windows::io::{AsRawHandle, FromRawHandle};
 
-#[cfg(unix)]
 #[derive(Clone, Copy, PartialEq)]
-enum OutputKind { Tty, Pipe, File, Other }
+pub enum OutputKind { #[cfg(unix)] Tty, #[cfg(unix)] Pipe, #[cfg(unix)] File, Other }
 
 #[cfg(unix)]
 fn detect_output_kind(fd: std::os::unix::io::RawFd) -> OutputKind {
@@ -42,32 +43,31 @@ fn detect_output_kind(fd: std::os::unix::io::RawFd) -> OutputKind {
 pub struct RawStdout(ManuallyDrop<File>);
 
 impl RawStdout {
-    pub fn new() -> Option<(Self, bool, RawFd)> {
+    #[allow(unused_assignments)]
+    pub fn new() -> (Option<(Self, RawFd)>, OutputKind) {
         #[cfg(unix)]
         let file = unsafe { File::from_raw_fd(io::stdout().as_raw_fd()) };
 
         #[cfg(unix)]
         let fd = file.as_raw_fd();
 
+        let mut output_kind = OutputKind::Other;
+        #[cfg(unix)] { // Grow the pipe buffer so the reader doesn't force to block as often
+            output_kind = detect_output_kind(fd);
+            if output_kind == OutputKind::Pipe {
+                tune_pipe_capacity(fd);
+            }
+        }
+
         #[cfg(unix)]
         if is_stdout_being_redirected_to_dev_null(fd) {
-            return None;
+            return (None, output_kind);
         }
 
         #[cfg(windows)]
         let file = unsafe { File::from_raw_handle(io::stdout().as_raw_handle()) };
 
-        let mut is_pipe = false;
-        #[cfg(unix)] { // Grow the pipe buffer so the reader doesn't force to block as often
-            if detect_output_kind(fd) == OutputKind::Pipe {
-                is_pipe = true;
-
-                const F_SETPIPE_SZ: i32 = 1031;
-                unsafe { libc::fcntl(fd, F_SETPIPE_SZ, 1024 * 1024); }
-            }
-        }
-
-        Some((RawStdout(ManuallyDrop::new(file)), is_pipe, fd))
+        (Some((RawStdout(ManuallyDrop::new(file)), fd)), output_kind)
     }
 }
 
@@ -115,10 +115,17 @@ pub mod vmsplice {
     use std::os::unix::io::RawFd;
 
     #[repr(C)]
-    struct IoVec {
-        iov_base: *mut c_void,
-        iov_len: usize,
+    pub struct IoVec {
+        pub iov_base: *mut c_void,
+        pub iov_len: usize,
     }
+
+    // SAFETY: IoVec is just a (pointer, length) pair. Moving the *value*
+    // between threads carries no synchronization requirement by itself --
+    // the real obligation (pointed-to memory valid, not concurrently
+    // mutated) is upheld by OutputWorker's ownership discipline at the call
+    // site, same reasoning as RawStdout's explicit Send below.
+    unsafe impl Send for IoVec {}
 
     const SPLICE_F_NONBLOCK: u32 = 0x02;
 
@@ -154,4 +161,43 @@ pub mod vmsplice {
             Ok(n as usize)
         }
     }
+
+    /// Vectorized vmsplice: hands the kernel up to `iov.len()` buffers in
+    /// one syscall. Returns Ok(n) for total bytes accepted across the
+    /// whole vector (may span a prefix of buffers plus a partial buffer;
+    /// caller must walk iov lengths to find the boundary). 0 means the
+    /// pipe is full and accepted nothing.
+    ///
+    /// # Safety
+    /// Same contract as vmsplice_once, per iovec: caller must not
+    /// touch/reuse the accepted portion of any buffer until the reader
+    /// has consumed it. Only call on a fd known to be a pipe.
+    pub unsafe fn vmsplice_vectored(fd: RawFd, iov: &[IoVec]) -> io::Result<usize> {
+        let n = unsafe {
+            libc::syscall(
+                libc::SYS_vmsplice,
+                fd,
+                iov.as_ptr(),
+                iov.len(),
+                SPLICE_F_NONBLOCK,
+            )
+        };
+
+        if n < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(n as usize)
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn tune_pipe_capacity(raw_fd: std::os::unix::io::RawFd) {
+    let desired = (SLOTS_PER_WORKER * SLOT_CAP) as libc::c_int; // 1.25MB
+    // SAFETY: raw_fd is our own pipe fd; F_SETPIPE_SZ only resizes the
+    // kernel-side ring buffer, no memory aliasing involved. Ignoring the
+    // result is fine -- on failure (e.g. /proc/sys/fs/pipe-max-size caps
+    // it, or CAP_SYS_RESOURCE is required past that) the pipe just keeps
+    // its previous capacity and the vmsplice fallback path still handles it.
+    unsafe { libc::fcntl(raw_fd, libc::F_SETPIPE_SZ, desired) };
 }
