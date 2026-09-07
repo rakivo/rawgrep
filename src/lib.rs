@@ -274,21 +274,43 @@ pub fn setup_signal_handler() -> Arc<AtomicBool> {
     running
 }
 
-pub struct CursorHide;
+use std::sync::atomic::AtomicUsize;
+
+static CURSOR_HIDDEN_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Clone)]
+pub struct CursorHide {
+    active: bool,
+}
 
 impl CursorHide {
     #[inline]
     pub fn new() -> io::Result<Self> {
-        io::stdout().lock().write_all(CURSOR_HIDE.as_bytes())?;
-        io::stdout().flush()?;
-        Ok(CursorHide)
+        // fetch_add returns the PREVIOUS value; if it was 0, we're the
+        // first handle in, so we're the one that actually hides the cursor.
+        if CURSOR_HIDDEN_COUNT.fetch_add(1, Ordering::AcqRel) == 0 {
+            let mut out = io::stdout().lock();
+            out.write_all(CURSOR_HIDE.as_bytes())?;
+            out.flush()?;
+        }
+
+        Ok(CursorHide { active: true })
     }
 }
 
 impl Drop for CursorHide {
     #[inline]
     fn drop(&mut self) {
-        _ = io::stdout().lock().write_all(CURSOR_UNHIDE.as_bytes());
-        _ = io::stdout().flush();
+        if !self.active {
+            return;
+        }
+
+        // fetch_sub returns the PREVIOUS value; if it was 1, we just brought
+        // it to 0, so we're the last handle out and should restore the cursor.
+        if CURSOR_HIDDEN_COUNT.fetch_sub(1, Ordering::AcqRel) == 1 {
+            let mut out = io::stdout().lock();
+            _ = out.write_all(CURSOR_UNHIDE.as_bytes());
+            _ = out.flush();
+        }
     }
 }

@@ -4,7 +4,7 @@ use crate::slab::SlotPool;
 use crate::RawGrepConfig;
 use crate::path_buf::SmallPathBuf;
 use crate::stdout::{RawStdout, OutputKind};
-use crate::{cli, ignore, platform};
+use crate::{cli, ignore, platform, CursorHide};
 use crate::parser::Parser;
 use crate::cache::{FileKey, FileMeta, CacheStats};
 use crate::stats::{AtomicStats, Stats};
@@ -47,6 +47,7 @@ struct SearchJob<S: MatchSink> {
 #[derive(Clone)]
 pub struct RawGrepCtx<S: MatchSink> {
     worker_count:   usize,
+
     stdout_is_being_redirected_to_dev_null: bool,
 
     injector:       Arc<Injector<WorkItem>>,
@@ -61,6 +62,8 @@ pub struct RawGrepCtx<S: MatchSink> {
 
     output_tx:      Sender<OutputMessage>,
     flush_ack_rx:   Arc<Mutex<Receiver<()>>>,
+
+    _cursor_hide_for_tty: Option<CursorHide>
 }
 
 impl<S: MatchSink + 'static> RawGrepCtx<S> {
@@ -80,6 +83,12 @@ impl<S: MatchSink + 'static> RawGrepCtx<S> {
 
         let (raw_stdout, output_kind) = RawStdout::new();
         let stdout_is_being_redirected_to_dev_null = raw_stdout.is_none();
+
+        let _cursor_hide_for_tty = if output_kind == OutputKind::Tty {
+            CursorHide::new().ok()
+        } else {
+            None
+        };
 
         if let Some((raw_stdout, raw_fd)) = raw_stdout {
             _ = std::thread::spawn(move || {
@@ -115,6 +124,7 @@ impl<S: MatchSink + 'static> RawGrepCtx<S> {
             job_done,
             running_signal,
             wake,
+            _cursor_hide_for_tty,
             current_job: job,
             output_tx,
             worker_count: num_threads,

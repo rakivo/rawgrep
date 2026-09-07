@@ -11,7 +11,7 @@ static ALLOC: dhat::Alloc = dhat::Alloc;
 
 use rawgrep::cli::Cli;
 use rawgrep::worker::NoSink;
-use rawgrep::{CursorHide, Error, RawGrepConfig, eprint_blue, eprint_green, eprintln_red};
+use rawgrep::{Error, RawGrepConfig, eprint_blue, eprint_green, eprintln_red};
 
 use std::io;
 
@@ -25,8 +25,6 @@ fn main() -> io::Result<()> {
 
     let cli = Cli::parse();
     let show_stats = cli.stats;
-
-    let _cur = CursorHide::new();
 
     match rawgrep::run_with_inspect(
         RawGrepConfig::from_cli(cli),
