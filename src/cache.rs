@@ -183,10 +183,10 @@ impl<T: Copy> FatPtr<T> {
     }
 
     #[inline(always)]
-    fn get(&self, idx: usize) -> T {
+    fn get(&self, index: usize) -> T {
         let Self { ptr, len } = *self;
-        debug_assert!(idx < len, "FatPtr: index {idx} out of bounds (len {len})");
-        unsafe { *ptr.add(idx) }
+        debug_assert!(index < len, "FatPtr: index {index} out of bounds (len {len})");
+        unsafe { *ptr.add(index) }
     }
 
     #[allow(unused)]
@@ -492,7 +492,7 @@ pub struct FragmentCache<S: CacheStorage = DiskStorage> {
     fragment_hashes: FatPtr<u32>,      // hash of 4-byte fragment
     file_keys:       FatPtr<FileKey>,  // file identifiers
     file_metas:      FatPtr<FileMeta>, // for cache invalidation
-    file_bitsets:    FatPtr<u64>,      // flattened bitsets: file_id * num_fragments_in_u64 + bit_idx
+    file_bitsets:    FatPtr<u64>,      // flattened bitsets: file_id * num_fragments_in_u64 + bit_index
 
     // @Cleanup
     owned_fragment_hashes: Option<Box<[u32]>>,
@@ -575,12 +575,12 @@ impl FragmentCache<MemoryStorage> {
                     owned_bits[offset + i] = !0u64;
                 }
 
-                for (frag_idx, &present) in fragment_presence[file_id].iter().enumerate() {
+                for (frag_index, &present) in fragment_presence[file_id].iter().enumerate() {
                     if present {
-                        let u64_idx = offset + frag_idx / 64;
-                        let bit_idx = frag_idx % 64;
-                        if u64_idx < owned_bits.len() {
-                            owned_bits[u64_idx] &= !(1u64 << bit_idx);
+                        let u64_index = offset + frag_index / 64;
+                        let bit_index = frag_index % 64;
+                        if u64_index < owned_bits.len() {
+                            owned_bits[u64_index] &= !(1u64 << bit_index);
                         }
                     }
                 }
@@ -845,14 +845,14 @@ impl<S: CacheStorage> FragmentCache<S> {
             for file_id in 0..num_files {
                 let file_key = new_file_keys[file_id];
                 let hash = file_key.hash();
-                let mut idx = (hash as usize) & mask;
+                let mut index = (hash as usize) & mask;
                 for _ in 0..16 {
-                    let existing = new_lookup[idx].load(Ordering::Relaxed);
+                    let existing = new_lookup[index].load(Ordering::Relaxed);
                     if existing == FILE_LOOKUP_EMPTY {
-                        new_lookup[idx].store(file_id as u32, Ordering::Relaxed);
+                        new_lookup[index].store(file_id as u32, Ordering::Relaxed);
                         break;
                     }
-                    idx = (idx + 1) & mask;
+                    index = (index + 1) & mask;
                 }
             }
 
@@ -991,14 +991,14 @@ impl<S: CacheStorage> FragmentCache<S> {
         for file_id in 0..num_files {
             let hash = file_keys.get(file_id).hash();
 
-            let mut idx = (hash as usize) & mask;
+            let mut index = (hash as usize) & mask;
             for _ in 0..16 {
-                if file_lookup[idx].load(Ordering::Relaxed) == FILE_LOOKUP_EMPTY {
-                    file_lookup[idx].store(file_id as u32, Ordering::Relaxed);
+                if file_lookup[index].load(Ordering::Relaxed) == FILE_LOOKUP_EMPTY {
+                    file_lookup[index].store(file_id as u32, Ordering::Relaxed);
                     break;
                 }
 
-                idx = (idx + 1) & mask;
+                index = (index + 1) & mask;
             }
         }
 
@@ -1150,15 +1150,15 @@ impl<S: CacheStorage> FragmentCache<S> {
         let offset = (file_id as usize) * bits_per_file_u64; // Start of this file's bitset
 
         for &frag_hash in required_fragment_hashes {
-            let Some(frag_idx) = self.find_fragment_index(frag_hash) else {
+            let Some(frag_index) = self.find_fragment_index(frag_hash) else {
                 continue;
             };
 
-            let u64_idx = offset + (frag_idx >> 6); // Which u64 contains the bit
-            let bit_idx = frag_idx & 63;            // Which bit contains the info
+            let u64_index = offset + (frag_index >> 6); // Which u64 contains the bit
+            let bit_index = frag_index & 63;            // Which bit contains the info
 
-            let bitset_val = self.file_bitsets.get(u64_idx);
-            let is_absent = (bitset_val & (1u64 << bit_idx)) != 0;
+            let bitset_val = self.file_bitsets.get(u64_index);
+            let is_absent = (bitset_val & (1u64 << bit_index)) != 0;
 
             if likely(is_absent) {
                 self.stats.hits.fetch_add(1, Ordering::Relaxed);
@@ -1182,10 +1182,10 @@ impl<S: CacheStorage> FragmentCache<S> {
     fn lookup_file_id(&self, file_key: FileKey) -> Option<u32> {
         let hash = file_key.hash();
         let mask = self.file_lookup.len() - 1;
-        let mut idx = (hash as usize) & mask;
+        let mut index = (hash as usize) & mask;
 
         for _ in 0..16 {
-            let file_id = self.file_lookup[idx].load(Ordering::Acquire);
+            let file_id = self.file_lookup[index].load(Ordering::Acquire);
             if file_id == FILE_LOOKUP_EMPTY {
                 return None;
             }
@@ -1195,236 +1195,28 @@ impl<S: CacheStorage> FragmentCache<S> {
                 return Some(file_id);
             }
 
-            idx = (idx + 1) & mask;
+            index = (index + 1) & mask;
         }
 
         None
     }
 
-    /// Adapter for `merge_updates` that accepts presence as a flat `Vec<bool>`
-    /// (`fragment_presence[file_idx * fragment_count + frag_idx]`) instead of packed bits.
-    ///
-    /// Used only in tests.
-    pub fn merge_updates_bool(
-        &mut self,
-        file_keys: Vec<FileKey>,
-        file_metas: Vec<FileMeta>,
-        fragment_hashes: &[u32],
-        fragment_presence: Vec<bool>,
-    ) -> io::Result<()> {
-        let fragment_count = fragment_hashes.len();
-        let words_per_file = fragment_count.div_ceil(64);
-        debug_assert_eq!(
-            fragment_presence.len(),
-            file_keys.len() * fragment_count,
-            "fragment_presence len must be file_keys.len() * fragment_hashes.len()"
-        );
-
-        let mut packed = Vec::with_capacity(file_keys.len() * words_per_file);
-        for file_idx in 0..file_keys.len() {
-            let row = &fragment_presence[file_idx * fragment_count..(file_idx + 1) * fragment_count];
-            let mut words = vec![0u64; words_per_file];
-            for (frag_idx, &present) in row.iter().enumerate() {
-                if present {
-                    words[frag_idx / 64] |= 1u64 << (frag_idx % 64);
-                }
-            }
-            packed.extend_from_slice(&words);
-        }
-
-        self.merge_updates(file_keys, file_metas, fragment_hashes, packed)
-    }
-
-    /// Merge thread-local cache buffers into cache (called once after all workers finish)
-    ///
-    /// `fragment_presence` contains per-fragment presence info for each file:
-    /// `fragment_presence[file_idx][frag_idx]` = true if that fragment is present in the file
-    pub fn merge_updates(
-        &mut self,
-        file_keys: Vec<FileKey>,
-        file_metas: Vec<FileMeta>,
-        fragment_hashes: &[u32],
-        fragment_presence: Vec<u64>,
-    ) -> io::Result<()> {
-        if file_keys.is_empty() {
-            return Ok(());
-        }
-
-        // COW: copy mmap data to owned buffers before writing
-        self.ensure_owned();
-
-        // ------- Ensure we have capacity for all new files
-        let current_files = self.num_files.load(Ordering::Relaxed) as usize;
-        let needed_capacity = current_files + file_keys.len();
-        self.ensure_capacity(needed_capacity);
-
-        let start = Instant::now();
-
-        let words_per_file = fragment_hashes.len().div_ceil(64);
-
-        //
-        //
-        // Add all files and collect fragment data
-        //
-        //
-
-        let mut file_updates = Vec::with_capacity(file_keys.len()); // @Note: merge_updates is called once per search, which normally means once per program when running main.rs; if not, when running inside some other program using RawGrepCtx, this memory should be reused. @Incomplete.
-
-        // ------- Track the original num_files to know which files are new
-        let original_num_files = self.num_files.load(Ordering::Relaxed) as usize;
-
-        //
-        // Guards against a single merge_updates() batch containing the same
-        // file_key twice. If that happens, the second occurrence's
-        // needs_full_reset pass would zero and clobber bits the first
-        // occurrence just wrote for fragments outside the current batch silently.
-        //
-        // Callers are expected to de-duplicate by file_key before calling merge_updates,
-        // which they don't right now... Not sure if this might actually happen.
-        //
-        #[cfg(debug_assertions)]
-        let mut seen_file_ids: std::collections::HashSet<usize> = std::collections::HashSet::with_capacity(file_keys.len());
-
-        let mut dropped = 0u32;
-
-        for file_idx in 0..file_keys.len() {
-            let num_files = self.num_files.load(Ordering::Relaxed) as usize;
-            if num_files >= self.file_capacity {
-                //
-                // self.file_capacity is capped at self.max_files (see ensure_capacity),
-                // so once it's reached, every subsequent file in this batch, and every future
-                // merge_updates call, will drop new files the same way until max_files is raised.
-                //
-                dropped = (file_keys.len() - file_idx) as u32;
-                break;
-            }
-
-            let file_key = file_keys[file_idx];
-            let file_meta = file_metas[file_idx];
-            let presence = &fragment_presence[file_idx * words_per_file..(file_idx + 1) * words_per_file];
-
-            // --------- Find or insert file
-            let file_id = match self.lookup_file_id(file_key) {
-                Some(id) => id as usize,
-                None => {
-                    let new_file_id = num_files;
-                    self.num_files.store((num_files + 1) as u32, Ordering::Relaxed);
-
-                    let file_keys_slice = self.owned_file_keys.as_mut().unwrap();
-                    let file_metas_slice = self.owned_file_metas.as_mut().unwrap();
-                    file_keys_slice[new_file_id] = file_key;
-                    file_metas_slice[new_file_id] = file_meta;
-
-                    self.insert_into_lookup(file_key, new_file_id as u32);
-                    new_file_id
-                }
-            };
-
-            #[cfg(debug_assertions)]
-            debug_assert!(
-                seen_file_ids.insert(file_id),
-                "merge_updates: file_id {} (file_key {:?}) appears more than once in a single batch; \
-                 second occurrence's bitset reset would clobber the first's bits for fragments \
-                 outside this batch. Caller must de-duplicate by file_key before calling merge_updates.",
-                file_id, file_key,
-            );
-
-
-            // --------- Update metadata
-            //
-            // A meta mismatch means every previously-recorded bit for this file
-            // (including bits from fragments outside this batch) is now stale.
-            //
-            let old_meta = self.owned_file_metas.as_ref().unwrap()[file_id];
-            let meta_changed = !old_meta.matches(file_meta);
-            self.owned_file_metas.as_mut().unwrap()[file_id] = file_meta;
-
-            // --------- Add fragments and collect indices with their presence status
-            //
-            // Limit to 100 fragments per file
-            //
-            // @Constant @Tune
-            let mut fragment_data = Vec::with_capacity(fragment_hashes.len().min(100));
-            for (frag_i, &frag_hash) in fragment_hashes.iter().take(100).enumerate() {
-                let frag_idx = self.add_fragment(frag_hash);
-                let is_present = (presence[frag_i/64] & (1 << (frag_i % 64))) != 0;
-                fragment_data.push((frag_idx, is_present));
-            }
-
-            // Full row reset is needed for brand-new files AND for files whose
-            // content changed since we last saw them, not just new files.
-            let needs_full_reset = file_id >= original_num_files || meta_changed;
-            file_updates.push((file_id, fragment_data, needs_full_reset));
-        }
-
-        if dropped > 0 {
-            self.stats.dropped_at_capacity.fetch_add(dropped, Ordering::Relaxed);
-            eprintln!(
-                "FragmentCache dropped {} file(s), max_files ({}) reached; \
-                 these files will never be cached until max_files is increased",
-                dropped, self.max_files
-            );
-        }
-
-        //
-        //
-        // Update all bitsets
-        //
-        //
-
-        let num_fragments = self.num_fragments.load(Ordering::Relaxed) as usize;
-        let bits_per_file_u64 = num_fragments.div_ceil(64).max(1);
-        let owned_file_bitsets = self.owned_file_bitsets.as_mut().unwrap();
-
-        for (file_id, fragment_data, needs_full_reset) in file_updates {
-            let offset = file_id * bits_per_file_u64;
-
-            if needs_full_reset {
-                for i in 0..bits_per_file_u64 {
-                    let idx = offset + i;
-                    if idx < owned_file_bitsets.len() {
-                        owned_file_bitsets[idx] = 0u64;  // Unknown -- only checked fragments get marked
-                    }
-                }
-            }
-
-            for (frag_idx, is_present) in fragment_data {
-                let u64_idx = offset + (frag_idx / 64);
-                let bit_idx = frag_idx % 64;
-                if u64_idx < owned_file_bitsets.len() {
-                    if is_present {
-                        // ----- Fragment PRESENT - clear bit (bit=0)
-                        owned_file_bitsets[u64_idx] &= !(1u64 << bit_idx);
-                    } else {
-                        // ----- Fragment ABSENT - set bit (bit=1)
-                        owned_file_bitsets[u64_idx] |= 1u64 << bit_idx;
-                    }
-                }
-            }
-        }
-
-        let elapsed = start.elapsed();
-        eprintln!("Cache updated: {} files in {:.2}ms", file_keys.len(), elapsed.as_millis() as f64);
-
-        Ok(())
-    }
-
     /// Add fragment to ring buffer (returns index)
     /// NOTE: Caller must call ensure_owned() first!
-    fn add_fragment(&mut self, frag_hash: u32) -> usize {
-        if let Some(idx) = self.find_fragment_index(frag_hash) {
-            return idx;
+    fn add_fragment(&mut self, frag_hash: u32) -> u32 {
+        if let Some(index) = self.find_fragment_index(frag_hash) {
+            return index as u32;
         }
 
         let num_fragments = self.num_fragments.load(Ordering::Relaxed) as usize;
 
         if num_fragments < self.max_fragments as usize {
             // ------- Ring buffer is not full
-            let idx = num_fragments;
+            let index = num_fragments;
             let new_num_fragments = num_fragments + 1;
 
             // Write hash first
-            self.owned_fragment_hashes.as_mut().unwrap()[idx] = frag_hash;
+            self.owned_fragment_hashes.as_mut().unwrap()[index] = frag_hash;
 
             //
             // Migrate bitset stride if we crossed a 64-boundary
@@ -1444,27 +1236,27 @@ impl<S: CacheStorage> FragmentCache<S> {
 
             let num_files = self.num_files.load(Ordering::Relaxed) as usize;
             let bits_per_file_u64 = new_num_fragments.div_ceil(64).max(1);
-            let u64_offset = idx / 64;
-            let bit_idx = idx % 64;
+            let u64_offset = index / 64;
+            let bit_index = index % 64;
 
             let owned_file_bitsets = self.owned_file_bitsets.as_mut().unwrap();
             for file_id in 0..num_files {
-                let bitset_idx = file_id * bits_per_file_u64 + u64_offset;
-                if bitset_idx < owned_file_bitsets.len() {
-                    owned_file_bitsets[bitset_idx] &= !(1u64 << bit_idx);
+                let bitset_index = file_id * bits_per_file_u64 + u64_offset;
+                if bitset_index < owned_file_bitsets.len() {
+                    owned_file_bitsets[bitset_index] &= !(1u64 << bit_index);
                 }
             }
 
-            idx
+            index as u32
         } else {
             // ------- Ring buffer is full
             // evict oldest (FIFO)
 
             let ring_pos = self.ring_pos.load(Ordering::Relaxed) as usize;
-            let idx = ring_pos;
+            let index = ring_pos;
 
             // Write hash first, then borrow bitsets
-            self.owned_fragment_hashes.as_mut().unwrap()[idx] = frag_hash;
+            self.owned_fragment_hashes.as_mut().unwrap()[index] = frag_hash;
 
             let next_pos = (ring_pos + 1) % (self.max_fragments as usize);
             self.ring_pos.store(next_pos as u32, Ordering::Relaxed);
@@ -1477,20 +1269,20 @@ impl<S: CacheStorage> FragmentCache<S> {
             // so stride is already at its maximum and will never grow again
             let num_files = self.num_files.load(Ordering::Relaxed) as usize;
             let bits_per_file_u64 = num_fragments.div_ceil(64).max(1);
-            let u64_offset = idx / 64;
-            let bit_idx    = idx % 64;
+            let u64_offset = index / 64;
+            let bit_index    = index % 64;
 
             let owned_file_bitsets = self.owned_file_bitsets.as_mut().unwrap();
 
             for file_id in 0..num_files {
-                let bitset_idx = file_id * bits_per_file_u64 + u64_offset;
-                if bitset_idx < owned_file_bitsets.len() {
+                let bitset_index = file_id * bits_per_file_u64 + u64_offset;
+                if bitset_index < owned_file_bitsets.len() {
                     // clear the bit (unknown/must-check)
-                    owned_file_bitsets[bitset_idx] &= !(1u64 << bit_idx);
+                    owned_file_bitsets[bitset_index] &= !(1u64 << bit_index);
                 }
             }
 
-            idx
+            index as u32
         }
     }
 
@@ -1499,12 +1291,12 @@ impl<S: CacheStorage> FragmentCache<S> {
     fn insert_into_lookup(&self, file_key: FileKey, file_id: u32) {
         let hash = file_key.hash();
         let mask = self.file_lookup.len() - 1;
-        let mut idx = (hash as usize) & mask;
+        let mut index = (hash as usize) & mask;
 
         // @Note: This might silently fail, which means this file will always
         // miss the cache, maybe we should return like a boolean or something.
         for _ in 0..16 {
-            let existing = self.file_lookup[idx].compare_exchange(
+            let existing = self.file_lookup[index].compare_exchange(
                 FILE_LOOKUP_EMPTY,
                 file_id,
                 Ordering::Release,
@@ -1516,7 +1308,7 @@ impl<S: CacheStorage> FragmentCache<S> {
                 return;
             }
 
-            idx = (idx + 1) & mask;
+            index = (index + 1) & mask;
         }
     }
 
@@ -1609,6 +1401,373 @@ impl<S: CacheStorage> FragmentCache<S> {
     #[cfg(not(unix))]
     fn fix_ownership(_path: &Path) -> io::Result<()> {
         Ok(())
+    }
+}
+
+/// Resolution of a single fragment hash against the current table.
+/// Computed once per batch since fragment_hashes is shared by every file.
+struct FragPlan {
+    hash: u32,
+
+    // Some if already in the table. None means apply_batch must add it.
+    existing_index: Option<u32>,
+}
+
+/// Resolution of a single file against the current table.
+struct FilePlan {
+    file_index:   u32,         // index into the caller's file_keys/file_metas
+    existing_id:  Option<u32>, // None means apply_batch must insert it
+    meta_changed: bool,
+}
+
+struct BatchPlan {
+    frags: Vec<FragPlan>,
+    files: Vec<FilePlan>,
+
+    // True if applying this plan would touch any stored byte.
+    changed: bool,
+}
+
+impl FragmentCache {
+    /// Read-only resolution pass. Never touches owned_* buffers, safe to
+    /// call before ensure_owned(). Shared by merge_updates() and
+    /// merge_updates_if_changed() so the lookups only happen once no matter
+    /// which caller ends up applying the result.
+    fn plan_batch(
+        &self,
+        file_keys: &[FileKey],
+        file_metas: &[FileMeta],
+        fragment_hashes: &[u32],
+        fragment_presence: &[u64],
+    ) -> BatchPlan {
+        let num_fragments = self.num_fragments.load(Ordering::Relaxed) as usize;
+        let bits_per_file_u64 = num_fragments.div_ceil(64).max(1);
+        let words_per_file = fragment_hashes.len().div_ceil(64);
+
+        //
+        // Resolve fragments once, shared across every file below.
+        //
+        let mut frags = Vec::with_capacity(fragment_hashes.len().min(100));
+        let mut has_new_fragment = false;
+        for &hash in fragment_hashes.iter().take(100) {
+            let existing_index = self.find_fragment_index(hash).map(|index| index as u32);
+            if existing_index.is_none() {
+                has_new_fragment = true;
+            }
+
+            frags.push(FragPlan { hash, existing_index });
+        }
+
+        let mut files = Vec::with_capacity(file_keys.len());
+
+        //
+        // A new fragment always dirties the batch: add_fragment() clears
+        // that bit for every existing file, which is a state change even
+        // if every file's own presence data matches what's on disk already.
+        //
+        let mut changed = has_new_fragment;
+
+        for file_index in 0..file_keys.len() {
+            let file_key = file_keys[file_index];
+            let file_meta = file_metas[file_index];
+
+            let existing_id = self.lookup_file_id(file_key);
+            let meta_changed = match existing_id {
+                None => true,  // Brand-new file is always a change
+                Some(id) => {
+                    let stored_meta = self.file_metas.get(id as usize);
+                    !stored_meta.matches(file_meta)
+                }
+            };
+
+            if existing_id.is_none() || meta_changed {
+                changed = true;
+            }
+
+            //
+            // Only worth comparing individual bits if the batch isn't
+            // already known dirty, and this file exists with matching
+            // meta (a new/invalidated file is a full rewrite regardless of what the bits say).
+            //
+            if !changed && let Some(id) = existing_id {
+                let offset = (id as usize) * bits_per_file_u64;
+                let presence = &fragment_presence[
+                    file_index * words_per_file
+                     ..
+                    (file_index + 1) * words_per_file
+                ];
+
+                for (frag_i, frag_plan) in frags.iter().enumerate() {
+                    // has_new_fragment is false here, so this is always Some.
+                    let frag_index = frag_plan.existing_index.unwrap() as usize;
+                    let is_present = (presence[frag_i / 64] & (1 << (frag_i % 64))) != 0;
+                    let expect_bit_set = !is_present;
+
+                    let u64_index = offset + (frag_index >> 6);
+                    let bit_index = frag_index & 63;
+                    let actual_bit_set = (self.file_bitsets.get(u64_index) & (1u64 << bit_index)) != 0;
+
+                    if actual_bit_set != expect_bit_set {
+                        changed = true;
+                        break;
+                    }
+                }
+            }
+
+            files.push(FilePlan { file_index: file_index as u32, existing_id, meta_changed });
+        }
+
+        BatchPlan { frags, files, changed }
+    }
+
+    /// Applies a plan produced by plan_batch(). Caller is responsible for
+    /// checking plan.changed first, this does no checking of its own.
+    fn apply_batch(
+        &mut self,
+        plan: &BatchPlan,
+        file_keys: &[FileKey],
+        file_metas: &[FileMeta],
+        fragment_presence: &[u64],
+    ) -> io::Result<()> {
+        let words_per_file = plan.frags.len().div_ceil(64).max(1) as u32;
+
+        // COW: copy mmap data to owned buffers before writing.
+        self.ensure_owned();
+
+        let needed_capacity = self.num_files.load(Ordering::Relaxed) as usize + plan.files.len();
+        self.ensure_capacity(needed_capacity);
+
+        let start = Instant::now();
+
+        //
+        // Resolve every fragment up front. fragment_hashes is shared
+        // by the whole batch, so each new hash only needs adding once here.
+        //
+        let mut frag_indexes = Vec::with_capacity(plan.frags.len());
+        for frag_plan in &plan.frags {
+            let index = match frag_plan.existing_index {
+                Some(index) => index,
+                None => self.add_fragment(frag_plan.hash),
+            };
+            frag_indexes.push(index);
+        }
+
+        let original_num_files = self.num_files.load(Ordering::Relaxed) as usize;
+
+        //
+        // Guards against a single merge_updates() batch containing the same
+        // file_key twice. If that happens, the second occurrence's
+        // needs_full_reset pass would zero and clobber bits the first
+        // occurrence just wrote for fragments outside the current batch silently.
+        //
+        // Callers are expected to de-duplicate by file_key before calling merge_updates,
+        // which they don't right now... Not sure if this might actually happen.
+        //
+        #[cfg(debug_assertions)]
+        let mut seen_file_ids = std::collections::HashSet::with_capacity(plan.files.len());
+
+        //
+        //
+        // Add all files and collect fragment data
+        //
+        //
+
+        let mut dropped = 0u32;
+        let mut file_updates = Vec::with_capacity(plan.files.len());
+
+        for (i, file_plan) in plan.files.iter().enumerate() {
+            let num_files = self.num_files.load(Ordering::Relaxed) as usize;
+            if num_files >= self.file_capacity {
+                //
+                // self.file_capacity is capped at self.max_files (see ensure_capacity),
+                // so once it's reached, every subsequent file in this batch, and every future
+                // merge_updates call, will drop new files the same way until max_files is raised.
+                //
+                dropped = (plan.files.len() - i) as u32;
+                break;
+            }
+
+            let file_key  = file_keys[file_plan.file_index as usize];
+            let file_meta = file_metas[file_plan.file_index as usize];
+
+            let file_id = match file_plan.existing_id {
+                Some(id) => id as usize,
+                None => {
+                    let new_file_id = num_files;
+                    self.num_files.store((num_files + 1) as u32, Ordering::Relaxed);
+
+                    self.insert_into_lookup(file_key, new_file_id as u32);
+                    new_file_id
+                }
+            };
+
+            #[cfg(debug_assertions)]
+            debug_assert!(
+                seen_file_ids.insert(file_id),
+                "apply_batch: file_id {} appears more than once in a single batch, \
+                 caller must de-duplicate by file_key before calling merge_updates.",
+                file_id,
+            );
+
+            //
+            // Update metadata
+            //
+
+            self.owned_file_keys.as_mut().unwrap()[file_id] = file_key;
+            self.owned_file_metas.as_mut().unwrap()[file_id] = file_meta;
+
+            let needs_full_reset =
+                file_plan.existing_id.is_none()
+             || file_plan.meta_changed
+             || file_id >= original_num_files;
+
+            let presence = &fragment_presence[
+                (file_plan.file_index       * words_per_file) as usize
+                ..
+                ((file_plan.file_index + 1) * words_per_file) as usize
+            ];
+
+            //
+            // Add fragments and collect indexes with their presence status
+            //
+            let mut fragment_data = Vec::with_capacity(frag_indexes.len());
+            for (frag_i, &frag_index) in frag_indexes.iter().enumerate() {
+                let is_present = (presence[frag_i / 64] & (1 << (frag_i % 64))) != 0;
+                fragment_data.push((frag_index, is_present));
+            }
+
+            file_updates.push((file_id, fragment_data, needs_full_reset));
+        }
+
+        if dropped > 0 {
+            self.stats.dropped_at_capacity.fetch_add(dropped, Ordering::Relaxed);
+            eprintln!(
+                "FragmentCache dropped {} file(s), max_files ({}) reached; \
+                 these files will never be cached until max_files is increased",
+                dropped, self.max_files
+            );
+        }
+
+        //
+        //
+        // Update all bitsets
+        //
+        //
+
+        let num_fragments = self.num_fragments.load(Ordering::Relaxed) as usize;
+        let bits_per_file_u64 = num_fragments.div_ceil(64).max(1);
+        let owned_file_bitsets = self.owned_file_bitsets.as_mut().unwrap();
+
+        for (file_id, fragment_data, needs_full_reset) in file_updates {
+            let offset = file_id * bits_per_file_u64;
+
+            if needs_full_reset {
+                for i in 0..bits_per_file_u64 {
+                    let index = offset + i;
+                    if index < owned_file_bitsets.len() {
+                        owned_file_bitsets[index] = 0u64;  // Unknown -- only checked fragments get marked
+                    }
+                }
+            }
+
+            for (frag_index, is_present) in fragment_data {
+                let frag_index = frag_index as usize;
+
+                let u64_index = offset + (frag_index / 64);
+                let bit_index = frag_index % 64;
+
+                if u64_index < owned_file_bitsets.len() {
+                    if is_present {
+                        // ----- Fragment PRESENT - clear bit (bit=0)
+                        owned_file_bitsets[u64_index] &= !(1u64 << bit_index);
+                    } else {
+                        // ----- Fragment ABSENT - set bit (bit=1)
+                        owned_file_bitsets[u64_index] |=   1u64 << bit_index;
+                    }
+                }
+            }
+        }
+
+        let elapsed = start.elapsed();
+        eprintln!("Cache updated: {} files in {:.2}ms", plan.files.len(), elapsed.as_millis() as f64);
+
+        Ok(())
+    }
+
+    /// Unconditional merge, same behavior as before. Used by tests and any
+    /// caller that already knows it wants to write.
+    pub fn merge_updates(
+        &mut self,
+        file_keys: Vec<FileKey>,
+        file_metas: Vec<FileMeta>,
+        fragment_hashes: &[u32],
+        fragment_presence: Vec<u64>,
+    ) -> io::Result<()> {
+        if file_keys.is_empty() {
+            return Ok(());
+        }
+
+        let plan = self.plan_batch(&file_keys, &file_metas, fragment_hashes, &fragment_presence);
+        self.apply_batch(&plan, &file_keys, &file_metas, &fragment_presence)
+    }
+
+    /// Same as merge_updates(), but skips ensure_owned() and every mutation
+    /// entirely if the batch would not change anything already on disk.
+    /// Returns whether it actually wrote anything, so the caller knows
+    /// whether save_to_disk() is worth calling.
+    pub fn merge_updates_if_changed(
+        &mut self,
+        file_keys: Vec<FileKey>,
+        file_metas: Vec<FileMeta>,
+        fragment_hashes: &[u32],
+        fragment_presence: Vec<u64>,
+    ) -> io::Result<bool> {
+        if file_keys.is_empty() {
+            return Ok(false);
+        }
+
+        let plan = self.plan_batch(&file_keys, &file_metas, fragment_hashes, &fragment_presence);
+        if !plan.changed {
+            return Ok(false);
+        }
+
+        self.apply_batch(&plan, &file_keys, &file_metas, &fragment_presence)?;
+
+        Ok(true)
+    }
+
+    /// Adapter for `merge_updates` that accepts presence as a flat `Vec<bool>`
+    /// (`fragment_presence[file_index * fragment_count + frag_index]`) instead of packed bits.
+    ///
+    /// Used only in tests.
+    pub fn merge_updates_bool(
+        &mut self,
+        file_keys: Vec<FileKey>,
+        file_metas: Vec<FileMeta>,
+        fragment_hashes: &[u32],
+        fragment_presence: Vec<bool>,
+    ) -> io::Result<()> {
+        let fragment_count = fragment_hashes.len();
+        let words_per_file = fragment_count.div_ceil(64);
+        debug_assert_eq!(
+            fragment_presence.len(),
+            file_keys.len() * fragment_count,
+            "fragment_presence len must be file_keys.len() * fragment_hashes.len()"
+        );
+
+        let mut packed = Vec::with_capacity(file_keys.len() * words_per_file);
+        for file_index in 0..file_keys.len() {
+            let row = &fragment_presence[file_index * fragment_count..(file_index + 1) * fragment_count];
+            let mut words = vec![0u64; words_per_file];
+            for (frag_index, &present) in row.iter().enumerate() {
+                if present {
+                    words[frag_index / 64] |= 1u64 << (frag_index % 64);
+                }
+            }
+            packed.extend_from_slice(&words);
+        }
+
+        self.merge_updates(file_keys, file_metas, fragment_hashes, packed)
     }
 }
 
@@ -2047,7 +2206,7 @@ mod tests {
         let k = key(1);
         let m = meta(1, 1);
 
-        // Fill 63 fragments as absent to push indices to boundary
+        // Fill 63 fragments as absent to push indexes to boundary
         let filler: Vec<u32> = (0u32..63).map(|i| i * 7 + 1).collect();
         let filler_presence: Vec<bool> = filler.iter().map(|_| false).collect();
         cache.merge_updates_bool(vec![k], vec![m], &filler, filler_presence).unwrap();
@@ -2676,22 +2835,22 @@ mod tests {
 
     #[test]
     fn absent_bits_correct_at_each_u64_boundary_position() {
-        // For fragment indices 0, 63, 64, 127, 128 - the boundary positions -
+        // For fragment indexes 0, 63, 64, 127, 128 - the boundary positions -
         // verify absent bits are set and read correctly.
-        let boundary_indices = [0usize, 62, 63, 64, 65, 126, 127];
+        let boundary_indexes = [0usize, 62, 63, 64, 65, 126, 127];
         let max_frags = 130;
 
-        for &target_idx in &boundary_indices {
+        for &target_index in &boundary_indexes {
             let mut cache = FragmentCache::new_in_memory(max_frags, 32);
-            let k = key(target_idx as u64);
-            let m = meta(target_idx as i64, target_idx as u64);
+            let k = key(target_index as u64);
+            let m = meta(target_index as i64, target_index as u64);
 
-            // Fill fragments up to target_idx with absent filler (different files)
-            for i in 0u32..target_idx as u32 {
-                let fk = key(1000 + target_idx as u64 * 200 + i as u64);
+            // Fill fragments up to target_index with absent filler (different files)
+            for i in 0u32..target_index as u32 {
+                let fk = key(1000 + target_index as u64 * 200 + i as u64);
                 let fm = meta(i as i64, i as u64);
                 let fh = 0xF100_0000u32
-                    .wrapping_add(target_idx as u32 * 1000)
+                    .wrapping_add(target_index as u32 * 1000)
                     .wrapping_add(i);
                 cache.merge_updates_bool(
                     vec![fk], vec![fm], &[fh],
@@ -2701,7 +2860,7 @@ mod tests {
 
             // Now add the target fragment as ABSENT for our file
             let target_hash = 0x7670_0000u32
-                .wrapping_add(target_idx as u32);
+                .wrapping_add(target_index as u32);
             cache.merge_updates_bool(
                 vec![k], vec![m], &[target_hash],
                 vec![false],
@@ -2709,7 +2868,7 @@ mod tests {
 
             assert!(
                 cache.can_skip_file(k, m, &[target_hash]),
-                "absent bit wrong at fragment index {target_idx} (u64 boundary position)"
+                "absent bit wrong at fragment index {target_index} (u64 boundary position)"
             );
         }
     }

@@ -218,10 +218,18 @@ impl<S: MatchSink + 'static> RawGrepCtx<S> {
         let (fragment_hashes, cache) = job.grepper.fragment_hashes_and_cache_mut();
 
         if let Some(cache) = cache {
-            _ = cache.merge_updates(file_keys, file_metas, fragment_hashes, fragment_presence);
-            _ = cache.save_to_disk();
-
-            debug!("[ctx] successfully saved cache");
+            match cache.merge_updates_if_changed(file_keys, file_metas, fragment_hashes, fragment_presence) {
+                Ok(true) => {
+                    _ = cache.save_to_disk();
+                    debug!("[ctx] successfully saved cache");
+                }
+                Ok(false) => {
+                    debug!("[ctx] cache batch unchanged, skipping merge+save..");
+                }
+                Err(e) => {
+                    debug!("[ctx] merge_updates_if_changed failed: {e}");
+                }
+            }
         } else {
             debug!("job.grepper.cache is None... (pattern < 3 bytes)");
         }
