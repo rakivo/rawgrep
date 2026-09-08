@@ -172,13 +172,24 @@ impl RawFs for Ext4Fs {
             return Ok(false);
         }
 
-        for &(disk_offset, len) in &parser.scratch_chunks {
+        for (i, &(disk_offset, len)) in parser.scratch_chunks.iter().enumerate() {
+            #[cfg(unix)]
+            if let Some(&(next_offset, next_len)) = parser.scratch_chunks.get(i + 1) {
+                use std::os::fd::AsRawFd;
+
+                unsafe {
+                    libc::posix_fadvise(
+                        self.file.as_raw_fd(), next_offset as i64, next_len as i64,
+                        libc::POSIX_FADV_WILLNEED,
+                    );
+                }
+            }
+
             let buf = Parser::get_buf_mut_impl(&mut parser.file, &mut parser.dir, &mut parser.gitignore, kind);
 
             let old_len = buf.len();
             let new_len = old_len + len as usize;
 
-            buf.clear();
             buf.reserve(new_len);
             unsafe { buf.set_len(new_len); }  // @ProbablySafe...
 
@@ -230,25 +241,25 @@ impl RawFs for Ext4Fs {
             let mut skip_first = 0usize;
 
             if check_binary && let Some(first) = extents.first() {
-                // Binary probe
+                // Binary check
 
                 let probe_len = (block_size as usize).min(max_size);
-                scratch2.clear();
-                scratch2.reserve(probe_len);
-                unsafe { scratch2.set_len(probe_len); }  // @ProbablySafe...
+                buf.reserve(probe_len);
+                unsafe { buf.set_len(probe_len); }  // @ProbablySafe...
 
                 let offset = first.start * block_size;
-                match self.read_at_offset(scratch2, offset) {
+                match self.read_at_offset(&mut buf[..probe_len], offset) {
                     Ok(n) => {
-                        if binary_probe(&scratch2[..n], file_size) {
-                            return Ok(false);  // binary
+                        buf.truncate(n);
+                        if binary_probe(&buf[..n], file_size) {
+                            buf.clear();
+                            return Ok(false);                    // binary
                         }
 
-                        buf.extend_from_slice(&scratch2[..n]);
                         skip_first = n;
                     }
 
-                    Err(_) => return Ok(true), // unreadable
+                    Err(_) => { buf.clear(); return Ok(true); }  // unreachable
                 }
             }
 
@@ -576,11 +587,26 @@ impl Ext4Fs {
                 child_blocks.push(leaf_block);
             }
 
+            let block_size = self.sb.block_size as u64;
+
+            #[cfg(unix)]
+            for &cb in &child_blocks {
+                use std::os::fd::AsRawFd;
+                unsafe {
+                    libc::posix_fadvise(
+                        self.file.as_raw_fd(),
+                        (cb * block_size) as libc::off_t,
+                        block_size as libc::off_t,
+                        libc::POSIX_FADV_WILLNEED,
+                    );
+                }
+            }
+
             for child_block in child_blocks {
                 let mut probe = [0u8; 8192];  // ext4 block size is at most 8192 bytes
-                let probe = &mut probe[..self.sb.block_size as usize];
+                let probe = &mut probe[..block_size as usize];
 
-                let offset = child_block * self.sb.block_size as u64;
+                let offset = child_block * block_size;
                 if self.read_at_offset(probe, offset).is_ok() {
                     self.parse_extent_node_into(scratch, probe, level + 1)?;
                 }
