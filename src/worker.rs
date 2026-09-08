@@ -1414,6 +1414,8 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, '_, F, S> {
 
                 self.line_ranges_scratch.clear();
                 self.line_ranges_scratch.extend(global_matches.iter().map(|&(s, e)| {
+                    debug_assert!(s as usize >= line_start, "match starts before line_start: s={} line_start={}", s, line_start);
+
                     let rel_end   = (e.saturating_sub(line_start as u32)).min(line.len() as u32);
                     let rel_start = s.saturating_sub(line_start as u32).min(rel_end);
                     (rel_start, rel_end)
@@ -1615,6 +1617,7 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, '_, F, S> {
     #[inline(never)]
     fn find_and_print_matches_small_decode<C: LineCodec>(&mut self, skip: usize) -> io::Result<bool> {
         let buf = unsafe { self.parser.file.get_unchecked(skip..) };
+
         let buf_len = buf.len();
         if buf_len == 0 { return Ok(false); }
 
@@ -1631,7 +1634,7 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, '_, F, S> {
         {
             let decoded = &self.parser.scratch.as_slice();
             let mut scan_pos = 0usize;
-            while let Some(rel) = C::find_newline(unsafe { decoded.get_unchecked(scan_pos..) }) {
+            while let Some(rel) = memchr::memchr(b'\n', &decoded[scan_pos..]) {
                 let abs = scan_pos + rel;
                 self.newlines_scratch.push(abs as u32);
                 scan_pos = abs + 1;
@@ -1647,6 +1650,9 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, '_, F, S> {
 
         for &newline_pos in self.newlines_scratch.iter().chain([&(decoded_len as u32)]) {
             let line_end = newline_pos as usize;
+
+            debug_assert!(line_start <= line_end && line_end <= decoded_len);
+
             let raw_line = unsafe { self.parser.scratch.get_unchecked(line_start..line_end) };
             let line = if raw_line.last() == Some(&0x0D) {
                 unsafe { raw_line.get_unchecked(..raw_line.len() - 1) }
@@ -1664,6 +1670,7 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, '_, F, S> {
             if !self.ranges_scratch.is_empty() {
                 if !found_any {
                     found_any = true;
+
                     if !self.stdout_is_being_redirected_to_dev_null {
                         Self::write_file_header(&mut self.output, self.cli, &self.path_buf, should_print_color);
                     }
