@@ -7,6 +7,8 @@ linux-*
 *.cpp
 *.svg
 *.json
+*.py
+*.txt
 *benchmark*
 !benchmark_results.tar.gz
 vision.md
