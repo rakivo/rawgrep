@@ -8,6 +8,7 @@ linux-*
 *.svg
 *.json
 *benchmark*
+!benchmark_results.tar.gz
 vision.md
 *benches
 *.new
