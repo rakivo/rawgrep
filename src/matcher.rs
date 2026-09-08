@@ -48,6 +48,7 @@ fn extract_alternation_literals(pattern: &str) -> Option<Box<[Box<[u8]>]>> {
 //   the overhead of having 1 more indirection (AND allocating on the heap) really worth it.
 #[allow(clippy::large_enum_variant)]
 pub enum MatchIterator<'a> {
+    POISONED,
     Literal {
         iter: memchr::memmem::FindIter<'a, 'a>,
         needle_len: usize,
@@ -59,7 +60,7 @@ pub enum MatchIterator<'a> {
 impl<'a> Iterator for MatchIterator<'a> {
     type Item = (usize, usize);
 
-    #[inline]
+    #[inline(always)]
     fn next(&mut self) -> Option<Self::Item> {
         match self {
             MatchIterator::Literal { iter, needle_len } => {
@@ -70,6 +71,9 @@ impl<'a> Iterator for MatchIterator<'a> {
             }
             MatchIterator::Regex(iter) => {
                 iter.next().map(|m| (m.start(), m.end()))
+            }
+            MatchIterator::POISONED => unsafe {
+                std::hint::unreachable_unchecked()
             }
         }
     }

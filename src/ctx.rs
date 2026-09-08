@@ -19,7 +19,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use ::tracing::debug;
-use smallvec::SmallVec;
 use parking_lot::{Condvar, Mutex, RwLock};
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use crossbeam_deque::{Injector, Stealer, Worker as DequeWorker};
@@ -445,8 +444,9 @@ fn worker_thread_main<S: MatchSink + 'static>(
     let mut path_buf                  = Box::new(SmallPathBuf::new());
     let mut swap_path_buf             = Box::new(SmallPathBuf::new());
     let mut newlines_scratch          = Vec::new();
-    let mut ranges_scratch            = SmallVec::new();
-    let mut fragment_presence_scratch = SmallVec::new();
+    let mut ranges_scratch            = Vec::with_capacity(64); // @Speed @Note: If this reallocates we're gonna be really sad.
+    let mut line_ranges_scratch       = Vec::with_capacity(64); // @Speed @Note: If this reallocates we're gonna be really sad.
+    let mut fragment_presence_scratch = Vec::with_capacity(16);
     let mut path_arena                = PathArena::new();
     let mut file_entries_arena        = FileEntryArena::new();
     let mut subdirs_arena             = SubdirsArena::new();
@@ -532,6 +532,7 @@ fn worker_thread_main<S: MatchSink + 'static>(
                     entries_arena,
                     subdirs_arena,
                     newlines_scratch,
+                    line_ranges_scratch,
                     ranges_scratch,
                     path_arena,
                     file_entries_arena,
@@ -577,6 +578,7 @@ fn worker_thread_main<S: MatchSink + 'static>(
         path_arena = result.path_arena;
         newlines_scratch = result.newlines_scratch;
         ranges_scratch = result.ranges_scratch;
+        line_ranges_scratch = result.line_ranges_scratch;
         fragment_presence_scratch = result.fragment_presence_scratch;
         path_buf = result.path_buf;
         swap_path_buf = result.swap_path_buf;

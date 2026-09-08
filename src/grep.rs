@@ -218,40 +218,22 @@ impl<S: MatchSink> RawGrepper<NtfsFs, S> {
 
 #[inline]
 pub fn open_device(path: &str) -> io::Result<File> {
-    open_device_impl(path, false)
+    open_device_impl(path)
 }
 
 #[cfg(windows)]
 #[inline]
-pub fn open_device_impl(path: &str, uncached: bool) -> io::Result<File> {
+pub fn open_device_impl(path: &str) -> io::Result<File> {
     use std::os::windows::fs::OpenOptionsExt;
     use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_NO_BUFFERING;
 
-    let is_raw_device = path.starts_with(r"\\.\") || path.starts_with(r"\\?\");
-
-    let mut opts = OpenOptions::new();
-    opts.read(true).share_mode(0x3);
-
-    if is_raw_device && uncached {
-        opts.custom_flags(FILE_FLAG_NO_BUFFERING);
-    }
-
-    opts.open(path)
+    OpenOptions::new().read(true).share_mode(0x3).open(path)
 }
 
 #[cfg(unix)]
 #[inline]
-pub fn open_device_impl(path: &str, uncached: bool) -> io::Result<File> {
-    use std::os::unix::fs::OpenOptionsExt;
-
-    let mut opts = OpenOptions::new();
-    opts.read(true).write(false);
-
-    if uncached {
-        opts.custom_flags(libc::O_DIRECT).open(path)
-    } else {
-        opts.open(path)
-    }
+pub fn open_device_impl(path: &str) -> io::Result<File> {
+    OpenOptions::new().read(true).write(false).open(path)
 }
 
 #[inline]

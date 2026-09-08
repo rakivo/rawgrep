@@ -6,6 +6,11 @@ use smallvec::SmallVec;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 #[inline(always)]
+pub fn read_u8_unaligned(data: &[u8], offset: usize) -> u8 {
+    unsafe { data.as_ptr().add(offset).read_unaligned() }
+}
+
+#[inline(always)]
 pub fn read_u16_unaligned_le(data: &[u8], offset: usize) -> u16 {
     unsafe { (data.as_ptr().add(offset) as *const u16).read_unaligned().to_le() }
 }

@@ -105,6 +105,17 @@ strip = true
 overflow-checks = false
 debug-assertions = false
 
+[profile.release-fast-without-lto-with-debug] # Use this profile if you're inspecting the LLVM IR with "cargo asm"
+inherits = "release"
+opt-level = 3
+panic = "abort"
+codegen-units = 1
+lto = false
+debug = 1
+strip = true
+overflow-checks = false
+debug-assertions = false
+
 [profile.release-lto-same-as-ripgrep]
 inherits = "release"
 opt-level = 3
