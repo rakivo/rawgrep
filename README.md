@@ -128,7 +128,7 @@ rawgrep "pattern" . --binary    # Search binary files
 
 ### Filtering Levels
 ```bash
-# Default: respects .gitignore, skips binaries and large files (> 5 MB)
+# Default: respects .gitignore, skips binaries and large files (> 30 MB)
 rawgrep "pattern"
 
 # -u: ignore .gitignore
@@ -217,7 +217,7 @@ A: Yes. The tool only reads data and never writes. The `CAP_DAC_READ_SEARCH` cap
 A: Yeah.
 
 **Q: Why am I missing some matches?**
-A: By default, rawgrep respects `.gitignore` and skips binary/large files. Use `-u` to ignore `.gitignore`, `-uu` to also search binaries, or `-uuu` to search everything. This matches ripgrep's behavior.
+A: By default, rawgrep respects `.gitignore` and skips binary/large (> 30MB) files. Use `-u` to ignore `.gitignore`, `-uu` to also search binaries, or `-uuu` to search everything. This matches ripgrep's behavior.
 
 **Q: Can I use this on other filesystems?**
 A: Currently only ext4/ntfs is supported. Support for other filesystems may be added in the future. (Motivate me with stars)
