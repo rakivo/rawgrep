@@ -1,13 +1,5 @@
 #!/usr/bin/env bash
 
-#
-# If you're looking at this, just know that yes, I AI generated this benchmark,
-# I don't have that amount of patience to go through every little detail
-# of benchmarking, and I rather work on some real project, to gain some real performance benefit.
-#
-# But! It honestly looks like it works just fine. So, what's the matter anyway?
-#
-
 set -uo pipefail
 
 PATTERN="TODO"
