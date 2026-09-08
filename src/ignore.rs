@@ -285,8 +285,10 @@ impl LiteralMeta {
 struct WildcardPattern {
     bytes: Box<[u8]>,
     flags: u8, // bit 0: negated, bit 1: anchored, bit 2: dir_only
+
     /// For patterns like "*.rs", store the suffix for fast matching
     suffix: Option<Box<[u8]>>,
+
     /// For patterns like "test*", store the prefix
     prefix: Option<Box<[u8]>>,
 }
@@ -407,7 +409,7 @@ impl Gitignore {
                 let (suffix, prefix) = analyze_wildcard(pattern_bytes);
 
                 wildcards.push(WildcardPattern {
-                    bytes: pattern_bytes.to_vec().into_boxed_slice(),
+                    bytes: pattern_bytes.into(),
                     flags,
                     suffix,
                     prefix,
@@ -554,6 +556,7 @@ impl Gitignore {
 
                 let len = meta.len as usize;
                 let pattern = unsafe {
+                    debug_assert!(meta.offset as usize + len <= self.literal_data.len());
                     self.literal_data.get_unchecked(meta.offset as usize..meta.offset as usize + len)
                 };
 
@@ -631,28 +634,26 @@ impl Gitignore {
 
 /// Analyze wildcard pattern for fast-path matching
 /// Returns (suffix, prefix) for patterns like "*.rs" or "test*"
-// @Speed @Refactor
 #[allow(clippy::type_complexity)]
 fn analyze_wildcard(pattern: &[u8]) -> (Option<Box<[u8]>>, Option<Box<[u8]>>) {
-    // Pattern "*.ext" - very common
-    if pattern.len() >= 2
-    && pattern[0] == b'*'
-    && !pattern[1..].contains(&b'*')
-    && !pattern[1..].contains(&b'?')
-    && !pattern[1..].contains(&b'[')
-    {
-        return (Some(pattern[1..].to_vec().into_boxed_slice()), None);
+    if pattern.is_empty() {
+        return (None, None);
     }
 
-    // Pattern "prefix*" - also common
-    if pattern.len() >= 2 {
-        if let Some(star_pos) = memchr(b'*', pattern) {
-            if star_pos == pattern.len() - 1
-                && !pattern[..star_pos].contains(&b'*')
-                && !pattern[..star_pos].contains(&b'?')
-                && !pattern[..star_pos].contains(&b'[')
-            {
-                return (None, Some(pattern[..star_pos].to_vec().into_boxed_slice()));
+    // Pattern "*.ext"
+    if pattern[0] == b'*' {
+        let rest = &pattern[1..];
+        if !rest.is_empty() && memchr::memchr3(b'*', b'?', b'[', rest).is_none() {
+            return (Some(rest.into()), None);
+        }
+    }
+
+    // Pattern "prefix*"
+    if let Some(star_pos) = memchr(b'*', pattern) {
+        if star_pos == pattern.len() - 1 {
+            let head = &pattern[..star_pos];
+            if !head.is_empty() && memchr::memchr3(b'*', b'?', b'[', head).is_none() {
+                return (None, Some(head.into()));
             }
         }
     }
@@ -677,20 +678,33 @@ fn match_wildcard(pattern: &WildcardPattern, text: &[u8]) -> bool {
 
     // Fast path: suffix match (*.rs), optionally combined with a prefix (dir/*.rs)
     if let Some(ref suffix) = pattern.suffix {
-        if text.len() < suffix.len() {
+        debug_assert!(!suffix.is_empty(), "analyze_wildcard never produces an empty suffix");
+        let slen = suffix.len();
+        if text.len() < slen {
             return false;
         }
 
-        let (head, tail) = text.split_at(text.len() - suffix.len());
+        // SAFETY: text.len() >= slen, checked above.
+        let split = text.len() - slen;
+        let tail = unsafe { text.get_unchecked(split..) };
         if tail != suffix.as_ref() {
             return false;
         }
 
+        let head = unsafe { text.get_unchecked(..split) };
+
         let middle = if let Some(ref prefix) = pattern.prefix {
-            if head.len() < prefix.len() || &head[..prefix.len()] != prefix.as_ref() {
+            let plen = prefix.len();
+            if head.len() < plen {
                 return false;
             }
-            &head[prefix.len()..]
+
+            // SAFETY: head.len() >= plen, checked above.
+            if unsafe { head.get_unchecked(..plen) } != prefix.as_ref() {
+                return false;
+            }
+
+            unsafe { head.get_unchecked(plen..) }
         } else {
             head
         };
@@ -700,16 +714,19 @@ fn match_wildcard(pattern: &WildcardPattern, text: &[u8]) -> bool {
 
     // Fast path: prefix match (test*)
     if let Some(ref prefix) = pattern.prefix {
-        if text.len() < prefix.len() {
+        debug_assert!(!prefix.is_empty(), "analyze_wildcard never produces an empty prefix");
+
+        let pattern_len = prefix.len();
+        if text.len() < pattern_len {
             return false;
         }
 
-        if &text[..prefix.len()] != prefix.as_ref() {
+        if unsafe { text.get_unchecked(..pattern_len) } != prefix.as_ref() {
             return false;
         }
 
-        let middle = &text[prefix.len()..];
-        return !anchored || memchr(b'/', middle).is_none();
+        let middle = unsafe { text.get_unchecked(pattern_len..) };
+        return !anchored || memchr::memchr(b'/', middle).is_none();
     }
 
     // Fallback
@@ -726,10 +743,7 @@ fn glob_match(pattern: &[u8], text: &[u8], anchored: bool) -> bool {
     }
 
     // Fast path: no wildcards
-    if !pattern.contains(&b'*') &&
-       !pattern.contains(&b'?') &&
-       !pattern.contains(&b'[')
-    {
+    if memchr::memchr3(b'*', b'?', b'[', pattern).is_none() {
         return pattern == text;
     }
 
@@ -753,7 +767,7 @@ fn glob_match(pattern: &[u8], text: &[u8], anchored: bool) -> bool {
                 b'?' => {
                     // '?' must not match a separator either, when anchored
                     if anchored && unsafe { *text.get_unchecked(text_idx) } == MAIN_SEPARATOR as u8 {
-                        // fall through to backtrack logic below
+                        // Fallthrough to backtrack logic below...
                     } else {
                         pattern_idx += 1;
                         text_idx += 1;
@@ -782,24 +796,68 @@ fn glob_match(pattern: &[u8], text: &[u8], anchored: bool) -> bool {
             }
         }
 
-        if star_idx != usize::MAX {
-            // A '*' cannot swallow a separator when the pattern is anchored.
-            if anchored && unsafe { *text.get_unchecked(text_idx) } == MAIN_SEPARATOR as u8 {
-                return false;
+        if star_idx == usize::MAX {
+            return false;
+        }
+
+        let next_pat_idx = star_idx + 1;
+
+        let next_lit = if next_pat_idx < pattern_len {
+            let b = unsafe { *pattern.get_unchecked(next_pat_idx) };
+            (b != b'*' && b != b'?' && b != b'[').then_some(b)
+        } else {
+            None
+        };
+
+        match next_lit {
+            Some(lit) => {
+                let search_start = match_idx + 1;
+                debug_assert!(search_start <= text_len);
+                let haystack = unsafe { text.get_unchecked(search_start..text_len) };
+
+                //
+                // An anchored '*' can't swallow a '/', so normally we must not
+                // search past one. EXCEPT when the literal we're looking for
+                // IS '/' itself (e.g. pattern "a/*b/c"), then finding that
+                // separator IS the goal.
+                //
+                let bound = if anchored && lit != MAIN_SEPARATOR as u8 {
+                    memchr(MAIN_SEPARATOR as u8, haystack).unwrap_or(haystack.len())
+                } else {
+                    haystack.len()
+                };
+
+                let scoped = unsafe { haystack.get_unchecked(..bound) };
+                match memchr(lit, scoped) {
+                    Some(off) => {
+                        match_idx   = search_start + off;
+                        text_idx    = match_idx;
+                        pattern_idx = next_pat_idx;
+                    }
+
+                    None => return false,
+                }
             }
 
-            pattern_idx = star_idx + 1;
-            match_idx += 1;
-            text_idx = match_idx;
-        } else {
-            return false;
+            None => {
+                //
+                // Trailing star, or followed by another wildcard token
+                //
+
+                if anchored && unsafe { *text.get_unchecked(text_idx) } == MAIN_SEPARATOR as u8 {
+                    return false;
+                }
+                pattern_idx = next_pat_idx;
+                match_idx += 1;
+                text_idx = match_idx;
+            }
         }
     }
 
+    //
     // Skip trailing stars
-    while pattern_idx < pattern_len && unsafe {
-        *pattern.get_unchecked(pattern_idx)
-    } == b'*' {
+    //
+    while pattern_idx < pattern_len && unsafe { *pattern.get_unchecked(pattern_idx) } == b'*' {
         pattern_idx += 1;
     }
 
@@ -808,8 +866,8 @@ fn glob_match(pattern: &[u8], text: &[u8], anchored: bool) -> bool {
 
 #[inline]
 fn match_char_class(pattern: &[u8], start: usize, ch: u8) -> Option<usize> {
-    let plen = pattern.len();
-    if start + 2 >= plen || unsafe { *pattern.get_unchecked(start) } != b'[' {
+    let pattern_len = pattern.len();
+    if start + 2 >= pattern_len || unsafe { *pattern.get_unchecked(start) } != b'[' {
         return None;
     }
 
@@ -821,10 +879,10 @@ fn match_char_class(pattern: &[u8], start: usize, ch: u8) -> Option<usize> {
 
     // Find closing ]
     let mut end = i;
-    while end < plen && unsafe { *pattern.get_unchecked(end) } != b']' {
+    while end < pattern_len && unsafe { *pattern.get_unchecked(end) } != b']' {
         end += 1;
     }
-    if end >= plen {
+    if end >= pattern_len {
         return None;
     }
 

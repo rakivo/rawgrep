@@ -32,6 +32,7 @@ struct CacheAccumulator {
 
 /// Per-search data, swapped atomically between searches.
 struct SearchJob<S: MatchSink> {
+    gitignore_enabled: bool,
     grepper:   AnyGrepper<S>,
     stats:     AtomicStats,
     device:    Box<str>,
@@ -371,13 +372,16 @@ impl<S: MatchSink + 'static> RawGrepCtx<S> {
 
         debug!("[ctx] search_root_for_fs={search_root_for_fs:?} root_file_id={root_file_id:?}");
 
+        let gitignore_enabled = !config.no_ignore
+            && (config.no_require_git || crate::find_git_boundary(&search_root));
+
         //
         // Setup output channel and gitignore
         //
-        let root_gitignore = {
+        let root_gitignore = gitignore_enabled.then(|| {
             let gi_path = search_root.join(".gitignore");
             ignore::build_gitignore_from_file(&gi_path.to_string_lossy())
-        };
+        }).flatten();
         debug!("[ctx] root_gitignore present={}", root_gitignore.is_some());
 
         //
@@ -387,6 +391,7 @@ impl<S: MatchSink + 'static> RawGrepCtx<S> {
             let mut guard = self.current_job.write();
             *guard = Some(SearchJob {
                 grepper,
+                gitignore_enabled,
                 device:    device.clone(),
                 stats:     Default::default(),
                 cache_acc: Default::default(),
@@ -529,6 +534,7 @@ fn worker_thread_main<S: MatchSink + 'static>(
                     output,
                     parser,
                     path_buf,
+                    gitignore_enabled: job.gitignore_enabled,
                     entries_arena,
                     subdirs_arena,
                     newlines_scratch,

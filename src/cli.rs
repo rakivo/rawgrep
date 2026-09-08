@@ -60,6 +60,10 @@ pub struct Cli {
     #[bpaf(long("no-ignore"))]
     pub no_ignore: bool,
 
+    /// Don't ignore .gitignore files even if the current directory is not a git repository
+    #[bpaf(long("no-require-git"))]
+    pub no_require_git: bool,
+
     /// Search binary files (don't skip them)
     #[bpaf(long)]
     pub binary: bool,

@@ -107,6 +107,7 @@ pub struct RawGrepConfig {
     pub all:          bool,
     pub unrestricted: u8,
     pub hidden:       bool,
+    pub no_require_git:bool,
 
     // ---- output ---------------------------------------------------------
     pub no_color:       bool,
@@ -144,6 +145,7 @@ impl RawGrepConfig {
             no_color:         false,
             jump:             false,
             stats:            false,
+            no_require_git:   false,
             force_literal:    false,
             should_ignore_reserved_tool_dir_filter: false,
             threads:          std::thread::available_parallelism()
@@ -157,6 +159,7 @@ impl RawGrepConfig {
 
     pub fn device(mut self, d: impl Into<Box<str>>)     -> Self { self.device = Some(d.into());    self }
     pub fn no_color(mut self)                           -> Self { self.no_color      = true;       self }
+    pub fn no_require_git(mut self)                               -> Self { self.no_require_git          = true;       self }
     pub fn jump(mut self)                               -> Self { self.jump          = true;       self }
     pub fn stats(mut self)                              -> Self { self.stats         = true;       self }
     pub fn all(mut self)                                -> Self { self.all           = true;       self }
@@ -181,6 +184,7 @@ impl RawGrepConfig {
             search_root_path: c.search_root_path.into_boxed_str(),
             device:           c.device.map(Into::into),
             no_ignore:        c.no_ignore,
+            no_require_git:   c.no_require_git,
             binary:           c.binary,
             large:            c.large,
             hidden:           c.hidden,
@@ -202,7 +206,7 @@ impl RawGrepConfig {
     #[inline]
     pub fn to_cli(&self) -> cli::Cli {
         cli::Cli {
-            hidden: self.hidden,
+            hidden:           self.hidden,
             no_cache_write:   self.no_cache_write,
             reserved_tool_dirs: self.should_ignore_reserved_tool_dir_filter,
             pattern:          self.pattern.clone().into_string(),
@@ -210,6 +214,7 @@ impl RawGrepConfig {
             device:           self.device.clone().map(String::from),
             no_ignore:        self.no_ignore,
             binary:           self.binary,
+            no_require_git:   self.no_require_git,
             large:            self.large,
             all:              self.all,
             unrestricted:     self.unrestricted,
@@ -306,5 +311,41 @@ impl Drop for CursorHide {
             _ = out.write_all(CURSOR_UNHIDE.as_bytes());
             _ = out.flush();
         }
+    }
+}
+
+pub fn find_git_boundary(start: &Path) -> bool {
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt;
+
+    let Ok(start_meta) = std::fs::symlink_metadata(start) else {
+        return false;
+    };
+
+    #[cfg(unix)]
+    let start_dev = start_meta.dev();
+
+    let mut current = start;
+
+    loop {
+        if std::fs::symlink_metadata(current.join(".git")).is_ok() {
+            return true;
+        }
+
+        let Some(parent) = current.parent() else {
+            return false;
+        };
+
+        let Ok(parent_meta) = std::fs::symlink_metadata(parent) else {
+            return false;
+        };
+
+        #[cfg(unix)]
+        if parent_meta.dev() != start_dev {
+            // Crossed a mount boundary, stop here same as rg does
+            return false;
+        }
+
+        current = parent;
     }
 }

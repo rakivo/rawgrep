@@ -685,6 +685,7 @@ pub struct WorkerCtx<'a, 'output_arena, F: RawFs, S: MatchSink> {
     pub fragment_index:  &'a IntSet<u32>,
     pub pacer:           &'a FlushPacer,
     pub selected_fragment_hash_len: FragmentLen,
+    pub gitignore_enabled: bool,
     pub stdout_is_being_redirected_to_dev_null: bool,
 
     pub parser: Parser,
@@ -773,6 +774,11 @@ impl<'a, 'output_arena, F: RawFs, S: MatchSink> WorkerCtx<'a, 'output_arena, F, 
     }
 
     #[inline(always)]
+    const fn should_ignore_gitignore(&self) -> bool {
+        !self.gitignore_enabled || self.cli.should_ignore_gitignore()
+    }
+
+    #[inline(always)]
     const fn max_file_byte_size(&self) -> usize {
         if self.cli.should_ignore_size_filter() {
             usize::MAX
@@ -784,6 +790,7 @@ impl<'a, 'output_arena, F: RawFs, S: MatchSink> WorkerCtx<'a, 'output_arena, F, 
 
 // impl block of the core logic
 impl<F: RawFs, S: MatchSink> WorkerCtx<'_, '_, F, S> {
+    #[inline]
     pub fn dispatch_directory(
         &mut self,
         work: DirWork,
@@ -868,7 +875,7 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, '_, F, S> {
         self.fs.read_file_content(&mut self.parser, &node, dir_size, BufKind::Dir, false)?;
         self.stats.dirs_encountered += 1;
 
-        let new_gitignore_chain = self.cli.should_ignore_gitignore().not().then(|| {
+        let new_gitignore_chain = self.should_ignore_gitignore().not().then(|| {
             let prefix_len = self.path_buf.len() as u32;
             self.find_gitignore_file_id_in_buf(BufKind::Dir)
                 .and_then(|gi_file_id| self.try_load_gitignore(gi_file_id))
@@ -904,7 +911,7 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, '_, F, S> {
         let   file_mark = self.file_entries_arena.len();
         let   path_mark = self.path_arena.len();
 
-        let check_gitignore = !self.cli.should_ignore_gitignore() && !gitignore_chain.is_empty();
+        let check_gitignore = !self.should_ignore_gitignore() && !gitignore_chain.is_empty();
         let skip_reserved   = !self.cli.should_ignore_reserved_tool_dir_filter();
 
         for entry_index in entries_start..entries_end {
@@ -1143,7 +1150,7 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, '_, F, S> {
             }
         }
 
-        if !self.cli.should_ignore_gitignore() && !gitignore_chain.is_empty() {
+        if !self.should_ignore_gitignore() && !gitignore_chain.is_empty() {
             if gitignore_chain.is_ignored(self.path_buf.as_ref(), false) {
                 self.stats.files_skipped_gitignore += 1;
                 return Ok(());
