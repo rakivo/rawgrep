@@ -673,26 +673,51 @@ fn match_anchored_literal(pattern: &[u8], path: &[u8]) -> bool {
 
 #[inline(always)]
 fn match_wildcard(pattern: &WildcardPattern, text: &[u8]) -> bool {
-    // Fast path: suffix match (*.rs)
+    let anchored = pattern.anchored();
+
+    // Fast path: suffix match (*.rs), optionally combined with a prefix (dir/*.rs)
     if let Some(ref suffix) = pattern.suffix {
-        return text.len() >= suffix.len() && unsafe {
-            text.get_unchecked(text.len() - suffix.len()..)
-        } == suffix.as_ref();
+        if text.len() < suffix.len() {
+            return false;
+        }
+
+        let (head, tail) = text.split_at(text.len() - suffix.len());
+        if tail != suffix.as_ref() {
+            return false;
+        }
+
+        let middle = if let Some(ref prefix) = pattern.prefix {
+            if head.len() < prefix.len() || &head[..prefix.len()] != prefix.as_ref() {
+                return false;
+            }
+            &head[prefix.len()..]
+        } else {
+            head
+        };
+
+        return !anchored || memchr(b'/', middle).is_none();
     }
 
     // Fast path: prefix match (test*)
     if let Some(ref prefix) = pattern.prefix {
-        return text.len() >= prefix.len() && unsafe {
-            text.get_unchecked(..prefix.len())
-        } == prefix.as_ref();
+        if text.len() < prefix.len() {
+            return false;
+        }
+
+        if &text[..prefix.len()] != prefix.as_ref() {
+            return false;
+        }
+
+        let middle = &text[prefix.len()..];
+        return !anchored || memchr(b'/', middle).is_none();
     }
 
     // Fallback
-    glob_match(&pattern.bytes, text)
+    glob_match(&pattern.bytes, text, anchored)
 }
 
 #[inline]
-fn glob_match(pattern: &[u8], text: &[u8]) -> bool {
+fn glob_match(pattern: &[u8], text: &[u8], anchored: bool) -> bool {
     let pattern_len = pattern.len();
     let text_len = text.len();
 
@@ -726,20 +751,24 @@ fn glob_match(pattern: &[u8], text: &[u8]) -> bool {
                 }
 
                 b'?' => {
-                    pattern_idx += 1;
-                    text_idx += 1;
-                    continue;
+                    // '?' must not match a separator either, when anchored
+                    if anchored && unsafe { *text.get_unchecked(text_idx) } == MAIN_SEPARATOR as u8 {
+                        // fall through to backtrack logic below
+                    } else {
+                        pattern_idx += 1;
+                        text_idx += 1;
+                        continue;
+                    }
                 }
 
                 b'[' => {
-                    if let Some(new_p) = match_char_class(
-                        pattern,
-                        pattern_idx,
-                        unsafe { *text.get_unchecked(text_idx) }
-                    ) {
-                        pattern_idx = new_p;
-                        text_idx += 1;
-                        continue;
+                    let ch = unsafe { *text.get_unchecked(text_idx) };
+                    if !(anchored && ch == MAIN_SEPARATOR as u8) {
+                        if let Some(new_p) = match_char_class(pattern, pattern_idx, ch) {
+                            pattern_idx = new_p;
+                            text_idx += 1;
+                            continue;
+                        }
                     }
                 }
 
@@ -754,6 +783,11 @@ fn glob_match(pattern: &[u8], text: &[u8]) -> bool {
         }
 
         if star_idx != usize::MAX {
+            // A '*' cannot swallow a separator when the pattern is anchored.
+            if anchored && unsafe { *text.get_unchecked(text_idx) } == MAIN_SEPARATOR as u8 {
+                return false;
+            }
+
             pattern_idx = star_idx + 1;
             match_idx += 1;
             text_idx = match_idx;

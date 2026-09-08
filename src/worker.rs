@@ -178,7 +178,7 @@ where
 #[cfg(target_os = "linux")]
 pub enum PendingRelease {
     Slot(&'static OutputSlab, u16),
-    Owned(Box<[u8]>), // kept alive here, not dropped, until confirmed drained
+    Owned(Box<[u8]>),  // Kept alive here, not dropped, until confirmed drained
 }
 
 pub enum OutputMessage {
