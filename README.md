@@ -9,19 +9,25 @@ benchmark script: [`bench.sh`](bench.sh)
 ```
 corpus: Chromium codebase (~500k files)
 pattern: 'TODO' (literal)
-rawgrep 0.1.9 (rev 36db1d5) vs ripgrep 15.2.0 (rev 3fce3b5bb0)
+rawgrep 0.2.0 (rev efa6ced) vs ripgrep 15.2.0 (rev 3fce3b5bb0)
 system: Intel i5-13400F, 16 threads, ext4 file system, NVMe SSD (Crucial P2 250GB, ~994MB/s read / 736MB/s write), 16GB 3200MHz RAM (~15GB free), performance mode enabled, Debian 6.12
 ```
 
 | scenario | rawgrep time | rawgrep RAM | ripgrep time | ripgrep RAM | speedup |
 |---|---|---|---|---|---|
-| warm cache + fragment cache | 200.8ms ± 6.7ms | 225.6 MiB | 363.5ms ± 6.1ms | 225.7 MiB | 1.81x |
-| warm cache + fragment cache, no gitignore | 181.6ms ± 6.7ms | 220.2 MiB | 350.7ms ± 6.7ms | 225.5 MiB | 1.93x |
-| warm cache, no fragment cache | 539.9ms ± 5.6ms | 268.3 MiB | 363.6ms ± 6.7ms | 274.1 MiB | 0.67x (@Incomplete, slower) |
-| cold cache + fragment cache | 2.620s ± 0.020s | 208.0 MiB | 11.963s ± 0.184s | 208.5 MiB | 4.57x |
-| cold cache, no fragment cache | 8.277s ± 0.136s | 246.1 MiB | 11.872s ± 0.084s | 256.5 MiB | 1.43x |
+| warm cache + fragment cache | 167.3ms ± 6.1ms | 185 MiB | 363.4ms ± 6.2ms | 188 MiB | 2.17x |
+| warm cache, no fragment cache | 370.7ms ± 6.6ms | 254 MiB | 364.8ms ± 7.3ms | 257 MiB | 0.98x (slower) |
+| cold cache, no fragment cache | 8.311s ± 0.120s | 246.1 MiB | 11.932s ± 0.119s | 256.5 MiB* | 1.44x |
+| cold cache + fragment cache | 2.581s ± 0.026s | 208.0 MiB | 11.932s ± 0.196s | 208.5 MiB* | 4.62x |
 
-With *fragment cache* -- rawgrep's intended mode -- it's fast, anywhere from 1.5x to ~60x faster than ripgrep. The larger the corpus, the more of an advantage rawgrep tends to have relative to ripgrep. Using *fragment cache* rawgrep is doing much less I/O, which means it can stay in the page cache on much larger corpora, while ripgrep can't. That's what behind the 60x number -- the corpus used for that benchmark is my 1.27M-file home directory.
+| scenario | rawgrep time | rawgrep RAM | fff time | fff RAM | speedup |
+|---|---|---|---|---|---|
+| warm cache + both using cache, fff vs rawgrep | 170.5ms ± 8.2ms | 582 MiB* (See note below) | 625.0ms ± 12.5ms | 580 MiB | 3.66x |
+| cold cache + both using cache, fff vs rawgrep | 2.593s ± 0.039s | 584 MiB* (See note below) | 5.125s ± 0.044s | 583 MiB | 1.98x |
+
+rawgrep had weirdly high RAM usage benchmarking against fff, all in all I'm pretty sure it does not mirror the actuality, it should be around 200mb like in the benchmarks against ripgrep. Most likely RSS picking up shared page-cache from fff's cache build running right before it, not real rawgrep usage.
+
+But, apart from that, we can see that **with** *fragment cache* -- rawgrep's intended mode -- it's fast, anywhere from 2x to ~60x faster than ripgrep/fff/*any other grep in the world*. The larger the corpus, the more of an advantage rawgrep tends to have relative to other greps. Using *fragment cache* rawgrep is doing much less I/O, which means it can stay in the page cache on much larger corpora, while other greps can't. That's exactly what's behind the 60x number -- the corpus used for that benchmark is my 1.27M-file home directory.
 
 ## How is `rawgrep` so fast?
 
