@@ -15,15 +15,15 @@ system: Intel i5-13400F, 16 threads, ext4 file system, NVMe SSD (Crucial P2 250G
 
 | scenario | rawgrep time | rawgrep RAM | ripgrep time | ripgrep RAM | speedup |
 |---|---|---|---|---|---|
-| warm cache + fragment cache | 165.9 ± 5.8 ms | 185 MiB | 368.0 ± 6.8 ms | 187 MiB | 2.22x |
-| warm cache, no fragment cache | 382.3 ± 5.4 ms | 249 MiB | 367.5 ± 6.8 ms | 252 MiB | 0.96x (slower) |
-| cold cache, no fragment cache | 8.320 ± 0.086 s | 285 MiB | 11.906 ± 0.084 s | 286 MiB | 1.43x |
-| cold cache + fragment cache | 2.595 ± 0.038 s | 196 MiB | 11.969 ± 0.241 s | 197 MiB | 4.61x |
+| warm cache + fragment cache | 165.9 ± 5.8 ms | 185 MiB | 368.0 ± 6.8 ms | 187 MiB* (See note below) | 2.22x |
+| warm cache, no fragment cache | 382.3 ± 5.4 ms | 249 MiB | 367.5 ± 6.8 ms | 252 MiB* (See note below) | 0.96x (slower) |
+| cold cache, no fragment cache | 8.320 ± 0.086 s | 285 MiB | 11.906 ± 0.084 s | 286 MiB* (See note below) | 1.43x |
+| cold cache + fragment cache | 2.595 ± 0.038 s | 196 MiB | 11.969 ± 0.241 s | 197 MiB* (See note below) | 4.61x |
 
 | scenario | rawgrep time | rawgrep RAM | fff time | fff RAM | speedup |
 |---|---|---|---|---|---|
-| warm, fff (cache built once) vs rawgrep | 167.6 ± 6.6 ms | 579 MiB | 626.8 ± 11.8 ms | 578 MiB | 3.74x |
-| cold, fff (cache built once) vs rawgrep | 2.596 ± 0.039 s | 588 MiB | 5.084 ± 0.030 s | 583 MiB | 1.96x |
+| warm, fff (cache built once) vs rawgrep | 167.6 ± 6.6 ms | 579 MiB* (See note below) | 626.8 ± 11.8 ms | 578 MiB | 3.74x |
+| cold, fff (cache built once) vs rawgrep | 2.596 ± 0.039 s | 588 MiB* (See note below) | 5.084 ± 0.030 s | 583 MiB | 1.96x |
 
 # The note
 
