@@ -1770,7 +1770,7 @@ impl<S: CacheStorage> FragmentCache<S> {
             packed.extend_from_slice(&words);
         }
 
-        self.merge_updates(&file_keys, &file_metas, &fragment_hashes, &packed)
+        self.merge_updates(&file_keys, &file_metas, fragment_hashes, &packed)
     }
 }
 

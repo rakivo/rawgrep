@@ -1400,7 +1400,7 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
                         &self.path_buf,
                         line,
                         line_num,
-                        &line_matches,
+                        line_matches,
                         should_print_color,
                     );
                 }
