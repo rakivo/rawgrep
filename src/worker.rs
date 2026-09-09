@@ -474,6 +474,7 @@ pub struct WorkerResult {
     pub file_metas: Vec<FileMeta>,
 
     pub path_buf:      Box<SmallPathBuf>,
+    pub swap_path_buf: Box<SmallPathBuf>,
 
     // Reused across `find_and_print_matches` calls
     pub          newlines_scratch: Vec<u32>,
@@ -512,6 +513,7 @@ pub struct WorkerCtx<'a, F: RawFs, S: MatchSink> {
     pub      entries_arena: EntriesArena,       // 24
 
     pub      path_buf:      Box<SmallPathBuf>,  // 8
+    pub      swap_path_buf: Box<SmallPathBuf>,  // 8
 
     pub batch_size_cached:  u32,
     pub check_mask:         usize,
@@ -555,6 +557,7 @@ impl<'a, F: RawFs, S: MatchSink> WorkerCtx<'a, F, S> {
             parser: self.parser,
             path_arena: self.path_arena,
             file_entries_arena: self.file_entries_arena,
+            swap_path_buf: self.swap_path_buf,
             output: self.output,
             path_buf: self.path_buf,
             subdirs_arena: self.subdirs_arena,
@@ -798,23 +801,30 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
         debug_assert!(self.file_entries_arena.len() >= file_mark);
         self.fs.sort_entries(unsafe { self.file_entries_arena.get_unchecked_mut(file_mark..) });
 
-        struct AbortOnDrop;
-        impl Drop for AbortOnDrop {
-            fn drop(&mut self) {
-                // If we get here, process_files panicked while we were holding
-                // two live copies of the Box pointer. Which shouldn't happen.
-                std::process::abort();
-            }
-        }
-
-        let path_buf: Box<SmallPathBuf> = unsafe { std::ptr::read(&self.path_buf) };
         let file_result;
         {
-            let guard = AbortOnDrop;
-            file_result = self.process_files(file_mark, self.file_entries_arena.len(), &path_buf, &gitignore_chain);
-            std::mem::forget(guard);
+            std::mem::swap(&mut self.path_buf, &mut self.swap_path_buf);
+
+            struct AbortOnDrop;
+            impl Drop for AbortOnDrop {
+                fn drop(&mut self) {
+                    // process_files panicked while swap_path_buf's slot
+                    // held a duplicate Box pointer.
+                    // Unwinding here would double free. Abort instead.
+                    std::process::abort();
+                }
+            }
+
+            let path_buf: Box<SmallPathBuf> = unsafe { std::ptr::read(&self.swap_path_buf) };
+            {
+                let guard = AbortOnDrop;
+                file_result = self.process_files(file_mark, self.file_entries_arena.len(), &path_buf, &gitignore_chain);
+                std::mem::forget(guard);
+            }
+            unsafe { std::ptr::write(&mut self.swap_path_buf, path_buf) };
+
+            std::mem::swap(&mut self.path_buf, &mut self.swap_path_buf);
         }
-        unsafe { std::ptr::write(&mut self.path_buf, path_buf) };
 
         self.file_entries_arena.truncate(file_mark);
 
