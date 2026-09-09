@@ -281,7 +281,6 @@ impl LiteralMeta {
     fn dir_only(self) -> bool { self.flags & 4 != 0 }
 }
 
-#[derive(Clone)]
 struct WildcardPattern {
     bytes: Box<[u8]>,
     flags: u8, // bit 0: negated, bit 1: anchored, bit 2: dir_only
@@ -291,6 +290,13 @@ struct WildcardPattern {
 
     /// For patterns like "test*", store the prefix
     prefix: Option<Box<[u8]>>,
+
+    /// For patterns like "A/**/B", the literal "A" to check against the full
+    /// anchored path before matching "B" against just the filename.
+    ///
+    /// "**" already accounts for zero or more intervening directories, so once
+    /// this prefix check passes, the rest is an ordinary filename match.
+    mid_anchor: Option<Box<[u8]>>,
 }
 
 // @Refactor use bitflags instead in WildcardPattern?
@@ -364,14 +370,31 @@ impl Gitignore {
                 continue;
             }
 
-            let has_wildcards =
-                memchr(b'*', pattern_bytes).is_some()
-             || memchr(b'?', pattern_bytes).is_some()
-             || memchr(b'[', pattern_bytes).is_some();
+            //
+            // Detect a mid-pattern "/**/" (e.g. "lisp/**/*loaddefs.el").
+            // Per gitignore semantics "**" between two slashes matches zero or more
+            // full directory components, so "A/**/B" must also match "A/B" directly.
+            //
+            let mid_anchor: Option<Box<[u8]>> = if anchored {
+                memchr::memmem::find(pattern_bytes, b"/**/").and_then(|pos| {
+                    let tail = &pattern_bytes[pos + 4..];
+                    (!tail.is_empty() && memchr(MAIN_SEPARATOR as _, tail).is_none())
+                        .then(|| pattern_bytes[..pos].into())
+                })
+            } else {
+                None
+            };
+
+            let pattern_bytes: &[u8] = match &mid_anchor {
+                Some(head) => &pattern_bytes[head.len() + 4..],
+                None => pattern_bytes,
+            };
+
+            let has_wildcards = memchr::memchr3(b'*', b'?', b'[', pattern_bytes).is_some();
 
             let flags = (negated as u8) | ((anchored as u8) << 1) | ((dir_only as u8) << 2);
 
-            if !has_wildcards {
+            if !has_wildcards && mid_anchor.is_none() {
                 // --------- LITERAL PATTERN
                 let offset = literal_data.len();
                 let len = pattern_bytes.len();
@@ -395,6 +418,7 @@ impl Gitignore {
                     wildcards.push(WildcardPattern {
                         bytes: pattern_bytes.to_vec().into_boxed_slice(),
                         flags,
+                        mid_anchor: None,
                         suffix: None,
                         prefix: None,
                     });
@@ -405,14 +429,21 @@ impl Gitignore {
                 }
 
             } else {
-                // --------- WILDCARD PATTERN - analyze for fast paths
-                let (suffix, prefix) = analyze_wildcard(pattern_bytes);
+                // --------- WILDCARD, or a mid_anchor "A/**/B" pattern where B happens
+                // to be a plain literal -- either way it needs match_wildcard, so both
+                // route through here.
+                let (suffix, prefix) = if has_wildcards {
+                    analyze_wildcard(pattern_bytes)
+                } else {
+                    (None, None) // literal tail, glob_match's no-wildcard fast path (pattern == text) covers it
+                };
 
                 wildcards.push(WildcardPattern {
                     bytes: pattern_bytes.into(),
                     flags,
                     suffix,
                     prefix,
+                    mid_anchor,
                 });
                 order.push(OrderEntry {
                     ty: 1,
@@ -421,7 +452,6 @@ impl Gitignore {
             }
         }
 
-        // after literal_meta is fully built, before assembling Self:
         let unanchored_indices: Vec<u16> = literal_meta.iter().enumerate()
             .filter(|(_, m)| !m.anchored())
             .map(|(i, _)| i as u16)
@@ -674,18 +704,38 @@ fn match_anchored_literal(pattern: &[u8], path: &[u8]) -> bool {
 
 #[inline(always)]
 fn match_wildcard(pattern: &WildcardPattern, text: &[u8]) -> bool {
-    let anchored = pattern.anchored();
+    //
+    // mid_anchor patterns are always anchored, so `text` here is always the full path.
+    //
+    // Confirm the literal head, then match the tail against just the filename,
+    // "**" has already accounted for zero-or-more directories in between.
+    //
+    if let Some(mid) = &pattern.mid_anchor {
+        if !match_anchored_literal(mid, text) {
+            return false;
+        }
 
+        let filename_start = memrchr(MAIN_SEPARATOR as u8, text).map_or(0, |i| i + 1);
+        let filename = unsafe { text.get_unchecked(filename_start..) };
+        return match_wildcard_tail(pattern, filename, false);
+    }
+
+    match_wildcard_tail(pattern, text, pattern.anchored())
+}
+
+#[inline(always)]
+fn match_wildcard_tail(pattern: &WildcardPattern, text: &[u8], anchored: bool) -> bool {
     // Fast path: suffix match (*.rs), optionally combined with a prefix (dir/*.rs)
     if let Some(ref suffix) = pattern.suffix {
         debug_assert!(!suffix.is_empty(), "analyze_wildcard never produces an empty suffix");
-        let slen = suffix.len();
-        if text.len() < slen {
+
+        let suffix_len = suffix.len();
+        if text.len() < suffix_len {
             return false;
         }
 
         // SAFETY: text.len() >= slen, checked above.
-        let split = text.len() - slen;
+        let split = text.len() - suffix_len;
         let tail = unsafe { text.get_unchecked(split..) };
         if tail != suffix.as_ref() {
             return false;
@@ -694,17 +744,17 @@ fn match_wildcard(pattern: &WildcardPattern, text: &[u8]) -> bool {
         let head = unsafe { text.get_unchecked(..split) };
 
         let middle = if let Some(ref prefix) = pattern.prefix {
-            let plen = prefix.len();
-            if head.len() < plen {
+            let pattern_len = prefix.len();
+            if head.len() < pattern_len {
                 return false;
             }
 
             // SAFETY: head.len() >= plen, checked above.
-            if unsafe { head.get_unchecked(..plen) } != prefix.as_ref() {
+            if unsafe { head.get_unchecked(..pattern_len) } != prefix.as_ref() {
                 return false;
             }
 
-            unsafe { head.get_unchecked(plen..) }
+            unsafe { head.get_unchecked(pattern_len..) }
         } else {
             head
         };
