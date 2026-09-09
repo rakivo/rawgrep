@@ -8,9 +8,14 @@ DEVICE="/dev/nvme0n1p2"
 NVME_CTRL="nvme0"
 THREADS=16
 RUNS=10
-WARM_RUNS=100
+WARM_RUNS=200
 WARMUP=5
 RESULTS_DIR="./benchmark_results"
+DO_CORRECTNESS_CHECK=true
+
+if [[ "${1:-}" == "--no-correctness-check" ]]; then
+    DO_CORRECTNESS_CHECK=false
+fi
 
 mkdir -p "$RESULTS_DIR"
 
@@ -101,78 +106,83 @@ eval "$CMD_FFF_INDEX" > /dev/null 2>&1 || true
 
 # Correctness check
 
-echo ""
-echo "=== correctness check ===" | tee "$RESULTS_DIR/correctness.txt"
-
-# Strip ANSI codes, carriage returns, trailing/leading spaces, and empty lines
-eval "$CMD_RAWGREP_NOCACHE" 2>/dev/null \
-    | tr -d '\r' \
-    | sed -E 's/\x1B\[[0-9;]*[a-zA-R]//g' \
-    | sed 's/:\([0-9]*\): /:\1:/' \
-    | sed 's/[[:space:]]*$//' \
-    | grep -v '^$' \
-    | LC_ALL=C sort > /tmp/bench_rawgrep.txt
-
-eval "$CMD_RG" 2>/dev/null \
-    | tr -d '\r' \
-    | sed -E 's/\x1B\[[0-9;]*[a-zA-R]//g' \
-    | sed 's/[[:space:]]*$//' \
-    | grep -v '^$' \
-    | LC_ALL=C sort > /tmp/bench_rg.txt
-
-eval "$CMD_FFF_GREP" 2>/dev/null | tr -d '\r' | sed -E 's/\x1B\[[0-9;]*[a-zA-R]//g' | sed 's/[[:space:]]*$//' | grep -v '^$' | LC_ALL=C sort > /tmp/bench_fff.txt
-
-# fff's grep output paths are relative to $SEARCH_DIR (it cd's there before
-# running, since it has no positional path arg -- see CMD_FFF_GREP above),
-# while rg/rawgrep's paths are relative to wherever this script runs from
-# and so carry a "$SEARCH_DIR/" prefix. Strip that prefix from rg/rawgrep's
-# output before diffing, or every real match looks like a mismatch.
-SEARCH_DIR_PREFIX=$(printf '%s\n' "${SEARCH_DIR%/}/" | sed 's/[.[\*^$/]/\\&/g')
-sed -i "s|^${SEARCH_DIR_PREFIX}||" /tmp/bench_rawgrep.txt
-sed -i "s|^${SEARCH_DIR_PREFIX}||" /tmp/bench_rg.txt
-
-cut -d: -f1 /tmp/bench_rawgrep.txt | grep -v '^$' | LC_ALL=C sort -u > /tmp/bench_files_rawgrep.txt
-cut -d: -f1 /tmp/bench_rg.txt | grep -v '^$' | LC_ALL=C sort -u > /tmp/bench_files_rg.txt
-cut -d: -f1 /tmp/bench_fff.txt | grep -v '^$' | LC_ALL=C sort -u > /tmp/bench_files_fff.txt
-
-# File 1 = rg, File 2 = rawgrep across all comparisons
-# comm -23 file1 file2 -> items in file1 (rg) but NOT file2 (rawgrep)
-# comm -13 file1 file2 -> items in file2 (rawgrep) but NOT file1 (rg)
-MISSED_LINES=$(LC_ALL=C comm -23 /tmp/bench_rg.txt /tmp/bench_rawgrep.txt | wc -l)
-EXTRA_LINES=$(LC_ALL=C comm -13 /tmp/bench_rg.txt /tmp/bench_rawgrep.txt | wc -l)
-MISSED_FILES=$(LC_ALL=C comm -23 /tmp/bench_files_rg.txt /tmp/bench_files_rawgrep.txt | wc -l)
-EXTRA_FILES=$(LC_ALL=C comm -13 /tmp/bench_files_rg.txt /tmp/bench_files_rawgrep.txt | wc -l)
-
-FFF_MISSED_LINES=$(LC_ALL=C comm -23 /tmp/bench_rg.txt /tmp/bench_fff.txt | wc -l)
-FFF_EXTRA_LINES=$(LC_ALL=C comm -13 /tmp/bench_rg.txt /tmp/bench_fff.txt | wc -l)
-FFF_MISSED_FILES=$(LC_ALL=C comm -23 /tmp/bench_files_rg.txt /tmp/bench_files_fff.txt | wc -l)
-FFF_EXTRA_FILES=$(LC_ALL=C comm -13 /tmp/bench_files_rg.txt /tmp/bench_files_fff.txt | wc -l)
-
-{
-    echo "rawgrep vs rg:"
-    echo "  lines in rg but not rawgrep:   $MISSED_LINES"
-    echo "  lines in rawgrep but not rg:   $EXTRA_LINES"
-    echo "  files matched by rg only:      $MISSED_FILES"
-    echo "  files matched by rawgrep only: $EXTRA_FILES"
+if $DO_CORRECTNESS_CHECK; then
     echo ""
-    echo "files matched by rg only (sample):"
-    LC_ALL=C comm -23 /tmp/bench_files_rg.txt /tmp/bench_files_rawgrep.txt | head -10
+    echo "=== correctness check ===" | tee "$RESULTS_DIR/correctness.txt"
+
+    # Strip ANSI codes, carriage returns, trailing/leading spaces, and empty lines
+    eval "$CMD_RAWGREP_NOCACHE" 2>/dev/null \
+        | tr -d '\r' \
+        | sed -E 's/\x1B\[[0-9;]*[a-zA-R]//g' \
+        | sed 's/:\([0-9]*\): /:\1:/' \
+        | sed 's/[[:space:]]*$//' \
+        | grep -v '^$' \
+        | LC_ALL=C sort > /tmp/bench_rawgrep.txt
+
+    eval "$CMD_RG" 2>/dev/null \
+        | tr -d '\r' \
+        | sed -E 's/\x1B\[[0-9;]*[a-zA-R]//g' \
+        | sed 's/[[:space:]]*$//' \
+        | grep -v '^$' \
+        | LC_ALL=C sort > /tmp/bench_rg.txt
+
+    eval "$CMD_FFF_GREP" 2>/dev/null | tr -d '\r' | sed -E 's/\x1B\[[0-9;]*[a-zA-R]//g' | sed 's/[[:space:]]*$//' | grep -v '^$' | LC_ALL=C sort > /tmp/bench_fff.txt
+
+    # fff's grep output paths are relative to $SEARCH_DIR (it cd's there before
+    # running, since it has no positional path arg -- see CMD_FFF_GREP above),
+    # while rg/rawgrep's paths are relative to wherever this script runs from
+    # and so carry a "$SEARCH_DIR/" prefix. Strip that prefix from rg/rawgrep's
+    # output before diffing, or every real match looks like a mismatch.
+    SEARCH_DIR_PREFIX=$(printf '%s\n' "${SEARCH_DIR%/}/" | sed 's/[.[\*^$/]/\\&/g')
+    sed -i "s|^${SEARCH_DIR_PREFIX}||" /tmp/bench_rawgrep.txt
+    sed -i "s|^${SEARCH_DIR_PREFIX}||" /tmp/bench_rg.txt
+
+    cut -d: -f1 /tmp/bench_rawgrep.txt | grep -v '^$' | LC_ALL=C sort -u > /tmp/bench_files_rawgrep.txt
+    cut -d: -f1 /tmp/bench_rg.txt | grep -v '^$' | LC_ALL=C sort -u > /tmp/bench_files_rg.txt
+    cut -d: -f1 /tmp/bench_fff.txt | grep -v '^$' | LC_ALL=C sort -u > /tmp/bench_files_fff.txt
+
+    # File 1 = rg, File 2 = rawgrep across all comparisons
+    # comm -23 file1 file2 -> items in file1 (rg) but NOT file2 (rawgrep)
+    # comm -13 file1 file2 -> items in file2 (rawgrep) but NOT file1 (rg)
+    MISSED_LINES=$(LC_ALL=C comm -23 /tmp/bench_rg.txt /tmp/bench_rawgrep.txt | wc -l)
+    EXTRA_LINES=$(LC_ALL=C comm -13 /tmp/bench_rg.txt /tmp/bench_rawgrep.txt | wc -l)
+    MISSED_FILES=$(LC_ALL=C comm -23 /tmp/bench_files_rg.txt /tmp/bench_files_rawgrep.txt | wc -l)
+    EXTRA_FILES=$(LC_ALL=C comm -13 /tmp/bench_files_rg.txt /tmp/bench_files_rawgrep.txt | wc -l)
+
+    FFF_MISSED_LINES=$(LC_ALL=C comm -23 /tmp/bench_rg.txt /tmp/bench_fff.txt | wc -l)
+    FFF_EXTRA_LINES=$(LC_ALL=C comm -13 /tmp/bench_rg.txt /tmp/bench_fff.txt | wc -l)
+    FFF_MISSED_FILES=$(LC_ALL=C comm -23 /tmp/bench_files_rg.txt /tmp/bench_files_fff.txt | wc -l)
+    FFF_EXTRA_FILES=$(LC_ALL=C comm -13 /tmp/bench_files_rg.txt /tmp/bench_files_fff.txt | wc -l)
+
+    {
+        echo "rawgrep vs rg:"
+        echo "  lines in rg but not rawgrep:   $MISSED_LINES"
+        echo "  lines in rawgrep but not rg:   $EXTRA_LINES"
+        echo "  files matched by rg only:      $MISSED_FILES"
+        echo "  files matched by rawgrep only: $EXTRA_FILES"
+        echo ""
+        echo "files matched by rg only (sample):"
+        LC_ALL=C comm -23 /tmp/bench_files_rg.txt /tmp/bench_files_rawgrep.txt | head -10
+        echo ""
+        echo "files matched by rawgrep only (sample):"
+        LC_ALL=C comm -13 /tmp/bench_files_rg.txt /tmp/bench_files_rawgrep.txt | head -10
+        echo ""
+        echo "fff vs rg:"
+        echo "  lines in rg but not fff:   $FFF_MISSED_LINES"
+        echo "  lines in fff but not rg:   $FFF_EXTRA_LINES"
+        echo "  files matched by rg only:  $FFF_MISSED_FILES"
+        echo "  files matched by fff only: $FFF_EXTRA_FILES"
+        echo ""
+        echo "files matched by rg only, not fff (sample):"
+        LC_ALL=C comm -23 /tmp/bench_files_rg.txt /tmp/bench_files_fff.txt | head -10
+        echo ""
+        echo "files matched by fff only, not rg (sample):"
+        LC_ALL=C comm -13 /tmp/bench_files_rg.txt /tmp/bench_files_fff.txt | head -10
+    } | tee -a "$RESULTS_DIR/correctness.txt"
+else
     echo ""
-    echo "files matched by rawgrep only (sample):"
-    LC_ALL=C comm -13 /tmp/bench_files_rg.txt /tmp/bench_files_rawgrep.txt | head -10
-    echo ""
-    echo "fff vs rg:"
-    echo "  lines in rg but not fff:   $FFF_MISSED_LINES"
-    echo "  lines in fff but not rg:   $FFF_EXTRA_LINES"
-    echo "  files matched by rg only:  $FFF_MISSED_FILES"
-    echo "  files matched by fff only: $FFF_EXTRA_FILES"
-    echo ""
-    echo "files matched by rg only, not fff (sample):"
-    LC_ALL=C comm -23 /tmp/bench_files_rg.txt /tmp/bench_files_fff.txt | head -10
-    echo ""
-    echo "files matched by fff only, not rg (sample):"
-    LC_ALL=C comm -13 /tmp/bench_files_rg.txt /tmp/bench_files_fff.txt | head -10
-} | tee -a "$RESULTS_DIR/correctness.txt"
+    echo "=== skipping correctness check ==="
+fi
 
 # Warm cache - with fragment cache
 
