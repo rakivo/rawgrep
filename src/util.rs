@@ -3,7 +3,6 @@ use std::sync::OnceLock;
 use std::{fs::File, io, sync::Arc};
 
 use smallvec::SmallVec;
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 #[inline(always)]
 pub fn cast_slice<A: bytemuck::NoUninit, B: bytemuck::AnyBitPattern>(a: &[A]) -> &[B] {
@@ -226,29 +225,6 @@ pub fn resolve_apfs_physical_store(virtual_device: &str) -> Result<String, Error
         "APFSPhysicalStore not found in diskutil output",
     )))
 }
-
-#[inline]
-pub fn init_logging() {
-    if let Ok(level) = std::env::var("RAWGREP_LOG") {
-        let Ok(rawgrep)    = format!("rawgrep={level}").parse() else { return };
-        let Ok(rawgrep_ui) = format!("rawgrep_ui={level}").parse() else { return };
-
-        let filter = EnvFilter::new("off")
-            .add_directive(rawgrep)
-            .add_directive(rawgrep_ui);
-
-        tracing_subscriber::registry()
-            .with(filter)
-            .with(
-                tracing_subscriber::fmt::layer()
-                    .without_time()
-                    .with_target(false)
-                    .compact()
-                    .with_ansi(std::env::var("DONT_USE_COLOR").is_err())
-            ).init();
-    }
-}
-
 
 //
 // CPU affinity helpers - gdt-cpus has bugs on macOS, so we provide fallbacks

@@ -1,5 +1,6 @@
 #![allow(clippy::needless_range_loop)]
 
+use crate::debug;
 use crate::writeln_blue;
 use crate::util::{likely, unlikely};
 
@@ -371,7 +372,7 @@ impl CacheStorage for DiskStorage {
                 let new_rl = libc::rlimit { rlim_cur: target, rlim_max: rl.rlim_max };
                 let ret = unsafe { libc::setrlimit(libc::RLIMIT_MEMLOCK, &new_rl) };
                 if ret != 0 {
-                    ::tracing::debug!(
+                    debug!(
                         "[cache] setrlimit(RLIMIT_MEMLOCK) failed ({}), mlock may still fail",
                         io::Error::last_os_error()
                     );

@@ -35,8 +35,8 @@ pub mod platform;
 pub mod slab;
 pub mod thin_path_arc;
 pub mod liner;
+pub mod logger;
 
-pub use tracing;
 pub use crossbeam_channel;
 
 pub use error::Error;

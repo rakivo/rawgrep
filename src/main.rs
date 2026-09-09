@@ -19,8 +19,6 @@ fn main() -> io::Result<()> {
     #[cfg(feature = "dhat")]
     let _profiler = dhat::Profiler::new_heap();
 
-    rawgrep::util::init_logging();
-
     _ = rawgrep::platform::set_process_priority(-10);
 
     let cli = Cli::parse();

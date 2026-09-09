@@ -1,3 +1,4 @@
+use crate::debug;
 use crate::pacer::FlushPacer;
 use crate::error::Error;
 use crate::matcher::Matcher;
@@ -19,7 +20,6 @@ use std::io::{self};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use ::tracing::debug;
 use parking_lot::{Condvar, Mutex, RwLock};
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use crossbeam_deque::{Injector, Stealer, Worker as DequeWorker};
