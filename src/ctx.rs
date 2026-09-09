@@ -433,7 +433,6 @@ fn worker_thread_main<S: MatchSink + 'static>(
     // saving allocations on every search restart.
     let mut parser                    = Parser::new(false);
     let mut path_buf                  = Box::new(SmallPathBuf::new());
-    let mut swap_path_buf             = Box::new(SmallPathBuf::new());
     let mut newlines_scratch          = Vec::new();
     let mut ranges_scratch            = Vec::with_capacity(64); // @Speed @Note: If this reallocates we're gonna be really sad.
     let mut line_ranges_scratch       = Vec::with_capacity(64); // @Speed @Note: If this reallocates we're gonna be really sad.
@@ -487,7 +486,6 @@ fn worker_thread_main<S: MatchSink + 'static>(
         // Reset the buffers
         //
         unsafe { path_buf.set_len(0); }
-        unsafe { swap_path_buf.set_len(0); }
         newlines_scratch.clear();
         ranges_scratch.clear();
         subdirs_arena.clear();
@@ -527,7 +525,6 @@ fn worker_thread_main<S: MatchSink + 'static>(
                     ranges_scratch,
                     path_arena,
                     file_entries_arena,
-                    swap_path_buf,
                     fragment_presence_scratch,
 
                     batch_size_cached: 0,
@@ -563,7 +560,6 @@ fn worker_thread_main<S: MatchSink + 'static>(
         line_ranges_scratch = result.line_ranges_scratch;
         fragment_presence_scratch = result.fragment_presence_scratch;
         path_buf = result.path_buf;
-        swap_path_buf = result.swap_path_buf;
         output = result.output;
         result.stats.merge_into(&job.stats);
 
