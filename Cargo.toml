@@ -26,22 +26,11 @@ tracy = ["tracy-client/enable"]
 mimalloc = ["dep:mimalloc"]
 dhat = ["dep:dhat"]
 
-# Want a small binary? Do this:
-# RUSTFLAGS="-Zunstable-options -Cpanic=immediate-abort -Zlocation-detail=none -Zfmt-debug=none" \
-#     cargo +nightly b \
-#        -Z build-std=std,panic_abort \
-#        -Z build-std-features= \
-#         --profile=release-small --target=x86_64-unknown-linux-gnu --no-default-features --features=use_nightly,small,mimalloc
-small = ["regex-tiny"]
-
-full  = ["regex-full"]
-
 only_log_errors = ["tracing/max_level_error", "tracing/release_max_level_error"]
 only_log_errors_in_release = ["tracing/release_max_level_error"]
 
 [dependencies]
-regex-tiny = { package="regex",          version="1",        default-features=false, optional=true }
-regex-full = { package="regex-automata", version = "0.4.18", default-features=false, features=["std", "meta"], optional = true }
+regex = { package="regex-automata", version = "0.4.18", default-features=false, features=["std", "meta"], optional = true }
 
 aho-corasick = { version = "1.1.4", default-features = false }
 smallvec = { version = "1.15.1", features = ["const_generics"] }
@@ -130,6 +119,12 @@ panic = "abort"
 incremental = false
 codegen-units = 1
 
+# Want a small binary? Do this:
+# RUSTFLAGS="-Zunstable-options -Cpanic=immediate-abort -Zlocation-detail=none -Zfmt-debug=none" \
+#     cargo +nightly b \
+#        -Z build-std=std,panic_abort \
+#        -Z build-std-features= \
+#         --profile=release-small --target=x86_64-unknown-linux-gnu --features=use_nightly
 [profile.release-small]
 inherits = "release"
 opt-level = "z"

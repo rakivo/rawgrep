@@ -78,8 +78,6 @@ jobs:
       - name: Check feature combinations
         run: |
           cargo hack check --feature-powerset \
-            --at-least-one-of=small,full \
-            --mutually-exclusive-features=small,full \
             --mutually-exclusive-features=mimalloc,dhat \
             --depth=3
 
@@ -100,8 +98,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # Can't use --all-features because small/full are mutually exclusive
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check bans licenses sources
-          arguments: --features full
+          arguments: --all-features
