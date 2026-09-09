@@ -9,21 +9,21 @@ benchmark script: [`bench.sh`](bench.sh)
 ```
 corpus: Chromium codebase (~500k files)
 pattern: 'TODO' (literal)
-rawgrep 0.2.0 (rev efa6ced) vs ripgrep 15.2.0 (rev 3fce3b5bb0)
+rawgrep 0.2.0 (rev a9f90c4) vs ripgrep 15.2.0 (rev 3fce3b5bb0)
 system: Intel i5-13400F, 16 threads, ext4 file system, NVMe SSD (Crucial P2 250GB, ~994MB/s read / 736MB/s write), 16GB 3200MHz RAM (~15GB free), performance mode enabled, Debian 6.12
 ```
 
 | scenario | rawgrep time | rawgrep RAM | ripgrep time | ripgrep RAM | speedup |
 |---|---|---|---|---|---|
-| warm cache + fragment cache | 167.3ms ± 6.1ms | 185 MiB | 363.4ms ± 6.2ms | 188 MiB* (See note below) | 2.17x |
-| warm cache, no fragment cache | 370.7ms ± 6.6ms | 254 MiB | 364.8ms ± 7.3ms | 257 MiB* (See note below) | 0.98x (slower) |
-| cold cache, no fragment cache | 8.311s ± 0.120s | 246.1 MiB | 11.932s ± 0.119s | 256.5 MiB* (See note below) | 1.44x |
-| cold cache + fragment cache | 2.581s ± 0.026s | 208.0 MiB | 11.932s ± 0.196s | 208.5 MiB* (See note below) | 4.62x |
+| warm cache + fragment cache | 165.9 ± 5.8 ms | 185 MiB | 368.0 ± 6.8 ms | 188 MiB* (See note below) | 2.22x |
+| warm cache - fragment cache | 382.3 ± 5.4 ms | 254 MiB | 367.5 ± 6.8 ms | 257 MiB* (See note below) | 0.96x (slower) |
+| cold cache - fragment cache | 8.320 ± 0.086 s | 246.1 MiB | 11.906 ± 0.084 s | 256.5 MiB* (See note below) | 1.43x |
+| cold cache + fragment cache | 2.595 ± 0.038 s | 208.0 MiB | 11.969 ± 0.241 s | 208.5 MiB* (See note below) | 4.61x |
 
 | scenario | rawgrep time | rawgrep RAM | fff time | fff RAM | speedup |
 |---|---|---|---|---|---|
-| warm cache + both using cache, fff vs rawgrep | 170.5ms ± 8.2ms | 582 MiB* (See note below) | 625.0ms ± 12.5ms | 580 MiB | 3.66x |
-| cold cache + both using cache, fff vs rawgrep | 2.593s ± 0.039s | 584 MiB* (See note below) | 5.125s ± 0.044s | 583 MiB | 1.98x |
+| warm, fff (cache built once) vs rawgrep | 167.6 ± 6.6 ms | 582 MiB* (See note below) | 626.8 ± 11.8 ms | 580 MiB | 3.74x |
+| cold, fff (cache built once) vs rawgrep | 2.596 ± 0.039 s | 584 MiB* (See note below) | 5.084 ± 0.030 s | 583 MiB | 1.96x |
 
 # The note
 
