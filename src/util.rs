@@ -6,6 +6,26 @@ use smallvec::SmallVec;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 #[inline(always)]
+pub fn cast_slice<A: bytemuck::NoUninit, B: bytemuck::AnyBitPattern>(a: &[A]) -> &[B] {
+    #[cfg(any(debug_assertions, feature = "enable-bytemuck-checks"))]
+    {
+        bytemuck::cast_slice(a)
+    }
+
+    #[cfg(not(any(debug_assertions, feature = "enable-bytemuck-checks")))]
+    unsafe {
+        if size_of::<B>() == size_of::<A>() {
+            core::slice::from_raw_parts(a.as_ptr() as *const B, a.len())
+        } else {
+            let new_len =
+                if size_of::<B>() != 0 { size_of_val::<[A]>(a) / size_of::<B>() } else { 0 };
+
+            core::slice::from_raw_parts(a.as_ptr() as *const B, new_len)
+        }
+    }
+}
+
+#[inline(always)]
 pub fn read_u8_unaligned(data: &[u8], offset: usize) -> u8 {
     unsafe { data.as_ptr().add(offset).read_unaligned() }
 }
@@ -18,6 +38,11 @@ pub fn read_u16_unaligned_le(data: &[u8], offset: usize) -> u16 {
 #[inline(always)]
 pub fn read_u32_unaligned_le(data: &[u8], offset: usize) -> u32 {
     unsafe { (data.as_ptr().add(offset) as *const u32).read_unaligned().to_le() }
+}
+
+#[inline(always)]
+pub fn read_u64_unaligned_le(data: &[u8], offset: usize) -> u64 {
+    unsafe { (data.as_ptr().add(offset) as *const u64).read_unaligned().to_le() }
 }
 
 #[cfg(windows)]

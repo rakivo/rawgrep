@@ -17,6 +17,8 @@ rust-version = "1.85.1"
 default = ["mimalloc", "full"]
 use_nightly = []
 
+enable-bytemuck-checks = []
+
 # profiling
 tracy = ["tracy-client/enable"]
 

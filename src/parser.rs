@@ -93,6 +93,7 @@ pub trait RawFs: Sync + Send {
         &self,
         _scratch: &mut Vec<u8>,
         _scratch2: &mut Vec<u8>,
+        _scratch3: &mut Vec<u64>,
         _scratch_chunks: &mut Vec<(u64, u32)>,
         _node: &Self::Node,
         _max_size: usize,
@@ -129,6 +130,7 @@ pub struct Parser {
     // Filesystem-specific scratch space
     pub scratch:   Vec<u8>,                // 24
     pub scratch2:  Vec<u8>,                // 48
+    pub scratch3:  Vec<u64>,               // 48
 
     // =============== Cache line ======================
 
@@ -146,6 +148,7 @@ impl Parser {
             dont_skip_dot_entries,
             file: Vec::new(),
             dir: Vec::new(),
+            scratch3: Vec::new(),
             gitignore: Vec::new(),
             scratch: Vec::new(),
             scratch_chunks: Vec::new(),

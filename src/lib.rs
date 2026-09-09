@@ -70,18 +70,6 @@ pub const COLOR_RESET: &str = "\x1b[0m";
 pub const CURSOR_HIDE: &str = "\x1b[?25l";
 pub const CURSOR_UNHIDE: &str = "\x1b[?25h";
 
-use smallvec::SmallVec;
-
-/// Helper used to indicate that we copy some amount of copiable data (bytes) into a newly allocated memory
-#[inline(always)]
-pub fn copy_data<A, T>(bytes: &[T]) -> SmallVec<A>
-where
-    A: smallvec::Array<Item = T>,
-    T: Copy
-{
-    SmallVec::from_slice(bytes)
-}
-
 use std::sync::Arc;
 use std::io::{self, Write};
 use std::num::NonZeroUsize;
@@ -258,6 +246,18 @@ pub fn run_with_inspect<S: MatchSink + 'static>(
     let threads = config.threads.get();
     let mut ctx = RawGrepCtx::new(threads, running);
     ctx.search(&config, sink, inspect_before_search)?;
+    Ok(ctx.wait_and_save_cache(&config))
+}
+
+#[inline]
+pub fn run_with_inspect_for_single_search<S: MatchSink + 'static>(
+    config: RawGrepConfig,
+    running: Arc<AtomicBool>,
+    sink: S,
+    inspect_before_search: impl FnOnce(&Path, &str, FsType, &str) // (search root, device, fs, pattern)
+) -> Result<(Stats, Option<CacheStats>)> {
+    let threads = config.threads.get();
+    let mut ctx = RawGrepCtx::new_for_single_search(threads, running, &config, sink, inspect_before_search)?;
     Ok(ctx.wait_and_save_cache(&config))
 }
 

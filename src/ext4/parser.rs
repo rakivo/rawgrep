@@ -1,6 +1,6 @@
 //! ext4 filesystem implementation of RawFs trait
 
-use crate::tracy;
+use crate::{tracy, util};
 use crate::util::{likely, unlikely, read_u16_unaligned_le, read_u32_unaligned_le, read_u8_unaligned};
 use crate::parser::{BufFatPtr, BufKind, FileId, FileNode, FileType, Parser, RawFs, binary_probe};
 use crate::worker::STREAMING_CHUNK_SIZE;
@@ -12,8 +12,6 @@ use std::os::fd::AsRawFd;
 use std::fs::File;
 use std::{io, mem};
 use std::ops::ControlFlow;
-
-use smallvec::SmallVec;
 
 /// Ext4 filesystem context
 pub struct Ext4Fs {
@@ -83,7 +81,11 @@ impl RawFs for Ext4Fs {
 
         let inode_offset = self.inode_disk_offset(file_id);
 
-        let mut inode_buf = [0u8; 256];  // Ext4 inode_size is 128 or 256 in virtually all real deployments
+        let mut inode_buf = std::mem::MaybeUninit::<[u8; 256]>::uninit();  // Ext4 inode_size is 128 or 256 in virtually all real deployments
+        let inode_buf = unsafe {
+            std::slice::from_raw_parts_mut(inode_buf.as_mut_ptr() as *mut u8, self.sb.inode_size as usize)
+        };
+
         debug_assert!(self.sb.inode_size as usize <= inode_buf.len());
 
         let inode_size = self.sb.inode_size as usize;
@@ -111,19 +113,15 @@ impl RawFs for Ext4Fs {
 
         let size = ((size_high as u64) << 32) | (size_low as u64);
 
-        let raw_block = [raw.block];
-        let block_bytes = bytemuck::cast_slice::<[[u8; 12]; 5], u8>(&raw_block);
-
         #[cfg(target_endian = "little")]
-        let blocks: [u32; 15] = {
-            // On a little-endian host, on-disk LE u32s are already in native order.
-            let as_u32: &[u32] = bytemuck::cast_slice(block_bytes);
-            as_u32.try_into().expect("block array is always exactly 60 bytes / 15 u32s")
-        };
+        let blocks: [u32; 15] = bytemuck::cast(raw.block);
 
         #[cfg(target_endian = "big")]
         let blocks: [u32; 15] = {
-            let as_u32: &[u32] = bytemuck::cast_slice(block_bytes);
+            let raw_block = [raw.block];
+            let block_bytes = util::cast_slice::<[[u8; 12]; 5], u8>(&raw_block);
+
+            let as_u32: &[u32] = util::cast_slice(block_bytes);
             std::array::from_fn(|i| u32::from_le(as_u32[i]))
         };
 
@@ -168,6 +166,7 @@ impl RawFs for Ext4Fs {
         if !self.collect_file_chunks(
             &mut parser.scratch,
             &mut parser.scratch2,
+            &mut parser.scratch3,
             &mut parser.scratch_chunks,
             node,
             size_to_read,
@@ -184,26 +183,15 @@ impl RawFs for Ext4Fs {
         let fd = self.file.as_raw_fd();
 
         #[cfg(unix)]
-        {
-            const PREFETCH_AHEAD: usize = 4;
-
-            for &(offset, len) in parser.scratch_chunks.iter().take(PREFETCH_AHEAD) {
-                unsafe {
-                    libc::posix_fadvise(
-                        fd, offset as i64, len as i64,
-                        libc::POSIX_FADV_WILLNEED
-                    );
-                }
-            }
-        }
+        const PREFETCH_AHEAD: usize = 4;
 
         for (i, &(disk_offset, len)) in parser.scratch_chunks.iter().enumerate() {
             #[cfg(unix)]
-            if let Some(&(next_offset, next_len)) = parser.scratch_chunks.get(i + 1) {
+            if let Some(&(next_offset, next_len)) = parser.scratch_chunks.get(i + PREFETCH_AHEAD) {
                 unsafe {
                     libc::posix_fadvise(
                         fd, next_offset as i64, next_len as i64,
-                        libc::POSIX_FADV_WILLNEED,
+                        libc::POSIX_FADV_WILLNEED
                     );
                 }
             }
@@ -215,7 +203,7 @@ impl RawFs for Ext4Fs {
 
             unsafe { buf.set_len(new_len); }  // @ProbablySafe...
 
-            match self.read_at_offset(&mut buf[old_len..], disk_offset) {
+            match self.read_at_offset(unsafe { buf.get_unchecked_mut(old_len..) }, disk_offset) {
                 Ok(n) => buf.truncate(old_len + n),
                 Err(_) => { buf.truncate(old_len); break; }
             }
@@ -226,15 +214,17 @@ impl RawFs for Ext4Fs {
     }
 
     #[allow(clippy::uninit_vec)]
+    #[inline(always)]
     fn collect_file_chunks(
         &self,
-        scratch: &mut Vec<u8>,
-        scratch2: &mut Vec<u8>, // Probe buffer, only touched (and only sized) when check_binary
+        scratch:  &mut Vec<u8>,
+        scratch2: &mut Vec<u8>,  // Probe buffer, only touched (and only sized) when check_binary
+        scratch3: &mut Vec<u64>, // For children blocks
         scratch_chunks: &mut Vec<(u64, u32)>,
         node: &Ext4Inode,
         max_size: usize,
         check_binary: bool,
-        buf: &mut Vec<u8>,      // Destination buffer -- probed bytes get written straight in here
+        buf: &mut Vec<u8>,       // Destination buffer -- probed bytes get written straight in here
     ) -> io::Result<bool> {
         let _span = tracy::span!("Ext4Fs::collect_file_chunks");
 
@@ -253,8 +243,8 @@ impl RawFs for Ext4Fs {
             //
             // Parse extents into scratch
             //
-            let block_bytes = bytemuck::cast_slice(&node.blocks);
-            self.parse_extent_node_into(scratch, block_bytes, 0)?;
+            let block_bytes = util::cast_slice(&node.blocks);
+            self.parse_extent_node_into(scratch, scratch3, block_bytes, 0)?;
 
             let extents = Self::scratch_as_extents(scratch);
 
@@ -270,10 +260,12 @@ impl RawFs for Ext4Fs {
                 unsafe { buf.set_len(probe_len); }  // @ProbablySafe...
 
                 let offset = first.start * block_size;
-                match self.read_at_offset(&mut buf[..probe_len], offset) {
+                match self.read_at_offset(unsafe { buf.get_unchecked_mut(..probe_len) }, offset) {
                     Ok(n) => {
                         buf.truncate(n);
-                        if binary_probe(&buf[..n], file_size) {
+                        debug_assert!(buf.len() >= n);
+
+                        if binary_probe(unsafe { buf.get_unchecked(..n) }, file_size) {
                             buf.clear();
                             return Ok(false);                    // binary
                         }
@@ -326,7 +318,7 @@ impl RawFs for Ext4Fs {
             // Direct blocks
             //
 
-            let blocks = &node.blocks[..EXT4_BLOCK_POINTERS_COUNT];
+            let blocks = unsafe { node.blocks.get_unchecked(..EXT4_BLOCK_POINTERS_COUNT) };
 
             if blocks.iter().all(|&b| b == 0 || b as u64 >= self.max_block) {
                 return Ok(true);
@@ -347,11 +339,15 @@ impl RawFs for Ext4Fs {
                 // not as "bail out", unlike the extents branch.
                 //
                 let n = self.read_at_offset(scratch2, first as u64 * block_size).unwrap_or(0);
-                if binary_probe(&scratch2[..n], file_size) {
+
+                debug_assert!(scratch2.len() >= n);
+                let probe = unsafe { scratch2.get_unchecked(..n) };
+
+                if binary_probe(probe, file_size) {
                     return Ok(false); // binary
                 }
 
-                buf.extend_from_slice(&scratch2[..n]);
+                buf.extend_from_slice(probe);
                 skip_first = n;
             }
 
@@ -450,8 +446,14 @@ impl Ext4Fs {
     pub fn inode_disk_offset(&self, inode_num: u64) -> u64 {
         let group = (inode_num - 1) / self.sb.inodes_per_group as u64;
         let index = (inode_num - 1) % self.sb.inodes_per_group as u64;
-        self.inode_table_blocks[group as usize] * self.sb.block_size as u64
+
+        debug_assert!(self.inode_table_blocks.len() >= group as usize);
+
+        unsafe {
+            self.inode_table_blocks.get_unchecked(group as usize)
+            * self.sb.block_size as u64
             + index * self.sb.inode_size as u64
+        }
     }
 
     /// Read inline data from inode's block array (max 60 bytes)
@@ -467,7 +469,7 @@ impl Ext4Fs {
         let _span = tracy::span!("Ext4Fs::read_inline_data");
 
         // blocks array is [u32; 15] = 60 bytes of inline data
-        let inline_bytes: &[u8] = bytemuck::cast_slice(&node.blocks);
+        let inline_bytes: &[u8] = util::cast_slice(&node.blocks);
         let actual_size = size_to_read.min(inline_bytes.len());
 
         let inline_bytes = unsafe { inline_bytes.get_unchecked(..actual_size) };
@@ -512,12 +514,13 @@ impl Ext4Fs {
 
     #[inline]
     fn scratch_as_extents(scratch: &[u8]) -> &[Ext4Extent] {
-        bytemuck::cast_slice(scratch)
+        util::cast_slice(scratch)
     }
 
     fn parse_extent_node_into(
         &self,
         scratch: &mut Vec<u8>,
+        child_blocks: &mut Vec<u64>,
         data: &[u8],
         level: usize,
     ) -> io::Result<()> {
@@ -544,6 +547,8 @@ impl Ext4Fs {
         if unlikely(u16::from_le(eh_magic) != EXT4_EXTENT_MAGIC) {
             return Ok(());
         }
+
+        scratch.reserve(eh_entries as usize * mem::size_of::<raw::Ext4Extent>());
 
         if eh_depth == 0 {
             let extent_size   = mem::size_of::<raw::Ext4Extent>();
@@ -572,10 +577,10 @@ impl Ext4Fs {
                 }
             }
         } else {
-            let mut child_blocks = SmallVec::<[u64; 16]>::new(); // @Memory @Speed...?
-
             const INDEX_SIZE:    usize = mem::size_of::<raw::Ext4ExtentIdx>();
             const INDICES_START: usize = mem::size_of::<raw::Ext4ExtentHeader>();
+
+            let mark = child_blocks.len();
 
             for i in 0..eh_entries as usize {
                 let offset = INDICES_START + i * INDEX_SIZE;
@@ -595,8 +600,7 @@ impl Ext4Fs {
             #[cfg(unix)]
             {
                 let fd = self.file.as_raw_fd();
-
-                for &cb in &child_blocks {
+                for &cb in &child_blocks[mark..] {
                     unsafe {
                         libc::posix_fadvise(
                             fd,
@@ -608,15 +612,24 @@ impl Ext4Fs {
                 }
             }
 
-            for child_block in child_blocks {
-                let mut probe = [0u8; 8192];  // ext4 block size is at most 8192 bytes
-                let probe = unsafe { probe.get_unchecked_mut(..block_size as usize) };
+            let count = child_blocks.len() - mark;
+
+            for child in 0..count {
+                let child_block = child_blocks[mark + child];
+
+                let mut probe = std::mem::MaybeUninit::<[u8; 8192]>::uninit();  // ext4 block size is at most 8192 bytes
+
+                let probe = unsafe {
+                    std::slice::from_raw_parts_mut(probe.as_mut_ptr() as *mut u8, block_size as usize)
+                };
 
                 let offset = child_block * block_size;
                 if self.read_at_offset(probe, offset).is_ok() {
-                    self.parse_extent_node_into(scratch, probe, level + 1)?;
+                    self.parse_extent_node_into(scratch, child_blocks, probe, level + 1)?;
                 }
             }
+
+            child_blocks.truncate(mark);
         }
 
         Ok(())

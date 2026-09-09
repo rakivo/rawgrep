@@ -26,7 +26,7 @@ fn main() -> io::Result<()> {
     let cli = Cli::parse();
     let show_stats = cli.stats;
 
-    match rawgrep::run_with_inspect(
+    match rawgrep::run_with_inspect_for_single_search(
         RawGrepConfig::from_cli(cli),
         rawgrep::setup_signal_handler(),
         NoSink,

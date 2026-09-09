@@ -68,57 +68,30 @@ pub struct RawGrepCtx<S: MatchSink> {
 }
 
 impl<S: MatchSink + 'static> RawGrepCtx<S> {
-    /// Spawn `num_threads` persistent worker threads and return the context.
-    /// Threads immediately sleep on the condvar and consume no CPU until
-    /// the first call to [`search`].
+    #[inline]
     pub fn new(num_threads: usize, running: Arc<AtomicBool>) -> Self {
-        let injector       = Arc::default();
-        let active_workers = Arc::default();
-        let wake           = Arc::default();
-        let running_signal = Arc::default();
-        let job_done       = Arc::default();
-        let job            = Arc::default();
-
-        let (output_tx, output_rx)       = unbounded();
-        let (flush_ack_tx, flush_ack_rx) = unbounded();
-
-        let (raw_stdout, output_kind) = RawStdout::new();
-        let stdout_is_being_redirected_to_dev_null = raw_stdout.is_none();
-
-        let _cursor_hide_for_tty = if output_kind == OutputKind::Tty {
-            CursorHide::new().ok()
-        } else {
-            None
-        };
-
-        if let Some((raw_stdout, _raw_fd)) = raw_stdout {
-            _ = std::thread::spawn(move || {
-                OutputWorker {
-                    rx: output_rx,
-                    flush_ack_tx,
-                    batch_bytes: 0,
-                    writer: raw_stdout,
-                    batch: Vec::with_capacity(256),
-                    iov_scratch: Vec::with_capacity(256),
-                }.run();
-            });
-        }
+        let plumbing = setup_output_plumbing();
 
         let ctx = Self {
-            injector,
+            injector: Arc::default(),
             running,
-            active_workers,
-            job_done,
-            running_signal,
-            wake,
-            _cursor_hide_for_tty,
-            current_job: job,
-            output_tx,
+            active_workers: Arc::default(),
+            job_done: Arc::default(),
+            running_signal: Arc::default(),
+            wake: Arc::default(),
+            _cursor_hide_for_tty: plumbing.cursor_hide,
+            current_job: Arc::default(),
+            output_tx: plumbing.output_tx,
             worker_count: num_threads,
-            stdout_is_being_redirected_to_dev_null,
-            flush_ack_rx: Arc::new(Mutex::new(flush_ack_rx)),
+            stdout_is_being_redirected_to_dev_null: plumbing.stdout_is_being_redirected_to_dev_null,
+            flush_ack_rx: plumbing.flush_ack_rx,
         };
 
+        ctx.spawn_workers(num_threads, plumbing.output_kind);
+        ctx
+    }
+
+    fn spawn_workers(&self, num_threads: usize, output_kind: OutputKind) {
         let mut local_workers = Vec::with_capacity(num_threads);
         let mut stealers      = Vec::with_capacity(num_threads);
         for _ in 0..num_threads {
@@ -128,34 +101,63 @@ impl<S: MatchSink + 'static> RawGrepCtx<S> {
         }
 
         let mut slot_pools = SlotPool::new_for_workers(num_threads);
-
-        let num_cores = crate::util::num_physical_cores_or(num_threads);
-
-        let pacer_enabled = !stdout_is_being_redirected_to_dev_null && output_kind == OutputKind::Tty;
-        let pacer = Arc::new(FlushPacer::new(pacer_enabled));
-        let stealers = Arc::new(stealers);
+        let num_cores      = crate::util::num_physical_cores_or(num_threads);
+        let pacer_enabled  = !self.stdout_is_being_redirected_to_dev_null && output_kind == OutputKind::Tty;
+        let pacer          = Arc::new(FlushPacer::new(pacer_enabled));
+        let stealers       = Arc::new(stealers);
 
         for (worker_id, local) in local_workers.into_iter().enumerate() {
-            let ctx = ctx.clone();
-            let stealers = stealers.clone();
-            let pacer = pacer.clone();
+            let ctx       = self.clone();
+            let stealers  = stealers.clone();
+            let pacer     = pacer.clone();
             let slot_pool = slot_pools.pop().unwrap();
 
             std::thread::spawn(move || {
                 crate::util::pin_thread_to_core(worker_id % num_cores);
-
-                worker_thread_main(
-                    worker_id as _,
-                    ctx,
-                    &stealers,
-                    local,
-                    &pacer,
-                    slot_pool,
-                );
+                worker_thread_main(worker_id as _, ctx, &stealers, local, &pacer, slot_pool);
             });
         }
+    }
 
-        ctx
+    /// For a process that will call `search()` exactly once. Builds the
+    /// job and pushes the root work item before any worker thread exists,
+    /// then pre-arms the wake generation to 1. Each thread's local
+    /// last_gen starts at 0, so its very first wake check already sees
+    /// the job as ready and skips cvar.wait entirely.
+    ///
+    /// If this ctx will ever be handed a second search, don't use this,
+    /// there is nothing here that helps search #2 onward, use `new` +
+    /// `search` instead.
+    pub fn new_for_single_search(
+        num_threads: usize,
+        running: Arc<AtomicBool>,
+        config: &RawGrepConfig,
+        sink: S,
+        inspect_before_search: impl FnOnce(&Path, &str, FsType, &str),
+    ) -> Result<Self, Error> {
+        let (job, work) = build_job_and_initial_work(config, sink, inspect_before_search)?;
+        let plumbing = setup_output_plumbing();
+
+        let ctx = Self {
+            injector: Arc::new(Injector::new()),
+            running,
+            active_workers: Arc::default(),
+            job_done: Arc::new((Mutex::new(num_threads), Condvar::new())),
+            running_signal: Arc::default(),
+            wake: Arc::new((Mutex::new(1u64), Condvar::new())),
+            _cursor_hide_for_tty: plumbing.cursor_hide,
+            current_job: Arc::new(RwLock::new(Some(Arc::new(job)))),
+            output_tx: plumbing.output_tx,
+            worker_count: num_threads,
+            stdout_is_being_redirected_to_dev_null: plumbing.stdout_is_being_redirected_to_dev_null,
+            flush_ack_rx: plumbing.flush_ack_rx,
+        };
+
+        ctx.injector.push(work);
+        ctx.running.store(true, Ordering::SeqCst);
+
+        ctx.spawn_workers(num_threads, plumbing.output_kind);
+        Ok(ctx)
     }
 
     #[inline]
@@ -224,10 +226,10 @@ impl<S: MatchSink + 'static> RawGrepCtx<S> {
             return;
         };
 
-        let mut acc = job.cache_acc.lock();
-        let file_keys         = std::mem::take(&mut acc.file_keys);
-        let file_metas        = std::mem::take(&mut acc.file_metas);
-        let fragment_presence = std::mem::take(&mut acc.fragment_presence);
+        let acc = job.cache_acc.lock();
+        let file_keys         = &acc.file_keys;
+        let file_metas        = &acc.file_metas;
+        let fragment_presence = &acc.fragment_presence;
 
         let (fragment_hashes, cache) = job.grepper.fragment_hashes_and_cache_mut();
 
@@ -237,9 +239,11 @@ impl<S: MatchSink + 'static> RawGrepCtx<S> {
                     _ = cache.save_to_disk();
                     debug!("[ctx] successfully saved cache");
                 }
+
                 Ok(false) => {
                     debug!("[ctx] cache batch unchanged, skipping merge+save..");
                 }
+
                 Err(e) => {
                     debug!("[ctx] merge_updates_if_changed failed: {e}");
                 }
@@ -260,8 +264,6 @@ impl<S: MatchSink + 'static> RawGrepCtx<S> {
         sink: S,
         inspect_before_search: impl FnOnce(&Path, &str, FsType, &str) // (search root, device, fs, pattern)
     ) -> Result<(), Error> {
-        let cli = config.to_cli();
-
         _ = cli::SHOULD_ENABLE_ANSI_COLORING.set(!config.no_color);
 
         debug!("[ctx] search() pattern={:?} root={:?}", config.pattern, config.search_root_path);
@@ -290,120 +292,17 @@ impl<S: MatchSink + 'static> RawGrepCtx<S> {
             *lock.lock() = self.worker_count;
         }
 
-        //
-        // Open device and detect fs
-        //
-
-        let search_root = if config.device.is_some() {
-            fs::canonicalize(&*config.search_root_path)
-                .unwrap_or_else(|_| PathBuf::from(&*config.search_root_path))
-        } else {
-            fs::canonicalize(&*config.search_root_path).map_err(|e| Error::PathNotFound {
-                path:   config.search_root_path.clone(),
-                source: e,
-            })?
-        };
-
-        let device = match config.device.clone() {
-            Some(d) => d,
-            None    => platform::detect_partition_for_path(
-                &search_root
-            ).map(Into::into).map_err(Error::DeviceDetectionFailed)?,
-        };
-
-        #[cfg(target_os = "macos")]
-        let device = crate::util::resolve_apfs_physical_store(&device)?;
-
-        let (file, fs_type) = open_device_and_detect_fs(&device)
-            .map_err(|e| match e.kind() {
-                io::ErrorKind::NotFound         => Error::DeviceNotFound(device.clone()),
-                io::ErrorKind::PermissionDenied => Error::PermissionDenied(device.clone()),
-                _                               => Error::Io(e),
-            })?;
-
-        debug!("[ctx] device={device:?} fs_type={fs_type:?}");
-
-        //
-        // Build grepper
-        //
-
-        let grepper = match fs_type {
-            FsType::Apfs => RawGrepper::new_apfs(&cli, &device, file, sink),
-            FsType::Ext4 => RawGrepper::new_ext4(&cli, &device, file, sink),
-            FsType::Ntfs => RawGrepper::new_ntfs(&cli, &device, file, sink),
-        }?;
-
-        debug!("[ctx] grepper built ok");
-
-        inspect_before_search(
-            &search_root, &device, fs_type, &cli.pattern
-        );  // called after grepper is built, before workers wake
-
-        //
-        // Resolve root inode
-        //
-        let search_root_for_fs = if config.device.is_some() {
-            platform::strip_mountpoint_prefix(&device, &search_root)
-                .unwrap_or_else(|| search_root.to_string_lossy().into_owned())
-        } else {
-            search_root.to_string_lossy().into_owned()
-        }.into_boxed_str();
-
-        let root_file_id = grepper
-            .try_resolve_path_to_file_id(&search_root_for_fs)
-            .map_err(|e| Error::RootNotFound {
-                path:   search_root_for_fs.clone(),
-                device: device.clone(),
-                source: e,
-            })?;
-
-        debug!("[ctx] search_root_for_fs={search_root_for_fs:?} root_file_id={root_file_id:?}");
-
-        let gitignore_enabled = !config.no_ignore
-            && (config.no_require_git || crate::find_git_boundary(&search_root));
-
-        //
-        // Setup output channel and gitignore
-        //
-        let root_gitignore = gitignore_enabled.then(|| {
-            let gi_path = search_root.join(".gitignore");
-            ignore::build_gitignore_from_file(&gi_path.to_string_lossy())
-        }).flatten();
-        debug!("[ctx] root_gitignore present={}", root_gitignore.is_some());
+        let (job, work) = build_job_and_initial_work(config, sink, inspect_before_search)?;
 
         //
         // Swap in new job
         //
         {
             let mut guard = self.current_job.write();
-            *guard = Some(SearchJob {
-                grepper,
-                gitignore_enabled,
-                device:    device.clone(),
-                stats:     Default::default(),
-                cache_acc: Default::default(),
-            }.into());
+            *guard = Some(job.into());
         }
         debug!("[ctx] job swapped in");
 
-        //
-        // Push root work item and wake workers
-        //
-
-        let work = if std::fs::metadata(&search_root).is_ok_and(|m| m.is_file()) {
-            WorkItem::File(FileWork {
-                file_id:         root_file_id,
-                gitignore_chain: root_gitignore
-                    .map(crate::ignore::GitignoreChain::from_root)
-                    .unwrap_or_default(),
-            })
-        } else {
-            WorkItem::Directory(DirWork::new(
-                root_file_id,
-                &[], 0,
-                root_gitignore.map(crate::ignore::GitignoreChain::from_root).unwrap_or_default()
-            ))
-        };
         self.injector.push(work);
         debug!("[ctx] root work item pushed to injector");
 
@@ -554,7 +453,7 @@ fn worker_thread_main<S: MatchSink + 'static>(
                 )
             };
         }
-        let result = match &job.grepper {
+        let mut result = match &job.grepper {
             AnyGrepper::Ext4(g) => dispatch!(g),
             AnyGrepper::Apfs(g) => dispatch!(g),
             AnyGrepper::Ntfs(g) => dispatch!(g),
@@ -586,9 +485,9 @@ fn worker_thread_main<S: MatchSink + 'static>(
         // Deposit cache data
         if !cli.no_cache_write && !cli.no_cache {
             let mut acc = job.cache_acc.lock();
-            acc.file_keys.extend_from_slice(&result.file_keys);
-            acc.file_metas.extend_from_slice(&result.file_metas);
-            acc.fragment_presence.extend_from_slice(&result.fragment_presence.words);
+            acc.file_keys.append(&mut result.file_keys);
+            acc.file_metas.append(&mut result.file_metas);
+            acc.fragment_presence.append(&mut result.fragment_presence.words);
         }
 
         file_keys         = result.file_keys;
@@ -603,5 +502,160 @@ fn worker_thread_main<S: MatchSink + 'static>(
                 cvar.notify_all();
             }
         }
+    }
+}
+
+// Shared job-building logic, pulled out of search() unchanged in behavior.
+fn build_job_and_initial_work<S: MatchSink + 'static>(
+    config: &RawGrepConfig,
+    sink: S,
+    inspect_before_search: impl FnOnce(&Path, &str, FsType, &str),
+) -> Result<(SearchJob<S>, WorkItem), Error> {
+    let cli = config.to_cli();
+    _ = cli::SHOULD_ENABLE_ANSI_COLORING.set(!config.no_color);
+
+    //
+    // Open device and detect fs
+    //
+
+    let search_root = if config.device.is_some() {
+        fs::canonicalize(&*config.search_root_path)
+            .unwrap_or_else(|_| PathBuf::from(&*config.search_root_path))
+    } else {
+        fs::canonicalize(&*config.search_root_path).map_err(|e| Error::PathNotFound {
+            path:   config.search_root_path.clone(),
+            source: e,
+        })?
+    };
+
+    let device = match config.device.clone() {
+        Some(d) => d,
+        None    => platform::detect_partition_for_path(&search_root)
+            .map(Into::into)
+            .map_err(Error::DeviceDetectionFailed)?,
+    };
+
+    #[cfg(target_os = "macos")]
+    let device = crate::util::resolve_apfs_physical_store(&device)?;
+
+    let (file, fs_type) = open_device_and_detect_fs(&device)
+        .map_err(|e| match e.kind() {
+            io::ErrorKind::NotFound         => Error::DeviceNotFound(device.clone()),
+            io::ErrorKind::PermissionDenied => Error::PermissionDenied(device.clone()),
+            _                               => Error::Io(e),
+        })?;
+
+    debug!("[ctx] device={device:?} fs_type={fs_type:?}");
+
+    //
+    // Build grepper
+    //
+
+    let grepper = match fs_type {
+        FsType::Apfs => RawGrepper::new_apfs(&cli, &device, file, sink),
+        FsType::Ext4 => RawGrepper::new_ext4(&cli, &device, file, sink),
+        FsType::Ntfs => RawGrepper::new_ntfs(&cli, &device, file, sink),
+    }?;
+
+    //
+    // Called after grepper is built, before workers wake
+    //
+    inspect_before_search(&search_root, &device, fs_type, &cli.pattern);
+
+    let search_root_for_fs = if config.device.is_some() {
+        platform::strip_mountpoint_prefix(&device, &search_root)
+            .unwrap_or_else(|| search_root.to_string_lossy().into_owned())
+    } else {
+        search_root.to_string_lossy().into_owned()
+    }.into_boxed_str();
+
+    let root_file_id = grepper
+        .try_resolve_path_to_file_id(&search_root_for_fs)
+        .map_err(|e| Error::RootNotFound {
+            path:   search_root_for_fs.clone(),
+            device: device.clone(),
+            source: e,
+        })?;
+
+    let gitignore_enabled = !config.no_ignore
+        && (config.no_require_git || crate::find_git_boundary(&search_root));
+
+    //
+    // Setup output channel and gitignore
+    //
+
+    let root_gitignore = gitignore_enabled.then(|| {
+        let gi_path = search_root.join(".gitignore");
+        ignore::build_gitignore_from_file(&gi_path.to_string_lossy())
+    }).flatten();
+
+    debug!("[ctx] root_gitignore present={}", root_gitignore.is_some());
+
+    let work = if std::fs::metadata(&search_root).is_ok_and(|m| m.is_file()) {
+        WorkItem::File(FileWork {
+            file_id:         root_file_id,
+            gitignore_chain: root_gitignore
+                .map(crate::ignore::GitignoreChain::from_root)
+                .unwrap_or_default(),
+        })
+    } else {
+        WorkItem::Directory(DirWork::new(
+            root_file_id,
+            &[], 0,
+            root_gitignore.map(crate::ignore::GitignoreChain::from_root).unwrap_or_default()
+        ))
+    };
+
+    let job = SearchJob {
+        grepper,
+        gitignore_enabled,
+        device:    device.clone(),
+        stats:     Default::default(),
+        cache_acc: Default::default(),
+    };
+
+    Ok((job, work))
+}
+
+struct OutputPlumbing {
+    output_tx:    Sender<OutputMessage>,
+    flush_ack_rx: Arc<Mutex<Receiver<()>>>,
+    stdout_is_being_redirected_to_dev_null: bool,
+    output_kind:  OutputKind,
+    cursor_hide:  Option<CursorHide>,
+}
+
+fn setup_output_plumbing() -> OutputPlumbing {
+    let (output_tx, output_rx)       = unbounded();
+    let (flush_ack_tx, flush_ack_rx) = unbounded();
+
+    let (raw_stdout, output_kind) = RawStdout::new();
+    let stdout_is_being_redirected_to_dev_null = raw_stdout.is_none();
+
+    let cursor_hide = if output_kind == OutputKind::Tty {
+        CursorHide::new().ok()
+    } else {
+        None
+    };
+
+    if let Some((raw_stdout, _raw_fd)) = raw_stdout {
+        _ = std::thread::spawn(move || {
+            OutputWorker {
+                rx: output_rx,
+                flush_ack_tx,
+                batch_bytes: 0,
+                writer: raw_stdout,
+                batch: Vec::with_capacity(256),
+                iov_scratch: Vec::with_capacity(256),
+            }.run();
+        });
+    }
+
+    OutputPlumbing {
+        output_tx,
+        flush_ack_rx: Arc::new(Mutex::new(flush_ack_rx)),
+        stdout_is_being_redirected_to_dev_null,
+        output_kind,
+        cursor_hide
     }
 }

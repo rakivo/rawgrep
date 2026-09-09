@@ -2,10 +2,10 @@
 
 use smallvec::SmallVec;
 
-use crate::tracy;
+use crate::{tracy, util};
 use crate::cli::Cli;
 use crate::binary::{is_dot_entry, is_hidden_entry};
-use crate::util::{read_at_offset, read_u32_unaligned_le};
+use crate::util::{read_at_offset, read_u8_unaligned, read_u32_unaligned_le, read_u64_unaligned_le};
 use crate::parser::{BufKind, FileId, FileNode, FileType, Parser, RawFs, binary_probe};
 use crate::worker::STREAMING_CHUNK_SIZE;
 
@@ -94,6 +94,7 @@ impl RawFs for NtfsFs {
         if !self.collect_file_chunks(
             &mut parser.scratch,
             &mut parser.scratch2,
+            &mut parser.scratch3,
             &mut parser.scratch_chunks,
             node,
             size_to_read,
@@ -119,10 +120,12 @@ impl RawFs for NtfsFs {
         Ok(true)
     }
 
+    #[inline(always)]
     fn collect_file_chunks(
         &self,
-        _scratch: &mut Vec<u8>,    // unused for NTFS cuz runlists are decoded inline
-        _scratch2: &mut Vec<u8>,   // unused for NTFS cuz runlists are decoded inline
+        _scratch:  &mut Vec<u8>,  // unused for NTFS cuz runlists are decoded inline
+        _scratch2: &mut Vec<u8>,  // unused for NTFS cuz runlists are decoded inline
+        _scratch3: &mut Vec<u64>,
         scratch_chunks: &mut Vec<(u64, u32)>,
         node: &NtfsNode,
         max_size: usize,
@@ -228,9 +231,9 @@ impl RawFs for NtfsFs {
 
         let mut pos = 0usize;
         while pos + 10 <= buf.len() { // @Cleanup
-            let record_num = u64::from_le_bytes(buf[pos..pos+8].try_into().unwrap());
-            let is_dir     = buf[pos+8] != 0;
-            let name_len   = buf[pos+9] as usize;
+            let record_num = read_u64_unaligned_le(buf, pos);
+            let is_dir     = read_u8_unaligned    (buf, pos+8) != 0;
+            let name_len   = read_u8_unaligned    (buf, pos+9) as usize;
             pos += 10;
 
             if pos + name_len > buf.len() { break; }
@@ -258,7 +261,7 @@ impl RawFs for NtfsFs {
 
     #[inline]
     fn directory_entry_count_hint(&self, buf: &[u8]) -> usize {
-        u32::from_le_bytes(buf[0..4].try_into().unwrap()) as _
+        read_u32_unaligned_le(buf, 0) as _
     }
 }
 
@@ -576,7 +579,7 @@ fn find_attribute<'a>(
                     let name_off = read_u32_unaligned_le(attr, NTFS_ATTR_NAME_OFF_OFFSET) as usize;
                     let nbytes = name_len * 2;
                     let name_bytes = &attr[name_off..name_off+nbytes];
-                    name_off + nbytes <= attr.len() && name_bytes == bytemuck::cast_slice(wanted)
+                    name_off + nbytes <= attr.len() && name_bytes == util::cast_slice(wanted)
                 }
             };
 

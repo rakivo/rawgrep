@@ -1701,17 +1701,17 @@ impl<S: CacheStorage> FragmentCache<S> {
     /// caller that already knows it wants to write.
     pub fn merge_updates(
         &mut self,
-        file_keys: Vec<FileKey>,
-        file_metas: Vec<FileMeta>,
+        file_keys: &[FileKey],
+        file_metas: &[FileMeta],
         fragment_hashes: &[u32],
-        fragment_presence: Vec<u64>,
+        fragment_presence: &[u64],
     ) -> io::Result<()> {
         if file_keys.is_empty() {
             return Ok(());
         }
 
-        let plan = self.plan_batch(&file_keys, &file_metas, fragment_hashes, &fragment_presence);
-        self.apply_batch(&plan, &file_keys, &file_metas, &fragment_presence)
+        let plan = self.plan_batch(file_keys, file_metas, fragment_hashes, fragment_presence);
+        self.apply_batch(&plan, file_keys, file_metas, fragment_presence)
     }
 
     /// Same as merge_updates(), but skips ensure_owned() and every mutation
@@ -1720,21 +1720,21 @@ impl<S: CacheStorage> FragmentCache<S> {
     /// whether save_to_disk() is worth calling.
     pub fn merge_updates_if_changed(
         &mut self,
-        file_keys: Vec<FileKey>,
-        file_metas: Vec<FileMeta>,
+        file_keys: &[FileKey],
+        file_metas: &[FileMeta],
         fragment_hashes: &[u32],
-        fragment_presence: Vec<u64>,
+        fragment_presence: &[u64],
     ) -> io::Result<bool> {
         if file_keys.is_empty() {
             return Ok(false);
         }
 
-        let plan = self.plan_batch(&file_keys, &file_metas, fragment_hashes, &fragment_presence);
+        let plan = self.plan_batch(file_keys, file_metas, fragment_hashes, fragment_presence);
         if !plan.changed {
             return Ok(false);
         }
 
-        self.apply_batch(&plan, &file_keys, &file_metas, &fragment_presence)?;
+        self.apply_batch(&plan, file_keys, file_metas, fragment_presence)?;
 
         Ok(true)
     }
@@ -1770,7 +1770,7 @@ impl<S: CacheStorage> FragmentCache<S> {
             packed.extend_from_slice(&words);
         }
 
-        self.merge_updates(file_keys, file_metas, fragment_hashes, packed)
+        self.merge_updates(&file_keys, &file_metas, &fragment_hashes, &packed)
     }
 }
 
