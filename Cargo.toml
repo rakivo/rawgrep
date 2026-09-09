@@ -12,6 +12,7 @@ keywords = ["regex", "grep", "egrep", "search", "pattern"]
 categories = ["command-line-utilities", "text-processing"]
 build = "build.rs"
 rust-version = "1.85.1"
+exclude = ["benchmark_results.tar.gz"]
 
 [features]
 default = ["mimalloc"]
