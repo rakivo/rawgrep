@@ -15,17 +15,23 @@ system: Intel i5-13400F, 16 threads, ext4 file system, NVMe SSD (Crucial P2 250G
 
 | scenario | rawgrep time | rawgrep RAM | ripgrep time | ripgrep RAM | speedup |
 |---|---|---|---|---|---|
-| warm cache + fragment cache | 167.3ms ± 6.1ms | 185 MiB | 363.4ms ± 6.2ms | 188 MiB | 2.17x |
-| warm cache, no fragment cache | 370.7ms ± 6.6ms | 254 MiB | 364.8ms ± 7.3ms | 257 MiB | 0.98x (slower) |
-| cold cache, no fragment cache | 8.311s ± 0.120s | 246.1 MiB | 11.932s ± 0.119s | 256.5 MiB* | 1.44x |
-| cold cache + fragment cache | 2.581s ± 0.026s | 208.0 MiB | 11.932s ± 0.196s | 208.5 MiB* | 4.62x |
+| warm cache + fragment cache | 167.3ms ± 6.1ms | 185 MiB | 363.4ms ± 6.2ms | 188 MiB* (See note below) | 2.17x |
+| warm cache, no fragment cache | 370.7ms ± 6.6ms | 254 MiB | 364.8ms ± 7.3ms | 257 MiB* (See note below) | 0.98x (slower) |
+| cold cache, no fragment cache | 8.311s ± 0.120s | 246.1 MiB | 11.932s ± 0.119s | 256.5 MiB* (See note below) | 1.44x |
+| cold cache + fragment cache | 2.581s ± 0.026s | 208.0 MiB | 11.932s ± 0.196s | 208.5 MiB* (See note below) | 4.62x |
 
 | scenario | rawgrep time | rawgrep RAM | fff time | fff RAM | speedup |
 |---|---|---|---|---|---|
 | warm cache + both using cache, fff vs rawgrep | 170.5ms ± 8.2ms | 582 MiB* (See note below) | 625.0ms ± 12.5ms | 580 MiB | 3.66x |
 | cold cache + both using cache, fff vs rawgrep | 2.593s ± 0.039s | 584 MiB* (See note below) | 5.125s ± 0.044s | 583 MiB | 1.98x |
 
-rawgrep had weirdly high RAM usage benchmarking against fff, all in all I'm pretty sure it does not mirror the actuality, it should be around 200mb like in the benchmarks against ripgrep. Most likely RSS picking up shared page-cache from fff's cache build running right before it, not real rawgrep usage.
+# The note
+
+rawgrep had weirdly high RAM usage benchmarking against fff, all in all it does not mirror the actuality, it should be around 200mb like in the benchmarks against ripgrep. Most likely RSS picking up shared page-cache from fff's cache build running right before it, not real rawgrep usage.
+
+Roughly the same thing happens with ripgrep's RAM usage: in reality, it plateaus at around 70 MiB in this specific benchmark.
+
+**Nevertheless**, I haven't gotten around to optimizing rawgrep's RSS usage much yet, since I've mostly been focused on making it fast. I do have ideas on how I could lower it without adding much, if any, wall-time overhead. So, beware of the upcoming benchmarks.
 
 But, apart from that, we can see that **with** *fragment cache* -- rawgrep's intended mode -- it's fast, anywhere from 2x to ~60x faster than ripgrep/fff/*any other grep in the world*. The larger the corpus, the more of an advantage rawgrep tends to have relative to other greps. Using *fragment cache* rawgrep is doing much less I/O, which means it can stay in the page cache on much larger corpora, while other greps can't. That's exactly what's behind the 60x number -- the corpus used for that benchmark is my 1.27M-file home directory.
 
