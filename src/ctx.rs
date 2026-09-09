@@ -1,5 +1,6 @@
 use crate::pacer::FlushPacer;
 use crate::error::Error;
+use crate::matcher::Matcher;
 use crate::slab::{SlotPool, SlotWriter};
 use crate::RawGrepConfig;
 use crate::path_buf::SmallPathBuf;
@@ -443,6 +444,8 @@ fn worker_thread_main<S: MatchSink + 'static>(
     let mut entries_arena             = EntriesArena::new();
     let mut output                    = SlotWriter::new(slot_pool, ctx.output_tx.clone());
 
+    let mut regex_cache               = None;
+
     let mut file_keys                 = Vec::new();
     let mut file_metas                = Vec::new();
     let mut fragment_presence         = FragmentPresenceBits::default();
@@ -497,6 +500,9 @@ fn worker_thread_main<S: MatchSink + 'static>(
             fragment_presence_scratch.resize(fragment_hash_count.div_ceil(64), 0);
             fragment_presence = FragmentPresenceBits::new(fragment_hash_count);
         }
+        if regex_cache.is_none() && let Matcher::Regex { re, .. } = job.grepper.matcher() {
+            regex_cache = Some(re.create_cache());
+        }
 
         macro_rules! dispatch {
             ($g:expr) => {
@@ -517,6 +523,7 @@ fn worker_thread_main<S: MatchSink + 'static>(
                     output,
                     parser,
                     path_buf,
+                    regex_cache: regex_cache.as_mut(),
                     gitignore_enabled: job.gitignore_enabled,
                     entries_arena,
                     subdirs_arena,

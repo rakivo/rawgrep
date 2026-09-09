@@ -279,7 +279,7 @@ impl RawFs for Ext4Fs {
                         }
 
                         skip_first = n;
-                        }
+                    }
 
                     Err(_) => { buf.clear(); return Ok(true); }  // unreachable
                 }

@@ -31,6 +31,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use nohash_hasher::IntSet;
 use crossbeam_channel::{Receiver, Sender};
 use parking_lot::{Mutex, Condvar};
+use crate::regex::meta::Cache as MetaCache;
 use crossbeam_deque::{Injector, Steal, Stealer};
 pub use crossbeam_deque::Worker as DequeWorker;
 
@@ -528,6 +529,7 @@ pub struct WorkerCtx<'a, F: RawFs, S: MatchSink> {
     pub pending_file_metas:        Vec<FileMeta>,
     pub pending_fragment_presence: FragmentPresenceBits,
 
+    pub regex_cache:               Option<&'a mut MetaCache>,
     pub worker_id:                 u16,
 
     // ----- Cold / output plumbing ----
@@ -1202,7 +1204,7 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
         if C::RAW_PASSTHROUGH {
             self.ranges_scratch.clear();
 
-            let mut iter = self.matcher.find_matches(buf);
+            let mut iter = self.matcher.find_matches(buf, self.regex_cache.as_deref_mut());
             while let Some((s, e)) = iter.next() {
                 self.ranges_scratch.push((s as u32, e as u32));
             }
@@ -1262,7 +1264,7 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
             } else {
                 self.ranges_scratch.clear();
 
-                let mut iter = self.matcher.find_matches(line);
+                let mut iter = self.matcher.find_matches(line, self.regex_cache.as_deref_mut());
                 while let Some((s, e)) = iter.next() {
                     self.ranges_scratch.push((s as u32, e as u32));
                 }
@@ -1411,7 +1413,7 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
 
             self.ranges_scratch.clear();
 
-            let mut iter = self.matcher.find_matches(line);
+            let mut iter = self.matcher.find_matches(line, self.regex_cache.as_deref_mut());
             while let Some((s, e)) = iter.next() {
                 self.ranges_scratch.push((s as u32, e as u32));
             }
@@ -1515,7 +1517,7 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
 
             self.ranges_scratch.clear();
 
-            iter = self.matcher.find_matches(line);
+            iter = self.matcher.find_matches(line, self.regex_cache.as_deref_mut());
             while let Some((s, e)) = iter.next() {
                 self.ranges_scratch.push((s as u32, e as u32));
             }

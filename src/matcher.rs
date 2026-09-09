@@ -1,8 +1,8 @@
 use std::io;
 
-use regex::bytes::Regex;
 use memchr::memmem::Finder;
 use aho_corasick::AhoCorasick;
+use crate::regex::meta::{Regex as MetaRegex, Cache as MetaCache};
 
 use crate::{cli::Cli, tracy};
 
@@ -48,13 +48,17 @@ fn extract_alternation_literals(pattern: &str) -> Option<Box<[Box<[u8]>]>> {
 //   the overhead of having 1 more indirection (AND allocating on the heap) really worth it.
 #[allow(clippy::large_enum_variant)]
 pub enum MatchIterator<'a> {
-    POISONED,
     Literal {
         iter: memchr::memmem::FindIter<'a, 'a>,
         needle_len: usize,
     },
     MultiLiteral(aho_corasick::FindIter<'a, 'a>),
-    Regex(regex::bytes::Matches<'a, 'a>),
+    Regex {
+        re: &'a MetaRegex,
+        cache: &'a mut MetaCache,
+        haystack: &'a [u8],
+        at: usize,
+    },
 }
 
 impl<'a> Iterator for MatchIterator<'a> {
@@ -66,14 +70,30 @@ impl<'a> Iterator for MatchIterator<'a> {
             MatchIterator::Literal { iter, needle_len } => {
                 iter.next().map(|pos| (pos, pos + *needle_len))
             }
+
             MatchIterator::MultiLiteral(iter) => {
                 iter.next().map(|m| (m.start(), m.end()))
             }
-            MatchIterator::Regex(iter) => {
-                iter.next().map(|m| (m.start(), m.end()))
-            }
-            MatchIterator::POISONED => unsafe {
-                std::hint::unreachable_unchecked()
+
+            MatchIterator::Regex { re, cache, haystack, at } => {
+                if *at > haystack.len() {
+                    return None;
+                }
+
+                let input = crate::regex::Input::new(haystack).span(*at..haystack.len());
+                let m = re.search_with(cache, &input)?;
+
+                let start = m.start();
+                let end   = m.end();
+
+                // Advance search offset for next iteration
+                if start == end {
+                    *at = end + 1; // Prevent infinite loop on 0-width empty matches
+                } else {
+                    *at = end;
+                }
+
+                Some((start, end))
             }
         }
     }
@@ -88,7 +108,7 @@ pub enum Matcher {
         patterns: Box<[Box<[u8]>]>,  // Keep original patterns for fragment extraction
     },
     Regex {
-        re: Regex,
+        re: MetaRegex,
         pattern: Box<str>,  // Keep original pattern for literal extraction
     },
 }
@@ -126,23 +146,31 @@ impl Matcher {
             });
         }
 
+        //
         // Fallback to regex
-        let re = crate::regex::bytes::RegexBuilder::new(pattern)
-            .dfa_size_limit(16 * 1024 * 1024)
-            .size_limit(16 * 1024 * 1024)
-            .build()
-            .map_err(|e| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("invalid regex '{pattern}': {e}")
-                )
-            })?;
+        //
+
+        const LIMIT: usize = 16 * 1024 * 1024; // @Configuration
+
+        use crate::regex::*;
+
+        let re = MetaRegex::builder()
+            .configure(
+                meta::Config::new()
+                    .dfa_size_limit(Some(LIMIT))
+                    .nfa_size_limit(Some(LIMIT))
+            )
+            .build(pattern)
+            .map_err(|e| io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid regex '{pattern}': {e}"),
+            ))?;
 
         Ok(Matcher::Regex { re, pattern: pattern.clone().into_boxed_str() })
     }
 
     #[inline(always)]
-    pub fn find_matches<'a>(&'a self, haystack: &'a [u8]) -> MatchIterator<'a> {
+    pub fn find_matches<'a>(&'a self, haystack: &'a [u8], cache: Option<&'a mut MetaCache>) -> MatchIterator<'a> {
         match self {
             Matcher::Literal(finder) => {
                 MatchIterator::Literal {
@@ -153,9 +181,12 @@ impl Matcher {
             Matcher::MultiLiteral { ac, .. } => {
                 MatchIterator::MultiLiteral(ac.find_iter(haystack))
             }
-            Matcher::Regex { re, .. } => {
-                MatchIterator::Regex(re.find_iter(haystack))
-            }
+            Matcher::Regex { re, .. } => MatchIterator::Regex {
+                re,
+                cache: unsafe { cache.unwrap_unchecked() },
+                haystack,
+                at: 0,
+            },
         }
     }
 

@@ -499,6 +499,15 @@ impl<S: MatchSink> AnyGrepper<S> {
     }
 
     #[inline]
+    pub fn matcher(&self) -> &Matcher {
+        match self {
+            AnyGrepper::Ext4(g) => g.matcher(),
+            AnyGrepper::Apfs(g) => g.matcher(),
+            AnyGrepper::Ntfs(g) => g.matcher(),
+        }
+    }
+
+    #[inline]
     pub fn fragment_hashes_and_cache_mut(&mut self) -> (&[u32], Option<&mut FragmentCache>) {
         match self {
             AnyGrepper::Ext4(g) => g.fragment_hashes_and_cache_mut(),
