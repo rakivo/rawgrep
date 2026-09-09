@@ -27,7 +27,7 @@ system: Intel i5-13400F, 16 threads, ext4 file system, NVMe SSD (Crucial P2 250G
 
 # The note
 
-rawgrep had weirdly high RAM usage benchmarking against fff, all in all it does not mirror the actuality, it should be around 200mb like in the benchmarks against ripgrep. Most likely RSS picking up shared page-cache from fff's cache build running right before it, not real rawgrep usage.
+rawgrep had weirdly high RAM usage benchmarking against fff, all in all it does not mirror the actuality, it should be around 200mb like in the benchmarks against ripgrep. Most likely RSS picking up shared page-cache from fff running right before it.
 
 Roughly the same thing happens with ripgrep's RAM usage: in reality, it plateaus at around 70 MiB in this specific benchmark.
 
