@@ -746,7 +746,6 @@ dependencies = [
  "parking_lot",
  "phf",
  "proptest",
- "regex",
  "regex-automata",
  "rustc_version",
  "smallvec",
@@ -764,16 +763,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed2bf2547551a7053d6fdfafda3f938979645c44812fbfcda098faae3f1a362d"
 dependencies = [
  "bitflags",
-]
-
-[[package]]
-name = "regex"
-version = "1.12.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "843bc0191f75f3e22651ae5f1e72939ab2f72a4bc30fa80a066bd66edefc24d4"
-dependencies = [
- "regex-automata",
- "regex-syntax",
 ]
 
 [[package]]

@@ -2,7 +2,7 @@ use std::io;
 
 use memchr::memmem::Finder;
 use aho_corasick::AhoCorasick;
-use crate::regex::meta::{Regex as MetaRegex, Cache as MetaCache};
+use regex_automata::meta::{Regex as MetaRegex, Cache as MetaCache};
 
 use crate::{cli::Cli, tracy};
 
@@ -80,7 +80,7 @@ impl<'a> Iterator for MatchIterator<'a> {
                     return None;
                 }
 
-                let input = crate::regex::Input::new(haystack).span(*at..haystack.len());
+                let input = regex_automata::Input::new(haystack).span(*at..haystack.len());
                 let m = re.search_with(cache, &input)?;
 
                 let start = m.start();
@@ -152,7 +152,7 @@ impl Matcher {
 
         const LIMIT: usize = 16 * 1024 * 1024; // @Configuration
 
-        use crate::regex::*;
+        use regex_automata::*;
 
         let re = MetaRegex::builder()
             .configure(

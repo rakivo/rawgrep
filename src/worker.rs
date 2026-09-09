@@ -31,7 +31,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use nohash_hasher::IntSet;
 use crossbeam_channel::{Receiver, Sender};
 use parking_lot::{Mutex, Condvar};
-use crate::regex::meta::Cache as MetaCache;
+use regex_automata::meta::Cache as MetaCache;
 use crossbeam_deque::{Injector, Steal, Stealer};
 pub use crossbeam_deque::Worker as DequeWorker;
 

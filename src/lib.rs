@@ -11,12 +11,6 @@
     clippy::doc_overindented_list_items,
 )]
 
-#[cfg(all(feature = "small", feature = "full"))]
-compile_error!("Cannot enable both `small` and `full` features - choose one!");
-
-#[cfg(not(any(feature = "small", feature = "full")))]
-compile_error!("Must enable either `small` or `full` feature!");
-
 pub mod ctx;
 pub mod cli;
 pub mod grep;
@@ -42,14 +36,8 @@ pub mod slab;
 pub mod thin_path_arc;
 pub mod liner;
 
-#[cfg(feature = "small")]
-pub(crate) extern crate regex_tiny as regex;
-
 pub use tracing;
 pub use crossbeam_channel;
-
-#[cfg(not(feature = "small"))]
-pub(crate) extern crate regex_full as regex;
 
 pub use error::Error;
 pub type Result<T> = std::result::Result<T, Error>;
