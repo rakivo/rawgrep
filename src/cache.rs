@@ -464,6 +464,9 @@ impl CacheStorage for MemoryStorage {
     #[inline]
     fn save_segments(&self, segments: &[&[u8]], total_size: usize) -> io::Result<()> {
         let mut data = Vec::with_capacity(total_size);
+
+        debug_assert!(segments.iter().map(|s| s.len()).sum::<usize>() == total_size);
+
         for segment in segments {
             data.extend_from_slice(segment);
         }
@@ -1613,7 +1616,7 @@ impl<S: CacheStorage> FragmentCache<S> {
             // Update metadata
             //
 
-            self.owned_file_keys.as_mut().unwrap()[file_id] = file_key;
+            self.owned_file_keys .as_mut().unwrap()[file_id] = file_key;
             self.owned_file_metas.as_mut().unwrap()[file_id] = file_meta;
 
             let needs_full_reset =

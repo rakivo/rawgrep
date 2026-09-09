@@ -386,6 +386,7 @@ impl PathArena {
     fn push_path(&mut self, parent: &[u8], needs_slash: bool, name: &[u8]) -> (u32, u32) {
         let start = self.buf.len() as u32;
 
+        self.buf.reserve_exact(parent.len() + needs_slash as usize + name.len());
         self.buf.extend_from_slice(parent);
         if needs_slash {
             self.buf.push(MAIN_SEPARATOR as u8);
@@ -938,6 +939,8 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
             let _span = tracy::span!("build full path");
 
             self.path_buf.clear();
+            self.path_buf.reserve_exact(parent_path.len() + usize::from(!parent_path.is_empty()) + file_name.len());
+
             self.path_buf.extend_from_slice(parent_path);
             if likely(!parent_path.is_empty()) {
                 self.path_buf.push(MAIN_SEPARATOR as _);
@@ -1073,10 +1076,14 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
             bytes_searched += n;
 
             carry.combine_buf.clear();
-            carry.combine_buf.extend_from_slice(&carry.tail);
+            {
+                debug_assert!(self.parser.chunk.len() >= n);
 
-            debug_assert!(self.parser.chunk.len() >= n);
-            carry.combine_buf.extend_from_slice(unsafe { self.parser.chunk.get_unchecked(..n) });
+                carry.combine_buf.reserve_exact(carry.tail.len() + n);
+
+                carry.combine_buf.extend_from_slice(unsafe { self.parser.chunk.get_unchecked(..n) });
+                carry.combine_buf.extend_from_slice(&carry.tail);
+            }
             carry.tail.clear();
 
             let combined = std::mem::take(&mut carry.combine_buf);
@@ -1549,6 +1556,7 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
     }
 }
 
+#[allow(clippy::too_many_arguments, reason = "@Speed: Hoist should_print_color branching out of these writing functions...? Might be a good idea.")]
 impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
     #[inline(always)]
     fn write_match_line(
@@ -1561,6 +1569,28 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
         matches:           impl Iterator<Item = (u32, u32)>,
         should_print_color: bool,
     ) {
+        let mut itoa_buf = itoa::Buffer::new();
+        let line_num_str = itoa_buf.format(line_num); // format once, reuse len + bytes below
+
+        // Reserve
+        {
+            let mut prefix_len = line_num_str.len() + 2; // digits + ": "
+            if should_print_color {
+                prefix_len += COLOR_CYAN.len() + COLOR_RESET.len();
+            }
+
+            if cli.jump {
+                let root = cli.search_root_path.as_bytes();
+                let ends_with_slash = root.last() == Some(&(MAIN_SEPARATOR as _));
+                prefix_len += root.len() + usize::from(!ends_with_slash) + path.len() + 1; // ':'
+                if should_print_color {
+                    prefix_len += COLOR_GREEN.len() + COLOR_RESET.len();
+                }
+            }
+
+            scratch.reserve(prefix_len);
+        }
+
         if cli.jump {
             if should_print_color { scratch.extend_from_slice(COLOR_GREEN.as_bytes()); }
 
@@ -1582,7 +1612,17 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
 
         scratch.extend_from_slice(b": ");
 
-        let display = truncate_utf8(line, 500);
+        let display = truncate_utf8(line, 500); // @Configuration @Tune
+
+        // Lower-bound reserve: the unhighlighted slices of display we copy
+        // always sum to exactly display.len() bytes, no matter how the match
+        // ranges split it, plus the trailing '\n'.
+        //
+        // This won't guarantee zero reallocation when color is on
+        // (extra COLOR_RED/COLOR_RESET bytes depend on match count,
+        // which we can't know without consuming the iterator, and size_hint() won't help us).
+        scratch.reserve(display.len() + 1);
+
         let mut last = 0;
         for (s, e) in matches {
             let s = s as usize;
@@ -1624,6 +1664,15 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
 
         let root = cli.search_root_path.as_bytes();
         let ends_with_slash = root.last() == Some(&(MAIN_SEPARATOR as _));
+
+        // Reserve
+        {
+            let mut len = root.len() + usize::from(!ends_with_slash) + path.len() + 2; // ":\n"
+            if should_print_color {
+                len += COLOR_GREEN.len() + COLOR_RESET.len();
+            }
+            scratch.reserve(len);
+        }
 
         scratch.extend_from_slice(root);
         if !ends_with_slash { scratch.push(MAIN_SEPARATOR as _); }

@@ -249,13 +249,13 @@ impl SlotBuf {
 
         match &mut *this {
             SlotBuf::Slab { slab, slot, len } => {
-                OutputMessage::Slot { slab: *slab, slot: *slot, len: *len as u32 }
+                OutputMessage::Slot { slab, slot: *slot, len: *len as u32 }
             }
 
             SlotBuf::Owned { slab, buf, reserved } => {
                 let buf = std::mem::take(buf);
                 let data = crate::util::vec_into_boxed_slice_noshrink(buf);
-                OutputMessage::Owned(OwnedOverflow::new(*slab, data, *reserved))
+                OutputMessage::Owned(OwnedOverflow::new(slab, data, *reserved))
             }
         }
     }
