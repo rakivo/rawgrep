@@ -20,8 +20,11 @@
 
 use crate::worker::OutputMessage;
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::ops::{Deref, DerefMut};
 use std::cell::UnsafeCell;
+
+use crate::crossbeam_channel::Sender;
 
 pub const SLOT_CAP:         usize = 64 * 1024;
 pub const SLOTS_PER_WORKER: usize = 20;
@@ -41,6 +44,8 @@ struct WorkerSlotFlags(AtomicU32);
 pub struct OutputSlab {
     storage: Box<[UnsafeCell<u8>]>,
     free:    Box<[WorkerSlotFlags]>,  // One block per worker
+    overflow_used: AtomicUsize,       // Bytes currently checked out via the overflow path
+    overflow_cap:  usize,             // @Incomplete: Add a CLI flag controling this ... ?
 }
 
 unsafe impl Sync for OutputSlab {}
@@ -92,7 +97,22 @@ impl OutputSlab {
         // ManuallyDrop fd: exactly one of these per process, reclaimed by
         // the OS at exit, never freed by us.
         //
-        Box::leak(Box::new(Self { storage, free }))
+        Box::leak(Box::new(Self { storage, free, overflow_cap: 1024 * 1024 * 16, overflow_used: AtomicUsize::new(0) }))
+    }
+
+    /// Try to reserve `n` bytes of overflow budget. None if it would exceed the cap.
+    #[inline(always)]
+    fn try_reserve_overflow(&self, n: usize) -> bool {
+        let mut cur = self.overflow_used.load(Ordering::Relaxed);
+        loop {
+            if cur + n > self.overflow_cap { return false; }
+            match self.overflow_used.compare_exchange_weak(
+                cur, cur + n, Ordering::AcqRel, Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => cur = actual,
+            }
+        }
     }
 
     /// # Safety
@@ -161,15 +181,26 @@ impl SlotPool {
         (0..num_workers).map(|w| SlotPool { slab, worker: w, spills: 0 }).collect()
     }
 
-    #[inline]
+    #[inline(always)]
     pub fn acquire(&mut self) -> SlotBuf {
         if let Some(local) = self.slab.try_claim(self.worker) {
             let slot = (self.worker * SLOTS_PER_WORKER + local) as u16;
             return SlotBuf::Slab { slab: self.slab, slot, len: 0 };
         }
 
-        self.spills += 1;
-        SlotBuf::Owned(Vec::with_capacity(SLOT_CAP))
+        self.acquire_overflow(SLOT_CAP)
+    }
+
+    #[inline(always)]
+    fn acquire_overflow(&mut self, cap: usize) -> SlotBuf {
+        loop {
+            if self.slab.try_reserve_overflow(cap) {
+                self.spills += 1;
+                return SlotBuf::Owned { slab: self.slab, buf: Vec::with_capacity(cap), reserved: cap };
+            }
+
+            std::thread::park_timeout(std::time::Duration::from_micros(200));
+        }
     }
 
     #[inline(always)]
@@ -177,70 +208,167 @@ impl SlotPool {
 }
 
 pub enum SlotBuf {
-    Slab { slab: &'static OutputSlab, slot: u16, len: usize },
-    Owned(Vec<u8>),
+    Slab  { slab: &'static OutputSlab, slot: u16, len: usize },
+    Owned { slab: &'static OutputSlab, buf: Vec<u8>, reserved: usize },
 }
 
 impl SlotBuf {
     #[inline(always)]
     pub fn len(&self) -> usize {
-        match self { SlotBuf::Slab { len, .. } => *len, SlotBuf::Owned(v) => v.len() }
+        match self {
+            SlotBuf::Slab { len, .. } => *len,
+            SlotBuf::Owned { buf, .. } => buf.len()
+        }
     }
 
     #[inline(always)]
     pub fn is_empty(&self) -> bool { self.len() == 0 }
 
     #[inline(always)]
-    pub fn push(&mut self, b: u8) { self.extend_from_slice(&[b]); }
-
-    #[inline(always)]
     pub fn clear(&mut self) {
-        match self { SlotBuf::Slab { len, .. } => *len = 0, SlotBuf::Owned(v) => v.clear() }
-    }
-
-    #[inline(always)]
-    pub fn extend_from_slice(&mut self, bytes: &[u8]) {
         match self {
-            SlotBuf::Slab { slab, slot, len } => {
-                if bytes.len() > SLOT_CAP - *len {
-                    self.spill(bytes);
-                    return;
-                }
-
-                // SAFETY: this thread has held exclusive ownership of `slot`
-                // since acquire(); finish() (below) is the only way it leaves,
-                // and that consumes self.
-                unsafe { slab.slot_mut(*slot as usize)[*len..*len + bytes.len()].copy_from_slice(bytes); }
-
-                *len += bytes.len();
-            }
-
-            SlotBuf::Owned(v) => {
-                v.extend_from_slice(bytes);
-            }
+            SlotBuf::Slab { len, .. } => *len = 0,
+            SlotBuf::Owned { buf, .. } => buf.clear(),
         }
     }
 
-    /// One flush overruns its slot: promote to heap. The slot never left
-    /// this thread, so returning it immediately is safe -- nothing else
-    /// could be racing it.
-    #[inline]
-    fn spill(&mut self, extra: &[u8]) {
-        let SlotBuf::Slab { slab, slot, len } = self else { unreachable!() };
-
-        let mut v = Vec::with_capacity(*len + extra.len() + SLOT_CAP / 2);
-        unsafe { v.extend_from_slice(&slab.slot(*slot as usize)[..*len]); }
-        v.extend_from_slice(extra);
-
-        slab.release(*slot as usize);
-        *self = SlotBuf::Owned(v);
+    #[inline(always)]
+    fn append_unchecked(&mut self, bytes: &[u8]) {
+        match self {
+            SlotBuf::Slab { slab, slot, len } => unsafe {
+                slab.slot_mut(*slot as usize)[*len..*len + bytes.len()].copy_from_slice(bytes);
+                *len += bytes.len();
+            },
+            SlotBuf::Owned { buf, .. } => buf.extend_from_slice(bytes),
+        }
     }
 
     #[inline(always)]
     pub fn finish(self) -> OutputMessage {
-        match self {
-            SlotBuf::Slab { slab, slot, len } => OutputMessage::Slot { slab, slot, len: len as u32 },
-            SlotBuf::Owned(v) => OutputMessage::Owned(crate::util::vec_into_boxed_slice_noshrink(v)),
+        let mut this = std::mem::ManuallyDrop::new(self);
+
+        match &mut *this {
+            SlotBuf::Slab { slab, slot, len } => {
+                OutputMessage::Slot { slab: *slab, slot: *slot, len: *len as u32 }
+            }
+
+            SlotBuf::Owned { slab, buf, reserved } => {
+                let buf = std::mem::take(buf);
+                let data = crate::util::vec_into_boxed_slice_noshrink(buf);
+                OutputMessage::Owned(OwnedOverflow::new(*slab, data, *reserved))
+            }
         }
     }
+}
+
+impl Drop for SlotBuf {
+    #[inline(always)]
+    fn drop(&mut self) {
+        match self {
+            SlotBuf::Slab { slab, slot, .. } => slab.release(*slot as usize),
+            SlotBuf::Owned { slab, reserved, .. } => if *reserved > 0 { slab.release_overflow(*reserved); },
+        }
+    }
+}
+
+impl Deref for SlotWriter {
+    type Target = SlotBuf; #[inline(always)] fn deref(&self) -> &Self::Target { &self.buf }
+}
+impl DerefMut for SlotWriter {
+    #[inline(always)]
+    fn deref_mut(&mut self) -> &mut Self::Target { &mut self.buf }
+}
+
+pub struct SlotWriter {
+    buf:  SlotBuf,
+    pub pool: SlotPool,
+    tx:   Sender<OutputMessage>,
+}
+
+impl SlotWriter {
+    #[inline(always)]
+    pub fn new(mut pool: SlotPool, tx: Sender<OutputMessage>) -> Self {
+        let buf = pool.acquire();
+        Self { buf, pool, tx }
+    }
+
+    /// Write one complete, already-assembled record.
+    /// NEVER split across two channel messages ---
+    /// --- callers must assemble the full record into a scratch buffer first.
+    #[inline]
+    pub fn write_record(&mut self, record: &[u8]) {
+        debug_assert!(!record.is_empty());
+
+        if record.len() > self.remaining() {
+            self.rotate();  // Ship whatever's buffered -- always whole prior records
+        }
+
+        if record.len() <= SLOT_CAP {
+            self.buf.append_unchecked(record);
+        } else {
+            //
+            // Bigger than a whole slab slot...
+            // rotate() above already shipped anything
+            // pending; assigning over self.buf drops the empty slab slot
+            // it just handed us and releases it back to the pool.
+            //
+            self.buf = self.pool.acquire_overflow(record.len());
+            self.buf.append_unchecked(record);
+            self.rotate();
+        }
+    }
+
+    #[inline(always)]
+    fn remaining(&self) -> usize {
+        match &self.buf {
+            SlotBuf::Slab { len, .. } => SLOT_CAP - *len,
+            SlotBuf::Owned { buf, reserved, .. } => reserved.saturating_sub(buf.len()),
+        }
+    }
+
+    #[inline(always)]
+    fn rotate(&mut self) {
+        let fresh = self.pool.acquire();
+        let old = std::mem::replace(&mut self.buf, fresh);
+        if !old.is_empty() {
+            let _ = self.tx.send(old.finish());
+        }
+    }
+
+    #[inline(always)]
+    pub fn flush(&mut self) {
+        if !self.buf.is_empty() { self.rotate(); }
+    }
+}
+
+
+impl OutputSlab {
+    #[inline(always)]
+    fn release_overflow(&self, n: usize) {
+        self.overflow_used.fetch_sub(n, Ordering::AcqRel);
+    }
+}
+
+/// Wraps overflow-path bytes so the reserved budget is always released
+/// exactly once, whenever this actually drops.
+pub struct OwnedOverflow {
+    pub data: Box<[u8]>,
+    pub slab: &'static OutputSlab,
+    reserved: usize,
+}
+
+impl OwnedOverflow {
+    #[inline]
+    pub const fn new(slab: &'static OutputSlab, data: Box<[u8]>, reserved: usize) -> Self {
+        Self { data, slab, reserved }
+    }
+}
+
+impl Drop for OwnedOverflow {
+    #[inline(always)]
+    fn drop(&mut self) { self.slab.release_overflow(self.reserved); }
+}
+
+impl Deref for OwnedOverflow {
+    type Target = [u8]; #[inline(always)] fn deref(&self) -> &[u8] { &self.data }
 }

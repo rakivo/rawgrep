@@ -1,6 +1,6 @@
 use crate::pacer::FlushPacer;
 use crate::error::Error;
-use crate::slab::SlotPool;
+use crate::slab::{SlotPool, SlotWriter};
 use crate::RawGrepConfig;
 use crate::path_buf::SmallPathBuf;
 use crate::stdout::{RawStdout, OutputKind};
@@ -90,29 +90,15 @@ impl<S: MatchSink + 'static> RawGrepCtx<S> {
             None
         };
 
-        if let Some((raw_stdout, raw_fd)) = raw_stdout {
+        if let Some((raw_stdout, _raw_fd)) = raw_stdout {
             _ = std::thread::spawn(move || {
                 OutputWorker {
                     rx: output_rx,
-                    raw_fd,
                     flush_ack_tx,
                     batch_bytes: 0,
-                    is_pipe: output_kind == OutputKind::Pipe,
                     writer: raw_stdout,
                     batch: Vec::with_capacity(256),
                     iov_scratch: Vec::with_capacity(256),
-
-                    #[cfg(target_os = "linux")]
-                    pipe_bytes_written: 0,
-
-                    #[cfg(target_os = "linux")]
-                    iov_pipe_scratch: Default::default(),
-
-                    #[cfg(target_os = "linux")]
-                    fionread_broken: false,
-
-                    #[cfg(target_os = "linux")]
-                    pending_release: Default::default()
                 }.run();
             });
         }
@@ -439,7 +425,7 @@ fn worker_thread_main<S: MatchSink + 'static>(
     stealers:  &[Stealer<WorkItem>],
     local:     DequeWorker<WorkItem>,
     pacer:     &FlushPacer,
-    mut slot_pool: SlotPool,
+    slot_pool: SlotPool,
 ) {
     debug!("[ctx] worker {worker_id} started, waiting on condvar");
 
@@ -456,7 +442,7 @@ fn worker_thread_main<S: MatchSink + 'static>(
     let mut file_entries_arena        = FileEntryArena::new();
     let mut subdirs_arena             = SubdirsArena::new();
     let mut entries_arena             = EntriesArena::new();
-    let mut output                    = slot_pool.acquire();
+    let mut output                    = SlotWriter::new(slot_pool, ctx.output_tx.clone());
 
     let mut file_keys                 = Vec::new();
     let mut file_metas                = Vec::new();
@@ -526,7 +512,6 @@ fn worker_thread_main<S: MatchSink + 'static>(
                     fragment_index:   $g.fragment_index(),
                     selected_fragment_hash_len: $g.selected_fragment_hash_len(),
                     cli:              $g.cli(),
-                    slot_pool:        &mut slot_pool,
                     sink:             $g.sink.clone(),
                     output_tx:        ctx.output_tx.clone(),
                     stats:            Default::default(),
@@ -568,15 +553,6 @@ fn worker_thread_main<S: MatchSink + 'static>(
             AnyGrepper::Ntfs(g) => dispatch!(g),
         };
 
-        debug!(
-            "[ctx] worker {worker_id} search #{search_count} done - \
-             files_encountered={} files_searched={} files_with_matches={} slot_pool_spill_count={}",
-            result.stats.files_encountered,
-            result.stats.files_searched,
-            result.stats.files_contained_matches,
-            slot_pool.spill_count()
-        );
-
         parser = result.parser;
         file_entries_arena = result.file_entries_arena;
         subdirs_arena = result.subdirs_arena;
@@ -590,6 +566,15 @@ fn worker_thread_main<S: MatchSink + 'static>(
         swap_path_buf = result.swap_path_buf;
         output = result.output;
         result.stats.merge_into(&job.stats);
+
+        debug!(
+            "[ctx] worker {worker_id} search #{search_count} done - \
+             files_encountered={} files_searched={} files_with_matches={} slot_pool_spill_count={}",
+            result.stats.files_encountered,
+            result.stats.files_searched,
+            result.stats.files_contained_matches,
+            output.pool.spill_count()
+        );
 
         // Deposit cache data
         if !cli.no_cache_write && !cli.no_cache {

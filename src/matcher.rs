@@ -127,12 +127,16 @@ impl Matcher {
         }
 
         // Fallback to regex
-        let re = Regex::new(pattern).map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("invalid regex '{pattern}': {e}")
-            )
-        })?;
+        let re = crate::regex::bytes::RegexBuilder::new(pattern)
+            .dfa_size_limit(16 * 1024 * 1024)
+            .size_limit(16 * 1024 * 1024)
+            .build()
+            .map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("invalid regex '{pattern}': {e}")
+                )
+            })?;
 
         Ok(Matcher::Regex { re, pattern: pattern.clone().into_boxed_str() })
     }
