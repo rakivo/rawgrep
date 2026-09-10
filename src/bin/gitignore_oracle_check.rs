@@ -28,6 +28,7 @@ fn main() -> ExitCode {
 
     let base_chain = GitignoreChain::default();
     let mut total = 0usize;
+    let mut total_ignored = 0usize;
     let mut mismatches = 0usize;
     let mut rel_bytes = Vec::with_capacity(256);
 
@@ -41,10 +42,14 @@ fn main() -> ExitCode {
         &included,
         &mut rel_bytes,
         &mut total,
+        &mut total_ignored,
         &mut mismatches,
     );
 
-    eprintln!("checked {total} paths, {mismatches} mismatch(es)");
+    eprintln!(
+        "checked {total} paths ({total_ignored} ignored, {} included), {mismatches} mismatch(es)",
+        total - total_ignored
+    );
 
     if mismatches > 0 {
         ExitCode::FAILURE
@@ -85,13 +90,18 @@ fn collect_included_set(root: &Path) -> HashSet<Vec<u8>> {
 fn walk(
     root: &Path,
     dir: &Path,
+
     depth: u16,
     prefix_len: u32,
+
     mut chain: GitignoreChain,
     ancestor_ignored: bool,
+
     included: &HashSet<Vec<u8>>,
     rel_bytes: &mut Vec<u8>,
+
     total: &mut usize,
+    total_ignored: &mut usize,
     mismatches: &mut usize,
 ) {
     let gi_path = dir.join(".gitignore");
@@ -152,8 +162,13 @@ fn walk(
         let oracle = !included.contains(rel_bytes);
 
         *total += 1;
+        if ours {
+            *total_ignored += 1;
+        }
+
         if ours != oracle {
             *mismatches += 1;
+
             println!(
                 "MISMATCH\t{}\tours={}\tignore-crate={}\t{}",
                 String::from_utf8_lossy(rel_bytes),
@@ -176,6 +191,7 @@ fn walk(
                 included,
                 rel_bytes,
                 total,
+                total_ignored,
                 mismatches,
             );
         }
