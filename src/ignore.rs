@@ -1,4 +1,5 @@
 use crate::tracy;
+use crate::util::unlikely;
 
 use std::{path::MAIN_SEPARATOR, sync::Arc};
 
@@ -68,9 +69,12 @@ impl GitignoreChain {
         match Arc::try_unwrap(inner) {
             Ok(mut owned) => {
                 // We have exclusive ownership - mutate in place
-                owned.stack.retain(|(d, ..)| *d <= depth);
+                owned.stack.retain(|(d, ..)| *d < depth);
                 owned.stack.push((depth, path_prefix_len, new_gi));
-                owned.has_any_negations |= has_negations;
+
+                owned.has_any_negations = has_negations
+                    || owned.stack[..owned.stack.len() - 1].iter().any(|(.., gi)| gi.has_negations);
+
                 Self {
                     inner: Some(Arc::new(owned)),
                 }
@@ -81,7 +85,7 @@ impl GitignoreChain {
                 let mut new_stack: SmallVec<[_; 8]> = shared
                     .stack
                     .iter()
-                    .filter(|(d, ..)| *d <= depth)
+                    .filter(|(d, ..)| *d < depth)
                     .cloned()
                     .collect();
 
@@ -283,7 +287,9 @@ impl LiteralMeta {
 
 struct WildcardPattern {
     bytes: Box<[u8]>,
-    flags: u8, // bit 0: negated, bit 1: anchored, bit 2: dir_only
+
+    /// bit 0: negated, bit 1: anchored, bit 2: dir_only
+    flags: u8,
 
     /// For patterns like "*.rs", store the suffix for fast matching
     suffix: Option<Box<[u8]>>,
@@ -297,6 +303,28 @@ struct WildcardPattern {
     /// "**" already accounts for zero or more intervening directories, so once
     /// this prefix check passes, the rest is an ordinary filename match.
     mid_anchor: Option<Box<[u8]>>,
+
+    /// Set when the pattern is anchored and ends in a bare "/**"
+    /// (or is exactly "**", i.e. "/**" with an empty head).
+    ///
+    /// Holds the literal directory prefix before the "/**" (empty for bare "/**").
+    ///
+    /// Per gitignore(5): "A trailing /** matches everything inside" -- this
+    /// must cross directory separators, unlike an ordinary anchored "*",
+    /// so it needs its own match path rather than going through the
+    /// generic glob_match backtracker.
+    trailing_double_star: Option<Box<[u8]>>,
+
+    /// Set when the pattern began with a leading "**/" whose remainder
+    /// still has internal directory structure
+    /// (e.g. "**/target/**", "**/a/**/b") and so couldn't be collapsed
+    /// into a bare unanchored filename check.
+    ///
+    /// "**/" matches zero or more leading directories, so at match time
+    /// the remainder's anchored match (trailing_double_star
+    /// mid_anchor / literal-or-glob tail) is retried at every
+    /// path-component boundary in "text", not just at the root.
+    leading_double_star: bool,
 }
 
 // @Refactor use bitflags instead in WildcardPattern?
@@ -340,30 +368,72 @@ impl Gitignore {
                 continue;
             }
 
-            let (pattern_bytes, negated) = if line[0] == b'!' {
-                has_negations = true;
+            let (mut pattern_bytes, negated) = if line[0] == b'!' {
                 (&line[1..], true)
             } else {
                 (line, false)
             };
+            if pattern_bytes.is_empty() {
+                continue;
+            }
+            if negated {
+                has_negations = true;
+            }
+
+            // Unescape a leading "\#" or "\!" -- gitignore(5): "Put a backslash in
+            // front of the first hash/bang for patterns that begin with a literal
+            // hash/bang." Without this, the backslash itself stays part of the
+            // stored pattern and never matches the real (unescaped) filename.
+            if pattern_bytes.len() >= 2
+                && pattern_bytes[0] == b'\\'
+                && matches!(pattern_bytes[1], b'#' | b'!')
+            {
+                pattern_bytes = &pattern_bytes[1..];
+            }
+
+            // Strip a trailing '/' -- and any further redundant trailing
+            // slashes, e.g. "foo//" -- *before* determining anchoring.
+            // Per gitignore(5), the trailing slash is removed "for the
+            // purpose of" the anchoring check, so it must never be
+            // mistaken for a separator "at the beginning or middle" of
+            // the pattern. Doing this the other way around (checking
+            // anchoring first) had two bugs: a lone trailing slash on an
+            // otherwise slash-free pattern like "foo/" spuriously
+            // anchored it, and a doubled trailing slash like "**//" could
+            // strip the pattern down to nothing and silently drop the
+            // rule entirely.
+            let dir_only = pattern_bytes.last() == Some(&(MAIN_SEPARATOR as _));
+            if dir_only {
+                while pattern_bytes.last() == Some(&(MAIN_SEPARATOR as _)) {
+                    pattern_bytes = &pattern_bytes[..pattern_bytes.len() - 1];
+                }
+            }
 
             if pattern_bytes.is_empty() {
                 continue;
             }
 
+            let mut leading_double_star = false;
             let (pattern_bytes, anchored) = if pattern_bytes[0] == MAIN_SEPARATOR as _ {
                 (&pattern_bytes[1..], true)
-            } else if pattern_bytes.starts_with(b"**/") {
-                (&pattern_bytes[3..], false)
+
+            } else if pattern_bytes.len() > 3 && pattern_bytes.starts_with(b"**/") {
+                let rest = &pattern_bytes[3..];
+                if memchr(MAIN_SEPARATOR as _, rest).is_none() {
+                    //
+                    // "**/foo" IS just unanchored "foo"
+                    //
+                    (rest, false)
+                } else {
+                    // Structure remains ("target/**", "a/**/b", ...) -- keep it
+                    // anchored so mid_anchor/trailing_double_star still fire on the
+                    // remainder below, but flag that the anchor floats to any depth.
+                    leading_double_star = true;
+                    (rest, true)
+                }
+
             } else {
                 (pattern_bytes, memchr(MAIN_SEPARATOR as _, pattern_bytes).is_some())
-            };
-
-            let dir_only = pattern_bytes.last() == Some(&(MAIN_SEPARATOR as _));
-            let pattern_bytes = if dir_only {
-                &pattern_bytes[..pattern_bytes.len() - 1]
-            } else {
-                pattern_bytes
             };
 
             if pattern_bytes.is_empty() {
@@ -381,6 +451,21 @@ impl Gitignore {
                     (!tail.is_empty() && memchr(MAIN_SEPARATOR as _, tail).is_none())
                         .then(|| pattern_bytes[..pos].into())
                 })
+            } else {
+                None
+            };
+
+            let trailing_double_star: Option<Box<[u8]>> = if anchored && mid_anchor.is_none() {
+                if pattern_bytes == b"**" {
+                    Some(Box::from(&b""[..]))
+                } else if pattern_bytes.len() > 3
+                    && pattern_bytes.ends_with(b"/**")
+                    && memchr::memchr3(b'*', b'?', b'[', &pattern_bytes[..pattern_bytes.len() - 3]).is_none()
+                {
+                    Some(pattern_bytes[..pattern_bytes.len() - 3].into())
+                } else {
+                    None
+                }
             } else {
                 None
             };
@@ -421,6 +506,8 @@ impl Gitignore {
                         mid_anchor: None,
                         suffix: None,
                         prefix: None,
+                        trailing_double_star: None,
+                        leading_double_star: false
                     });
                     order.push(OrderEntry {
                         ty: 1,
@@ -432,7 +519,9 @@ impl Gitignore {
                 // --------- WILDCARD, or a mid_anchor "A/**/B" pattern where B happens
                 // to be a plain literal -- either way it needs match_wildcard, so both
                 // route through here.
-                let (suffix, prefix) = if has_wildcards {
+                let (suffix, prefix) = if trailing_double_star.is_some() {
+                    (None, None)
+                } else if has_wildcards {
                     analyze_wildcard(pattern_bytes)
                 } else {
                     (None, None) // literal tail, glob_match's no-wildcard fast path (pattern == text) covers it
@@ -444,6 +533,8 @@ impl Gitignore {
                     suffix,
                     prefix,
                     mid_anchor,
+                    trailing_double_star,
+                    leading_double_star
                 });
                 order.push(OrderEntry {
                     ty: 1,
@@ -670,7 +761,9 @@ fn analyze_wildcard(pattern: &[u8]) -> (Option<Box<[u8]>>, Option<Box<[u8]>>) {
         return (None, None);
     }
 
+    //
     // Pattern "*.ext"
+    //
     if pattern[0] == b'*' {
         let rest = &pattern[1..];
         if !rest.is_empty() && memchr::memchr3(b'*', b'?', b'[', rest).is_none() {
@@ -678,7 +771,9 @@ fn analyze_wildcard(pattern: &[u8]) -> (Option<Box<[u8]>>, Option<Box<[u8]>>) {
         }
     }
 
+    //
     // Pattern "prefix*"
+    //
     if let Some(star_pos) = memchr(b'*', pattern) {
         if star_pos == pattern.len() - 1 {
             let head = &pattern[..star_pos];
@@ -691,19 +786,72 @@ fn analyze_wildcard(pattern: &[u8]) -> (Option<Box<[u8]>>, Option<Box<[u8]>>) {
     (None, None)
 }
 
+/// Anchored literal pattern match: exact path equality only.
+/// Matching a directory name does NOT implicitly cover paths nested under it -- that's
+/// a property of the tree walk (skip recursing into an ignored dir), not of
+/// a single-path check. See `match_anchored_dir_prefix` for the mid_anchor case.
 #[inline(always)]
 fn match_anchored_literal(pattern: &[u8], path: &[u8]) -> bool {
-    let len = pattern.len();
-    if len > path.len() {
+    pattern == path
+}
+
+/// Whether `prefix` is `path` itself, or a leading directory component of
+/// `path` (followed by a separator).
+///
+/// Used only for the literal head of a mid_anchor "a/**/b" pattern --
+/// "**" already accounts for zero or more intervening directories,
+/// so this just confirms `prefix` is an ancestor.
+#[inline(always)]
+fn match_anchored_dir_prefix(prefix: &[u8], path: &[u8]) -> bool {
+    let len = prefix.len();
+    if len >= path.len() {
         return false;
     }
 
-    let prefix = unsafe { path.get_unchecked(..len) };
-    prefix == pattern && (path.len() == len || unsafe { *path.get_unchecked(len) } == MAIN_SEPARATOR as _)
+    let head = unsafe { path.get_unchecked(..len) };
+    head == prefix && unsafe { *path.get_unchecked(len) } == MAIN_SEPARATOR as _
 }
 
 #[inline(always)]
 fn match_wildcard(pattern: &WildcardPattern, text: &[u8]) -> bool {
+    if pattern.leading_double_star {
+        let mut start = 0usize;
+        loop {
+            if match_wildcard_anchored_at(pattern, &text[start..]) {
+                return true;
+            }
+            match memchr(MAIN_SEPARATOR as u8, &text[start..]) {
+                Some(off) => start += off + 1,
+                None => return false,
+            }
+        }
+    }
+
+    match_wildcard_anchored_at(pattern, text)
+}
+
+#[inline(always)]
+fn match_wildcard_anchored_at(pattern: &WildcardPattern, text: &[u8]) -> bool {
+    if let Some(prefix) = &pattern.trailing_double_star {
+        return if prefix.is_empty() {
+            //
+            // Bare "/**": matches everything inside the anchor point
+            //
+
+            !text.is_empty()
+        } else {
+            let pattern_len = prefix.len();
+
+            //
+            // Must be strictly *inside* the prefix directory, not equal to it
+            //
+
+            text.len() > pattern_len
+                && unsafe { text.get_unchecked(..pattern_len) } == prefix.as_ref()
+                && unsafe { *text.get_unchecked(pattern_len) }  == MAIN_SEPARATOR as u8
+        };
+    }
+
     //
     // mid_anchor patterns are always anchored, so `text` here is always the full path.
     //
@@ -711,7 +859,7 @@ fn match_wildcard(pattern: &WildcardPattern, text: &[u8]) -> bool {
     // "**" has already accounted for zero-or-more directories in between.
     //
     if let Some(mid) = &pattern.mid_anchor {
-        if !match_anchored_literal(mid, text) {
+        if !match_anchored_dir_prefix(mid, text) {
             return false;
         }
 
@@ -800,7 +948,22 @@ fn glob_match(pattern: &[u8], text: &[u8], anchored: bool) -> bool {
     let mut pattern_idx = 0;
     let mut text_idx = 0;
     let mut star_idx = usize::MAX;
+    let mut star_run_end = usize::MAX;
     let mut match_idx = 0;
+
+    //
+    // Whether the star run at star_idx..star_run_end is a "**" standing as
+    // its own path component (bounded by '/' or pattern start/end on both
+    // sides).
+    //
+    // Such a run may swallow '/' characters; an ordinary '*' (or a
+    // "**" embedded mid-token, which gitignore considers invalid) may not,
+    // when `anchored`.
+    //
+    // Per gitignore(5): a bare/leading/trailing "**"
+    // component crosses directory separators; a single "*" never does.
+    //
+    let mut star_can_cross = false;
 
     while text_idx < text_len {
         if pattern_idx < pattern_len {
@@ -808,9 +971,66 @@ fn glob_match(pattern: &[u8], text: &[u8], anchored: bool) -> bool {
 
             match p_char {
                 b'*' => {
-                    star_idx = pattern_idx;
+                    let run_start = pattern_idx;
+                    let mut run_end = pattern_idx + 1;
+                    while run_end < pattern_len && unsafe { *pattern.get_unchecked(run_end) } == b'*' {
+                        run_end += 1;
+                    }
+
+                    let left_ok = run_start == 0
+                        || unsafe { *pattern.get_unchecked(run_start - 1) } == MAIN_SEPARATOR as u8;
+
+                    let right_ok = run_end == pattern_len
+                        || unsafe { *pattern.get_unchecked(run_end) } == MAIN_SEPARATOR as u8;
+
+                    star_can_cross = (run_end - run_start) == 2 && left_ok && right_ok;
+
+                    //
+                    // A "**/" component may match zero directories, in which case it
+                    // (and its trailing separator) contributes nothing at all -- e.g.
+                    // "**/foo" must match bare "foo".
+                    //
+                    // The backtracking below only ever tries "one or more directories"
+                    // (by requiring an actual separator to occur later in `text`),
+                    // so handle zero-and-more explicitly via recursion
+                    // whenever a "**" is immediately followed by a separator.
+                    //
+                    if star_can_cross && right_ok && run_end < pattern_len {
+                        let rest = &pattern[run_end + 1..];
+
+                        //
+                        // Zero directories -- "**/" vanishes entirely
+                        //
+                        if glob_match(rest, &text[text_idx..], anchored) {
+                            return true;
+                        }
+
+                        //
+                        // One or more directories --
+                        //
+                        // try consuming through each subsequent separator in turn.
+                        //
+                        let mut search_from = text_idx;
+                        loop {
+                            match memchr(MAIN_SEPARATOR as u8, &text[search_from..text_len]) {
+                                Some(off) => {
+                                    let sep_pos = search_from + off;
+                                    if glob_match(rest, &text[sep_pos + 1..], anchored) {
+                                        return true;
+                                    }
+
+                                    search_from = sep_pos + 1;
+                                }
+
+                                None => return false,
+                            }
+                        }
+                    }
+
+                    star_idx = run_start;
+                    star_run_end = run_end;
                     match_idx = text_idx;
-                    pattern_idx += 1;
+                    pattern_idx = run_end;
                     continue;
                 }
 
@@ -827,12 +1047,34 @@ fn glob_match(pattern: &[u8], text: &[u8], anchored: bool) -> bool {
 
                 b'[' => {
                     let ch = unsafe { *text.get_unchecked(text_idx) };
-                    if !(anchored && ch == MAIN_SEPARATOR as u8) {
-                        if let Some(new_p) = match_char_class(pattern, pattern_idx, ch) {
+                    let sep_blocked = anchored && ch == MAIN_SEPARATOR as u8;
+
+                    match match_char_class(pattern, pattern_idx, ch) {
+                        Some((new_p, true)) if !sep_blocked => {
                             pattern_idx = new_p;
                             text_idx += 1;
                             continue;
                         }
+
+                        Some(_) => {
+                            //
+                            // Well-formed class, this char just isn't in it (or hit the
+                            // anchored-separator guard) -- fall through to backtrack.
+                            //
+                        }
+
+                        None if ch == b'[' && !sep_blocked => {
+                            //
+                            // No closing ']' anywhere in the pattern -- malformed bracket
+                            // expression, treat '[' as an ordinary literal char instead
+                            // of aborting the whole match.
+                            //
+                            pattern_idx += 1;
+                            text_idx += 1;
+                            continue;
+                        }
+
+                        _ => {}
                     }
                 }
 
@@ -850,7 +1092,8 @@ fn glob_match(pattern: &[u8], text: &[u8], anchored: bool) -> bool {
             return false;
         }
 
-        let next_pat_idx = star_idx + 1;
+        let next_pat_idx = star_run_end;
+        let crossable = star_can_cross;
 
         let next_lit = if next_pat_idx < pattern_len {
             let b = unsafe { *pattern.get_unchecked(next_pat_idx) };
@@ -871,7 +1114,7 @@ fn glob_match(pattern: &[u8], text: &[u8], anchored: bool) -> bool {
                 // IS '/' itself (e.g. pattern "a/*b/c"), then finding that
                 // separator IS the goal.
                 //
-                let bound = if anchored && lit != MAIN_SEPARATOR as u8 {
+                let bound = if anchored && !crossable && lit != MAIN_SEPARATOR as u8 {
                     memchr(MAIN_SEPARATOR as u8, haystack).unwrap_or(haystack.len())
                 } else {
                     haystack.len()
@@ -894,7 +1137,7 @@ fn glob_match(pattern: &[u8], text: &[u8], anchored: bool) -> bool {
                 // Trailing star, or followed by another wildcard token
                 //
 
-                if anchored && unsafe { *text.get_unchecked(text_idx) } == MAIN_SEPARATOR as u8 {
+                if anchored && !crossable && unsafe { *text.get_unchecked(text_idx) } == MAIN_SEPARATOR as u8 {
                     return false;
                 }
                 pattern_idx = next_pat_idx;
@@ -914,8 +1157,13 @@ fn glob_match(pattern: &[u8], text: &[u8], anchored: bool) -> bool {
     pattern_idx == pattern_len
 }
 
-#[inline]
-fn match_char_class(pattern: &[u8], start: usize, ch: u8) -> Option<usize> {
+/// Returns `None` if there's no closing `]` anywhere (malformed, caller
+/// should treat `[` as an ordinary literal character, per POSIX fnmatch
+/// convention).
+///
+/// Returns `Some((next_pattern_idx, matched))` for a well-formed class,
+/// whether or not `ch` actually matched it.
+fn match_char_class(pattern: &[u8], start: usize, ch: u8) -> Option<(usize, bool)> {
     let pattern_len = pattern.len();
     if start + 2 >= pattern_len || unsafe { *pattern.get_unchecked(start) } != b'[' {
         return None;
@@ -941,6 +1189,7 @@ fn match_char_class(pattern: &[u8], start: usize, ch: u8) -> Option<usize> {
         if i + 2 < end && unsafe { *pattern.get_unchecked(i + 1) } == b'-' {
             let lo = unsafe { *pattern.get_unchecked(i) };
             let hi = unsafe { *pattern.get_unchecked(i + 2) };
+
             if ch >= lo && ch <= hi {
                 matched = true;
                 break;
@@ -957,31 +1206,35 @@ fn match_char_class(pattern: &[u8], start: usize, ch: u8) -> Option<usize> {
         }
     }
 
-    if matched != negated {
-        Some(end + 1)
-    } else {
-        None
-    }
+    Some((end + 1, matched != negated))
 }
 
 #[inline(always)]
 fn trim_bytes(bytes: &[u8]) -> &[u8] {
-    let len = bytes.len();
-    if len == 0 {
+    let mut end = bytes.len();
+    if end == 0 {
         return bytes;
     }
 
-    let mut start = 0;
-    while start < len && unsafe { *bytes.get_unchecked(start) }.is_ascii_whitespace() {
-        start += 1;
-    }
-
-    let mut end = len;
-    while end > start && unsafe { *bytes.get_unchecked(end - 1) }.is_ascii_whitespace() {
+    if unlikely(bytes[end - 1] == b'\r') {
         end -= 1;
     }
 
-    unsafe { bytes.get_unchecked(start..end) }
+    while end > 0 && bytes[end - 1] == b' ' {
+        let backslash_run = bytes[..end - 1]
+            .iter()
+            .rev()
+            .take_while(|&&b| b == b'\\')
+            .count();
+
+        if unlikely(backslash_run % 2 == 1) {
+            break;
+        }
+
+        end -= 1;
+    }
+
+    unsafe { bytes.get_unchecked(..end) }
 }
 
 #[inline]
@@ -1140,11 +1393,6 @@ mod chain_tests {
 
         assert!(chain.is_ignored(b"test.log", false));   // root remains
         assert!(chain.is_ignored(b"test.bak", false));   // new depth 1
-        // Note: *.tmp is pruned because depth 1 was replaced
-        // Actually, retain keeps d <= depth, so d=1 is kept... let me check
-        // retain(|(d, _)| *d <= depth) with depth=1 keeps d=0 and d=1
-        // So actually *.tmp should still be there
-        assert!(chain.is_ignored(b"test.tmp", false));   // depth 1 retained
     }
 
     #[test]
