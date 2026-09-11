@@ -110,18 +110,21 @@ pub enum Matcher {
     Regex {
         re: MetaRegex,
         pattern: Box<str>,  // Keep original pattern for literal extraction
+        case_insensitive: bool,
     },
 }
 
 impl Matcher {
     pub fn new(cli: &Cli) -> io::Result<Self> {
         let _span = tracy::span!("Matcher::new");
-
+        
         let pattern = &cli.pattern;
-
+        
+        if !cli.ignore_case {
         if cli.force_literal {
             return Ok(Matcher::Literal(Finder::new(pattern.as_bytes()).into_owned()));
         }
+        
 
         // Try literal extraction first
         if let Some(literal) = extract_literal(pattern) {
@@ -145,6 +148,7 @@ impl Matcher {
                 patterns: literals,
             });
         }
+   }
 
         //
         // Fallback to regex
@@ -160,13 +164,14 @@ impl Matcher {
                     .dfa_size_limit(Some(LIMIT))
                     .nfa_size_limit(Some(LIMIT))
             )
+            .syntax(util::syntax::Config::new().case_insensitive(cli.ignore_case))
             .build(pattern)
             .map_err(|e| io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("invalid regex '{pattern}': {e}"),
             ))?;
 
-        Ok(Matcher::Regex { re, pattern: pattern.clone().into_boxed_str() })
+        Ok(Matcher::Regex { re, pattern: pattern.clone().into_boxed_str(), case_insensitive: cli.ignore_case })
     }
 
     #[inline(always)]
@@ -225,7 +230,11 @@ impl Matcher {
                 Some((all_fragments.into_iter().collect(), fragment_len))
             }
 
-            Matcher::Regex { pattern, .. } => {
+            Matcher::Regex { pattern, case_insensitive, .. } => {
+                if *case_insensitive {
+                    return None;
+                }
+
                 extract_regex_literals(pattern)
             }
         }

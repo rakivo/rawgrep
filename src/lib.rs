@@ -92,7 +92,7 @@ pub struct RawGrepConfig {
 
     // ---- matcher --------------------------------------------------------
     pub force_literal: bool,
-
+    pub ignore_case: bool,
     // ---- parallelism ----------------------------------------------------
     pub threads: NonZeroUsize,
 
@@ -123,6 +123,7 @@ impl RawGrepConfig {
             stats:            false,
             no_require_git:   false,
             force_literal:    false,
+            ignore_case:      false,
             should_ignore_reserved_tool_dir_filter: false,
             threads:          std::thread::available_parallelism()
                                   .unwrap_or(unsafe { NonZeroUsize::new_unchecked(1) }),
@@ -144,6 +145,7 @@ impl RawGrepConfig {
     pub fn large(mut self)                              -> Self { self.large         = true;       self }
     pub fn should_ignore_reserved_tool_dir_filter(mut self)-> Self { self.should_ignore_reserved_tool_dir_filter = true; self }
     pub fn force_literal(mut self)                      -> Self { self.force_literal = true;       self }
+    pub fn ignore_case(mut self)                        -> Self { self.ignore_case = true;         self }
     pub fn no_cache(mut self)                           -> Self { self.no_cache      = true;       self }
     pub fn no_cache_write(mut self)                     -> Self { self.no_cache_write= true;       self }
     pub fn rebuild_cache(mut self)                      -> Self { self.rebuild_cache = true;       self }
@@ -171,6 +173,7 @@ impl RawGrepConfig {
             jump:             c.jump,
             stats:            c.stats,
             force_literal:    c.force_literal,
+            ignore_case:      c.ignore_case,
             threads:          c.threads,
             no_cache:         c.no_cache,
             cache_size_mb:    c.cache_size_mb,
@@ -198,6 +201,7 @@ impl RawGrepConfig {
             jump:             self.jump,
             stats:            self.stats,
             force_literal:    self.force_literal,
+            ignore_case:      self.ignore_case,
             threads:          self.threads,
             no_cache:         self.no_cache,
             cache_size_mb:    self.cache_size_mb,

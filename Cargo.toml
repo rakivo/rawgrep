@@ -29,7 +29,7 @@ dhat = ["dep:dhat"]
 ignore-oracle-check = ["dep:ignore"]
 
 [dependencies]
-regex-automata = { version = "0.4.18", default-features=false, features=["std", "meta"] }
+regex-automata = { version = "0.4.18", default-features=false, features=["std", "meta", "unicode-case"] }
 aho-corasick = { version = "1.1.4", default-features = false }
 smallvec = { version = "1.15.1", features = ["const_generics"] }
 mimalloc = { version = "=0.1.47", optional = true }

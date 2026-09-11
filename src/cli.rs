@@ -19,7 +19,6 @@ pub struct BufferConfig {
 }
 
 // TODO(#7): add -v / --invert-match (print non-matching lines)
-// TODO(#6): add -i / --ignore-case
 // TODO(#5): add -w / --word-regexp
 // TODO(#8): add -x / --line-regexp (match whole line)
 // TODO(#9): add -s / --case-sensitive override if auto-detect ever added
@@ -98,6 +97,9 @@ pub struct Cli {
     /// Force `Matcher` to use literal search even if there's regex stuff in the pattern
     #[bpaf(short, long("force-literal"))]
     pub force_literal: bool,
+
+    #[bpaf(short('i'), long("ignore-case"))]
+    pub ignore_case: bool,
 
     /// Number of worker threads to use
     ///
