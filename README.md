@@ -5,25 +5,25 @@
 
 ## Benchmarks
 
-benchmark script: [`bench.sh`](bench.sh)
+benchmark script: [`bench.sh`](https://github.com/rakivo/rawgrep/bench.sh)
 ```
 corpus: Chromium codebase (~500k files)
 pattern: 'TODO' (literal)
-rawgrep 0.2.0 (rev 70a01e8) vs ripgrep 15.2.0 (rev 3fce3b5bb0)
+rawgrep 0.2.0 (rev 0197d09) vs ripgrep 15.2.0 (rev 3fce3b5bb0)
 system: Intel i5-13400F, 16 threads, ext4 file system, NVMe SSD (Crucial P2 250GB, ~994MB/s read / 736MB/s write), 16GB 3200MHz RAM (~15GB free), performance mode enabled, Debian 6.12
 ```
 
 | scenario | rawgrep time | rawgrep RAM | ripgrep time | ripgrep RAM | speedup |
 |---|---|---|---|---|---|
-| warm cache + fragment cache | 156.2 ± 6.0 ms | 181 MiB | 366.0 ± 6.7 ms | 183 MiB* **(See note below)** | 2.34x |
-| warm cache, no fragment cache | 336.7 ± 5.7 ms | 248 MiB | 366.5 ± 6.4 ms | 259 MiB* **(See note below)** | 1.09x |
-| cold cache, no fragment cache | 9.761 ± 0.193 s | 271 MiB | 11.910 ± 0.103 s | 275 MiB* **(See note below)** | 1.22x |
-| cold cache + fragment cache | 3.532 ± 0.028 s | 193 MiB | 11.893 ± 0.088 s | 195 MiB* **(See note below)** | 3.37x |
+| warm cache + fragment cache | 165.4 ± 8.6 ms | 187 MiB | 367.0 ± 7.5 ms | 188 MiB* **(See note below)** | 2.22x |
+| warm cache - fragment cache | 330.9 ± 7.0 ms | 255 MiB | 366.4 ± 6.2 ms | 258 MiB* **(See note below)** | 1.11x |
+| cold cache - fragment cache | 8.322 ± 0.065 s | 231 MiB | 11.940 ± 0.094 s | 233 MiB* **(See note below)** | 1.43x |
+| cold cache + fragment cache | 2.584 ± 0.030 s | 181 MiB | 11.922 ± 0.064 s | 183 MiB* **(See note below)** | 4.61x |
 
 | scenario | rawgrep time | rawgrep RAM | fff time | fff RAM | speedup |
 |---|---|---|---|---|---|
-| warm, fff (cache built once) vs rawgrep | 160.9 ± 10.8 ms | 579 MiB* **(See note below)** | 625.6 ± 13.4 ms | 586 MiB | 3.89x |
-| cold, fff (cache built once) vs rawgrep | 3.519 ± 0.035 s | 586 MiB* **(See note below)** | 5.293 ± 0.024 s | 586 MiB | 1.50x |
+| warm, fff (cache built once) vs rawgrep + fragment cache | 162.6 ± 7.2 ms | 584 MiB* **(See note below)** | 623.4 ± 12.3 ms | 584 MiB | 3.83x |
+| cold, fff (cache built once) vs rawgrep + fragment cache | 2.587 ± 0.031 s | 583 MiB* **(See note below)** | 5.117 ± 0.021 s | 583 MiB | 1.98x |
 
 # The note
 
