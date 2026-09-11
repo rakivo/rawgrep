@@ -39,6 +39,33 @@ fn extract_alternation_literals(pattern: &str) -> Option<Box<[Box<[u8]>]>> {
     Some(literals.into())
 }
 
+pub struct RegexMatchIter<'a> {
+    re: &'a MetaRegex,
+    cache: &'a mut MetaCache,
+    haystack: &'a [u8],
+    at: usize,
+}
+
+impl<'a> Iterator for RegexMatchIter<'a> {
+    type Item = (usize, usize);
+
+    #[inline(always)]
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.at > self.haystack.len() {
+            return None;
+        }
+
+        let input = regex_automata::Input::new(self.haystack).span(self.at..self.haystack.len());
+        let m = self.re.search_with(self.cache, &input)?;
+
+        let start = m.start();
+        let end = m.end();
+        self.at = if start == end { end + 1 } else { end };
+
+        Some((start, end))
+    }
+}
+
 // NOTE:
 //   `Literal::iter` is 320 bytes,
 //   the second-largest variant contains at least 120 bytes,
@@ -49,16 +76,11 @@ fn extract_alternation_literals(pattern: &str) -> Option<Box<[Box<[u8]>]>> {
 #[allow(clippy::large_enum_variant)]
 pub enum MatchIterator<'a> {
     Literal {
-        iter: memchr::memmem::FindIter<'a, 'a>,
         needle_len: usize,
+        iter: memchr::memmem::FindIter<'a, 'a>,
     },
     MultiLiteral(aho_corasick::FindIter<'a, 'a>),
-    Regex {
-        re: &'a MetaRegex,
-        cache: &'a mut MetaCache,
-        haystack: &'a [u8],
-        at: usize,
-    },
+    Regex(RegexMatchIter<'a>),
 }
 
 impl<'a> Iterator for MatchIterator<'a> {
@@ -75,26 +97,7 @@ impl<'a> Iterator for MatchIterator<'a> {
                 iter.next().map(|m| (m.start(), m.end()))
             }
 
-            MatchIterator::Regex { re, cache, haystack, at } => {
-                if *at > haystack.len() {
-                    return None;
-                }
-
-                let input = regex_automata::Input::new(haystack).span(*at..haystack.len());
-                let m = re.search_with(cache, &input)?;
-
-                let start = m.start();
-                let end   = m.end();
-
-                // Advance search offset for next iteration
-                if start == end {
-                    *at = end + 1; // Prevent infinite loop on 0-width empty matches
-                } else {
-                    *at = end;
-                }
-
-                Some((start, end))
-            }
+            MatchIterator::Regex(re) => re.next()
         }
     }
 }
@@ -170,6 +173,31 @@ impl Matcher {
     }
 
     #[inline(always)]
+    pub fn push_all_matches(
+        &self,
+        buf: &[u8],
+        cache: Option<&mut MetaCache>,
+        ranges_scratch: &mut Vec<(u32, u32)>
+    ) {
+        match self.find_matches(buf, cache) {
+            MatchIterator::Literal { mut iter, needle_len } => {
+                let needle_len = needle_len;  // @Speed: Ensure no pointer-chasing
+                while let Some(pos) = iter.next() {
+                    ranges_scratch.push((pos as u32, (pos + needle_len) as u32));
+                }
+            }
+
+            MatchIterator::MultiLiteral(iter) => for m in iter {
+                ranges_scratch.push((m.start() as u32, m.end() as u32));
+            }
+
+            MatchIterator::Regex(re) => {
+                for (s, e) in re { ranges_scratch.push((s as u32, e as u32)) }
+            }
+        }
+    }
+
+    #[inline(always)]
     pub fn find_matches<'a>(&'a self, haystack: &'a [u8], cache: Option<&'a mut MetaCache>) -> MatchIterator<'a> {
         match self {
             Matcher::Literal(finder) => {
@@ -181,12 +209,12 @@ impl Matcher {
             Matcher::MultiLiteral { ac, .. } => {
                 MatchIterator::MultiLiteral(ac.find_iter(haystack))
             }
-            Matcher::Regex { re, .. } => MatchIterator::Regex {
+            Matcher::Regex { re, .. } => MatchIterator::Regex(RegexMatchIter {
                 re,
                 cache: unsafe { cache.unwrap_unchecked() },
                 haystack,
                 at: 0,
-            },
+            }),
         }
     }
 

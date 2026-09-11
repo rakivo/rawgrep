@@ -2,7 +2,7 @@
 
 use crate::{tracy, util};
 use crate::util::{likely, unlikely, read_u16_unaligned_le, read_u32_unaligned_le, read_u8_unaligned};
-use crate::parser::{BufFatPtr, BufKind, FileId, FileNode, FileType, Parser, RawFs, binary_probe};
+use crate::parser::{BufFatPtr, BufKind, FileId, FileNode, FileType, Parser, RawFs, binary_probe, FastDivU32};
 use crate::worker::STREAMING_CHUNK_SIZE;
 
 use super::*;
@@ -135,8 +135,11 @@ impl RawFs for Ext4Fs {
         })
     }
 
-    #[inline]
-    fn sort_entries(&self, entries: &mut [(FileId, BufFatPtr)]) {
+    #[inline(always)]
+    fn sort_entries_by_offset(&self, entries: &mut [(FileId, BufFatPtr)]) {
+        #[cfg(feature = "profile-sort-lens")]
+        eprintln!("{}", entries.len());
+
         entries.sort_unstable_by_key(|(file_id, _)| self.inode_disk_offset(*file_id));
     }
 
@@ -185,14 +188,40 @@ impl RawFs for Ext4Fs {
         #[cfg(unix)]
         const PREFETCH_AHEAD: usize = 4;
 
-        for (i, &(disk_offset, len)) in parser.scratch_chunks.iter().enumerate() {
-            #[cfg(unix)]
-            if let Some(&(next_offset, next_len)) = parser.scratch_chunks.get(i + PREFETCH_AHEAD) {
+        #[cfg(unix)]
+        {
+            for &(offset, len) in parser.scratch_chunks.iter().take(PREFETCH_AHEAD) {
                 unsafe {
                     libc::posix_fadvise(
-                        fd, next_offset as i64, next_len as i64,
+                        fd, offset as i64, len as i64,
                         libc::POSIX_FADV_WILLNEED
                     );
+                }
+            }
+        }
+
+        //
+        // Index of the furthest chunk already fadvise'd (by the burst above).
+        // The rolling hint below only ever advances this -- it must never
+        // re-hint a range the burst (or a prior iteration) already covered.
+        //
+        #[cfg(unix)]
+        let mut hinted_up_to = PREFETCH_AHEAD.min(parser.scratch_chunks.len());
+
+        for (i, &(disk_offset, len)) in parser.scratch_chunks.iter().enumerate() {
+            #[cfg(unix)] {
+                let want = i + 1;
+                if want >= hinted_up_to {
+                    if let Some(&(next_offset, next_len)) = parser.scratch_chunks.get(want) {
+                        unsafe {
+                            libc::posix_fadvise(
+                                fd, next_offset as i64, next_len as i64,
+                                libc::POSIX_FADV_WILLNEED
+                            );
+                        }
+                    }
+
+                    hinted_up_to = want + 1;
                 }
             }
 
@@ -248,8 +277,10 @@ impl RawFs for Ext4Fs {
 
             let extents = Self::scratch_as_extents(scratch);
 
-            // Bytes of the very first extent already pulled into `buf` by the probe below,
+            //
+            // Bytes of the very first extent already pulled into 'buf' by the probe below,
             // still owed to the chunk-building loop as a "skip" so it doesn't re-read them.
+            //
             let mut skip_first = 0usize;
 
             if check_binary && let Some(first) = extents.first() {
@@ -442,10 +473,9 @@ impl RawFs for Ext4Fs {
 
 // ext4-specific helper methods
 impl Ext4Fs {
-    #[inline]
+    #[inline(always)]
     pub fn inode_disk_offset(&self, inode_num: u64) -> u64 {
-        let group = (inode_num - 1) / self.sb.inodes_per_group as u64;
-        let index = (inode_num - 1) % self.sb.inodes_per_group as u64;
+        let (group, index) = self.sb.inodes_per_group_recip.divmod(inode_num - 1);
 
         debug_assert!(self.inode_table_blocks.len() >= group as usize);
 
@@ -509,6 +539,7 @@ impl Ext4Fs {
             inodes_per_group,
             inode_size,
             desc_size,
+            inodes_per_group_recip: FastDivU32::new(inodes_per_group)
         })
     }
 

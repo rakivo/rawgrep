@@ -76,7 +76,7 @@ pub trait RawFs: Sync + Send {
     fn parse_node(&self, file_id: FileId) -> io::Result<Self::Node>;
 
     #[inline]
-    fn sort_entries(&self, _entries: &mut [(FileId, BufFatPtr)]) {}
+    fn sort_entries_by_offset(&self, _entries: &mut [(FileId, BufFatPtr)]) {}
 
     /// Read file content into buffer, returns false if binary detected
     fn read_file_content(
@@ -138,7 +138,7 @@ pub struct Parser {
     pub gitignore: Vec<u8>,                // 96
     pub chunk:     Vec<u8>,
 
-    pub scratch_chunks: Vec<(u64, u32)>,
+    pub scratch_chunks:  Vec<(u64, u32)>,
 }
 
 impl Parser {
@@ -308,4 +308,30 @@ pub fn push_chunk(scratch_chunks: &mut Vec<(u64, u32)>, disk_offset: u64, len: u
     }
 
     scratch_chunks.push((disk_offset, len));
+}
+
+/// Precomputed reciprocal for dividing a u64 by a fixed u32 divisor
+/// without a hardware DIV on every call.
+#[derive(Copy, Clone)]
+pub struct FastDivU32 {
+    divisor: u64,
+    recip:   u64, // floor(2^64 / divisor) + 1
+}
+
+impl FastDivU32 {
+    #[inline]
+    pub const fn new(divisor: u32) -> Self {
+        assert!(divisor != 0);
+
+        let d = divisor as u64;
+        let recip = (u64::MAX / d).wrapping_add(1);
+        Self { divisor: d, recip }
+    }
+
+    #[inline(always)]
+    pub const fn divmod(&self, n: u64) -> (u64, u64) {
+        let q = ((self.recip as u128 * n as u128) >> 64) as u64;
+        let r = n - q * self.divisor;
+        (q, r)
+    }
 }

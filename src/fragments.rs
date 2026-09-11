@@ -53,6 +53,8 @@
 //! - <https://github.com/asbott/nowgrep>
 //! - Similar to Bloom filters but with explicit tracking
 
+use crate::util::prefetch_read;
+
 use nohash_hasher::IntSet;
 
 #[derive(Clone, Copy)]
@@ -252,6 +254,12 @@ fn check_fragment_presence_scalar(buf: &[u8], fragment_hashes: &[u32], fragment_
 
     let mut i = 0;
     while i + 4 <= buf.len() {
+        // Address-only dependency -- safe to issue unconditionally, no data needed.
+        let ahead = i + stride;
+        if ahead + 4 <= buf.len() {
+            prefetch_read(unsafe { buf.as_ptr().add(ahead) });
+        }
+
         let raw = u32::from_le_bytes([buf[i], buf[i+1], buf[i+2], buf[i+3]]) & mask;
         let hash = hash_fragment_u32(raw);
 
@@ -306,6 +314,11 @@ macro_rules! impl_fragment_presence_scanner {
                     let $data_ptr = buf.as_ptr().add(offset);
                     let $mask_val = mask;
                     let hashes: $hashes_ty = $load_block;
+
+                    let ahead = offset + stride;
+                    if ahead + 4 <= buf_len {
+                        prefetch_read(buf.as_ptr().add(ahead));
+                    }
 
                     for (frag_idx, &frag_hash) in fragment_hashes.iter().enumerate() {
                         let bit = 1u64 << frag_idx;

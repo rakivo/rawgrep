@@ -84,6 +84,19 @@ pub fn read_at_offset(file: &File, buf: &mut [u8], offset: u64) -> io::Result<us
 }
 
 #[inline(always)]
+pub fn prefetch_read<T>(ptr: *const T) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        std::arch::x86_64::_mm_prefetch(ptr as *const i8, std::arch::x86_64::_MM_HINT_T0);
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        std::arch::asm!("prfm pldl1keep, [{0}]", in(reg) ptr, options(readonly, nostack, preserves_flags));
+    }
+}
+
+#[inline(always)]
 pub fn truncate_utf8(s: &[u8], max: usize) -> &[u8] {
     if s.len() <= max {
         return s;

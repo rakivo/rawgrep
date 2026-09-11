@@ -1,4 +1,5 @@
 use std::fmt::Display;
+use crate::parser::FastDivU32;
 
 pub type INodeNum = u32;
 
@@ -51,6 +52,7 @@ pub struct Ext4SuperBlock {
     pub inodes_per_group: u32,
     pub inode_size: u16,
     pub desc_size: u16,
+    pub inodes_per_group_recip: FastDivU32,
 }
 
 impl Display for Ext4SuperBlock {
