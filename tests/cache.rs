@@ -844,10 +844,10 @@ proptest! {
 
             cache.merge_updates_bool(keys.clone(), metas.clone(), &hashes, presences).unwrap();
 
-            for fi in 0..num_files {
-                let present = (present_mask >> (fi % 32)) & 1 == 1;
+            for (file_index, file) in ground_truth.iter_mut().enumerate().take(num_files) {
+                let present = (present_mask >> (file_index % 32)) & 1 == 1;
                 for &h in &hashes {
-                    ground_truth[fi].insert(h, present);
+                    file.insert(h, present);
                 }
             }
 

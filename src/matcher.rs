@@ -173,6 +173,7 @@ impl Matcher {
     }
 
     #[inline(always)]
+    #[allow(clippy::redundant_locals, clippy::while_let_on_iterator)]
     pub fn push_all_matches(
         &self,
         buf: &[u8],
