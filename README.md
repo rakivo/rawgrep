@@ -9,7 +9,7 @@ benchmark script: [`bench.sh`](https://github.com/rakivo/rawgrep/bench.sh)
 ```
 corpus: Chromium codebase (~500k files)
 pattern: 'TODO' (literal)
-rawgrep 0.2.0 (rev 0197d09) vs ripgrep 15.2.0 (rev 3fce3b5bb0)
+rawgrep 0.2.0 (rev ebd960a) vs ripgrep 15.2.0 (rev 3fce3b5bb0)
 system: Intel i5-13400F, 16 threads, ext4 file system, NVMe SSD (Crucial P2 250GB, ~994MB/s read / 736MB/s write), 16GB 3200MHz RAM (~15GB free), performance mode enabled, Debian 6.12
 ```
 
