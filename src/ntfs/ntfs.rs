@@ -111,6 +111,10 @@ pub struct NtfsInode {
     pub mtime_sec: i64,     // from $STANDARD_INFORMATION, Unix epoch seconds
 }
 
+impl NtfsInode {
+    pub const POISONED: Self = unsafe { core::mem::zeroed() };
+}
+
 /// A single run (extent) in an NTFS runlist
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 #[repr(C)]

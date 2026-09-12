@@ -1,7 +1,7 @@
 use crate::tracy;
 use crate::grep::{AnyNodeCache, AnyNodeScratch, NodeCacheStats};
 use crate::binary::{is_binary_chunk, is_dot_entry, is_hidden_entry};
-use crate::worker::BINARY_PROBE_BYTE_SIZE;
+use crate::worker::{BINARY_PROBE_BYTE_SIZE, PendingSubdir};
 use crate::cli::BufferConfig;
 
 use std::fs::File;
@@ -43,6 +43,10 @@ pub type FileId = u64;
 
 /// Filesystem-agnostic file node info
 pub trait FileNode: Copy {
+    /// Sentinel written into a batch slot when `parse_node` fails, so callers
+    /// get a fixed-size Vec<Node> back instead of Vec<Result<Node, _>> / Vec<Option<Node>>.
+    const POISONED: Self;
+
     fn file_id(&self) -> FileId;
     fn size(&self) -> u64;
     fn mtime(&self) -> i64;
@@ -54,7 +58,6 @@ pub trait RawFs: Sync + Send {
     /// Filesystem-specific file node type (e.g., Ext4Inode)
     type Node: FileNode;
     type NodeCache: Default;
-
     /// Filesystem-specific context (e.g., superblock + mmap reference)
     type Context<'a>: Copy where Self: 'a;
 
@@ -79,17 +82,31 @@ pub trait RawFs: Sync + Send {
         &self,
         entries: &[(FileId, BufFatPtr)],
         _cache:  &mut Self::NodeCache,
-        out:     &mut Vec<io::Result<Self::Node>>,
+        out:     &mut Vec<Self::Node>,
     ) -> NodeCacheStats {
-        out.extend(entries.iter().map(|&(id, _)| self.parse_node(id)));
+        out.extend(entries.iter().map(|&(id, _)| match self.parse_node(id) {
+            Ok(node) => node,
+            Err(_) => Self::Node::POISONED
+        }));
+
         NodeCacheStats { hits: 0, misses: entries.len() as u32 }
     }
+
+    /// Parse file node by ID
+    fn parse_node_cached(
+        &self,
+        file_id: FileId,
+        cache: &mut Self::NodeCache
+    ) -> (io::Result<Self::Node>, NodeCacheStats);
 
     /// Parse file node by ID
     fn parse_node(&self, file_id: FileId) -> io::Result<Self::Node>;
 
     #[inline]
     fn sort_entries_by_offset(&self, _entries: &mut [(FileId, BufFatPtr)]) {}
+
+    #[inline]
+    fn sort_subdirs_by_offset(&self, _subdirs: &mut [PendingSubdir]) {}
 
     /// Read file content into buffer, returns false if binary detected
     fn read_file_content(
@@ -125,10 +142,10 @@ pub trait RawFs: Sync + Send {
 
     fn directory_entry_count_hint(&self, buf: &[u8]) -> usize;
 
-    fn take_node_scratch(&self,  _shared: &mut AnyNodeScratch)          -> Vec<io::Result<Self::Node>> { Default::default() } // @Incomplete
-    fn take_node_cache(&self,    _shared: &mut AnyNodeCache)            -> Self::NodeCache { Default::default() } // @Incomplete
-    fn erase_node_scratch(&self, _scratch: Vec<io::Result<Self::Node>>) -> AnyNodeScratch { Default::default() } // @Incomplete
-    fn erase_node_cache(&self,   _cache: Self::NodeCache)               -> AnyNodeCache { Default::default() } // @Incomplete
+    fn take_node_scratch(&self,  _shared: &mut AnyNodeScratch) -> Vec<Self::Node> { Default::default() } // @Incomplete
+    fn take_node_cache(&self,    _shared: &mut AnyNodeCache)   -> Self::NodeCache { Default::default() } // @Incomplete
+    fn erase_node_scratch(&self, _scratch: Vec<Self::Node>)    -> AnyNodeScratch { Default::default() } // @Incomplete
+    fn erase_node_cache(&self,   _cache: Self::NodeCache)      -> AnyNodeCache { Default::default() } // @Incomplete
 }
 
 /// Result of scanning directory entries

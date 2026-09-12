@@ -606,23 +606,23 @@ impl FragmentCache<MemoryStorage> {
 impl<S: CacheStorage> FragmentCache<S> {
     fn create_empty(config: &CacheConfig, storage: S) -> io::Result<Self> {
         let max_fragments = config.max_fragments as u32;
-        let max_files = config.max_files as u32;
+        let max_files     = config.max_files as u32;
 
         // Start with reasonable capacity to avoid many reallocations
         // 64K files = ~2MB for keys+metas, acceptable tradeoff for speed
         const INITIAL_CAPACITY: usize = 64 * 1024;
 
-        let owned_fragment_hashes = Box::<[u32]>::new_uninit_slice(config.max_fragments);
-        let owned_file_keys = Box::<[FileKey]>::new_uninit_slice(INITIAL_CAPACITY);
-        let owned_file_metas = Box::<[FileMeta]>::new_uninit_slice(INITIAL_CAPACITY);
+        let owned_fragment_hashes     = Box::<[u32]>::new_uninit_slice(config.max_fragments);
+        let owned_file_keys           = Box::<[FileKey]>::new_uninit_slice(INITIAL_CAPACITY);
+        let owned_file_metas          = Box::<[FileMeta]>::new_uninit_slice(INITIAL_CAPACITY);
 
-        let owned_fragment_hashes = unsafe { owned_fragment_hashes.assume_init() };
-        let owned_file_keys = unsafe { owned_file_keys.assume_init() };
-        let owned_file_metas = unsafe { owned_file_metas.assume_init() };
+        let owned_fragment_hashes     = unsafe { owned_fragment_hashes.assume_init() };
+        let owned_file_keys           = unsafe { owned_file_keys.assume_init() };
+        let owned_file_metas          = unsafe { owned_file_metas.assume_init() };
 
         // Stride=1 covers first 64 fragments, ensure_fragment_capacity
         // handles growth beyond that
-        let owned_file_bitsets = vec![!0u64; INITIAL_CAPACITY].into_boxed_slice();
+        let owned_file_bitsets        = vec![!0u64; INITIAL_CAPACITY].into_boxed_slice();
 
         // Small lookup table initially
         let lookup_size = (INITIAL_CAPACITY * 2).next_power_of_two();
@@ -634,9 +634,9 @@ impl<S: CacheStorage> FragmentCache<S> {
 
         // Create FatPtrs from the owned boxes
         let fragment_hashes = FatPtr::from_box(&owned_fragment_hashes);
-        let file_keys = FatPtr::from_box(&owned_file_keys);
-        let file_metas = FatPtr::from_box(&owned_file_metas);
-        let file_bitsets = FatPtr::from_box(&owned_file_bitsets);
+        let file_keys       = FatPtr::from_box(&owned_file_keys);
+        let file_metas      = FatPtr::from_box(&owned_file_metas);
+        let file_bitsets    = FatPtr::from_box(&owned_file_bitsets);
 
         Ok(Self {
             num_fragments: 0,
@@ -663,26 +663,26 @@ impl<S: CacheStorage> FragmentCache<S> {
     /// COW: copy mmap data to owned buffers when we need to write
     fn ensure_owned(&mut self) {
         if self.owned_fragment_hashes.is_some() {
-            // already owned
+            // Already owned
             return;
         }
 
         let start = Instant::now();
 
-        let num_fragments = self.num_fragments as usize;
-        let num_files = self.num_files as usize;
+        let num_fragments           = self.num_fragments as usize;
+        let num_files               = self.num_files as usize;
 
         // Allocate with growth headroom
-        let new_capacity = (num_files + 64*1024).min(self.max_files as usize);
+        let new_capacity            = (num_files + 64*1024).min(self.max_files as usize);
 
-        let alloc_start = Instant::now();
+        let alloc_start             = Instant::now();
         let mut new_fragment_hashes = Box::<[u32]>::new_uninit_slice(self.max_fragments as usize);
-        let mut new_file_keys = Box::<[FileKey]>::new_uninit_slice(new_capacity);
-        let mut new_file_metas = Box::<[FileMeta]>::new_uninit_slice(new_capacity);
+        let mut new_file_keys       = Box::<[FileKey]>::new_uninit_slice(new_capacity);
+        let mut new_file_metas      = Box::<[FileMeta]>::new_uninit_slice(new_capacity);
 
-        let bits_per_file_u64 = num_fragments.div_ceil(64).max(1);
-        let total_u64s = new_capacity * bits_per_file_u64;
-        let used_u64s = num_files * bits_per_file_u64;
+        let bits_per_file_u64       = num_fragments.div_ceil(64).max(1);
+        let total_u64s              = new_capacity * bits_per_file_u64;
+        let used_u64s               = num_files * bits_per_file_u64;
 
         eprintln!(
             "ensure_owned called: num_files={}, new_capacity={}, bits_per_file_u64={}, total_bitset_KB={}",
@@ -733,25 +733,27 @@ impl<S: CacheStorage> FragmentCache<S> {
         }
         let copy_time = copy_start.elapsed();
 
-        let new_fragment_hashes = unsafe { new_fragment_hashes.assume_init() };
-        let new_file_keys = unsafe { new_file_keys.assume_init() };
-        let new_file_metas = unsafe { new_file_metas.assume_init() };
-        let new_file_bitsets = unsafe { new_file_bitsets.assume_init() };
+        let new_fragment_hashes    = unsafe { new_fragment_hashes.assume_init() };
+        let new_file_keys          = unsafe { new_file_keys.assume_init() };
+        let new_file_metas         = unsafe { new_file_metas.assume_init() };
+        let new_file_bitsets       = unsafe { new_file_bitsets.assume_init() };
 
         // ----------- Update pointers to point to owned data
-        self.fragment_hashes = FatPtr::from_box(&new_fragment_hashes);
-        self.file_keys = FatPtr::from_box(&new_file_keys);
-        self.file_metas = FatPtr::from_box(&new_file_metas);
-        self.file_bitsets = FatPtr::from_box(&new_file_bitsets);
+        self.fragment_hashes       = FatPtr::from_box(&new_fragment_hashes);
+        self.file_keys             = FatPtr::from_box(&new_file_keys);
+        self.file_metas            = FatPtr::from_box(&new_file_metas);
+        self.file_bitsets          = FatPtr::from_box(&new_file_bitsets);
 
         // ----------- Store owned data
         self.owned_fragment_hashes = Some(new_fragment_hashes);
-        self.owned_file_keys = Some(new_file_keys);
-        self.owned_file_metas = Some(new_file_metas);
-        self.owned_file_bitsets = Some(new_file_bitsets);
+        self.owned_file_keys       = Some(new_file_keys);
+        self.owned_file_metas      = Some(new_file_metas);
+        self.owned_file_bitsets    = Some(new_file_bitsets);
 
         // ----------- Update capacity
-        self.file_capacity = new_capacity;
+        self.file_capacity         = new_capacity;
+
+        self.backing = None;
 
         let total_time = start.elapsed();
         eprintln!(
@@ -775,11 +777,11 @@ impl<S: CacheStorage> FragmentCache<S> {
         // @Constant
         let new_capacity = (needed + 64 * 1024).min(self.max_files as usize);
         if new_capacity <= self.file_capacity {
-            return; // at max capacity already
+            return;  // At max capacity already
         }
 
-        let num_files = self.num_files as usize;
-        let num_fragments = self.num_fragments as usize;
+        let num_files         = self.num_files as usize;
+        let num_fragments     = self.num_fragments as usize;
         let bits_per_file_u64 = num_fragments.div_ceil(64).max(1);
 
         //
@@ -815,9 +817,9 @@ impl<S: CacheStorage> FragmentCache<S> {
         // Grow file_bitsets
         //
         // @Refactor @Cutnpaste from above
-        let old_file_bitsets = self.owned_file_bitsets.take().unwrap();
-        let old_u64s = num_files * bits_per_file_u64;
-        let new_total_u64s = new_capacity * bits_per_file_u64;
+        let old_file_bitsets     = self.owned_file_bitsets.take().unwrap();
+        let old_u64s             = num_files * bits_per_file_u64;
+        let new_total_u64s       = new_capacity * bits_per_file_u64;
         let mut new_file_bitsets = Box::<[u64]>::new_uninit_slice(new_total_u64s);
         unsafe {
             std::ptr::copy_nonoverlapping(
@@ -873,19 +875,19 @@ impl<S: CacheStorage> FragmentCache<S> {
         //
         // Update FatPtrs
         //
-        self.file_keys = FatPtr::from_box(&new_file_keys);
-        self.file_metas = FatPtr::from_box(&new_file_metas);
-        self.file_bitsets = FatPtr::from_box(&new_file_bitsets);
+        self.file_keys          = FatPtr::from_box(&new_file_keys);
+        self.file_metas         = FatPtr::from_box(&new_file_metas);
+        self.file_bitsets       = FatPtr::from_box(&new_file_bitsets);
 
         //
         // Store new owned data
         //
-        self.owned_file_keys = Some(new_file_keys);
-        self.owned_file_metas = Some(new_file_metas);
+        self.owned_file_keys    = Some(new_file_keys);
+        self.owned_file_metas   = Some(new_file_metas);
         self.owned_file_bitsets = Some(new_file_bitsets);
 
         eprintln!("Cache capacity grew: {} -> {} files", self.file_capacity, new_capacity);
-        self.file_capacity = new_capacity;
+        self.file_capacity      = new_capacity;
     }
 
     /// Migrate bitsets when num_fragments crosses a 64-boundary.
@@ -947,24 +949,24 @@ impl<S: CacheStorage> FragmentCache<S> {
         let num_files = (header.num_files as usize).min(config.max_files);
 
         // ---------- Calculate offsets (data follows header with proper alignment)
-        let header_size = size_of::<CacheHeader>();
-        let fragments_offset = header_size;
-        let fragments_size = num_fragments * 4; // @Constant
+        let header_size         = size_of::<CacheHeader>();
+        let fragments_offset    = header_size;
+        let fragments_size      = num_fragments * 4; // @Constant
 
         // ---------- Align file_keys to 16 bytes
-        let file_keys_offset = (fragments_offset + fragments_size + 15) & !15;
-        let file_keys_size = num_files * size_of::<FileKey>();
+        let file_keys_offset    = (fragments_offset + fragments_size + 15) & !15;
+        let file_keys_size      = num_files * size_of::<FileKey>();
 
         // ---------- file_metas follows file_key
-        let file_metas_offset = file_keys_offset + file_keys_size;
-        let file_metas_size = num_files * size_of::<FileMeta>();
+        let file_metas_offset   = file_keys_offset + file_keys_size;
+        let file_metas_size     = num_files * size_of::<FileMeta>();
 
         // ---------- file_bitsets follows (align to 8 bytes for u64)
         let file_bitsets_offset = (file_metas_offset + file_metas_size + 7) & !7;
-        let bits_per_file_u64 = num_fragments.div_ceil(64);
-        let file_bitsets_len = num_files * bits_per_file_u64;
+        let bits_per_file_u64   = num_fragments.div_ceil(64);
+        let file_bitsets_len    = num_files * bits_per_file_u64;
 
-        let expected_size = file_bitsets_offset + file_bitsets_len * size_of::<u64>();
+        let expected_size       = file_bitsets_offset + file_bitsets_len * size_of::<u64>();
         if bytes.len() < expected_size {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "cache data truncated"));
         }
@@ -973,13 +975,13 @@ impl<S: CacheStorage> FragmentCache<S> {
         let fragment_hashes = unsafe {
             FatPtr::from_raw(bytes.as_ptr().add(fragments_offset) as *const u32, num_fragments)
         };
-        let file_keys = unsafe {
+        let file_keys       = unsafe {
             FatPtr::from_raw(bytes.as_ptr().add(file_keys_offset) as *const FileKey, num_files)
         };
-        let file_metas = unsafe {
+        let file_metas      = unsafe {
             FatPtr::from_raw(bytes.as_ptr().add(file_metas_offset) as *const FileMeta, num_files)
         };
-        let file_bitsets = unsafe {
+        let file_bitsets    = unsafe {
             FatPtr::from_raw(bytes.as_ptr().add(file_bitsets_offset) as *const u64, file_bitsets_len)
         };
 
@@ -1159,9 +1161,9 @@ impl<S: CacheStorage> FragmentCache<S> {
         };
 
         // -------- Check if any required fragment is marked absent
-        let num_fragments = self.num_fragments as usize;
+        let num_fragments     = self.num_fragments as usize;
         let bits_per_file_u64 = num_fragments.div_ceil(64).max(1);
-        let offset = (file_id as usize) * bits_per_file_u64; // Start of this file's bitset
+        let offset            = (file_id as usize) * bits_per_file_u64;  // Start of this file's bitset
 
         // Computable from file_id alone -- no dependency on the metadata check
         // below. Fire it now so it has the width of stored_meta.matches() to
@@ -1323,12 +1325,12 @@ impl<S: CacheStorage> FragmentCache<S> {
 
             // Ring buffer full means num_fragments == max_fragments,
             // so stride is already at its maximum and will never grow again
-            let num_files = self.num_files as usize;
+            let num_files         = self.num_files as usize;
             let bits_per_file_u64 = num_fragments.div_ceil(64).max(1);
-            let u64_offset = index / 64;
-            let bit_index    = index % 64;
+            let u64_offset        = index / 64;
+            let bit_index         = index % 64;
 
-            let owned_file_bitsets = self.owned_file_bitsets.as_mut().unwrap();
+            let owned_file_bitsets     = self.owned_file_bitsets.as_mut().unwrap();
             let owned_file_bitsets_len = owned_file_bitsets.len();
 
             for file_id in 0..num_files {
@@ -1348,8 +1350,8 @@ impl<S: CacheStorage> FragmentCache<S> {
     /// Insert file into lookup table
     #[inline]
     fn insert_into_lookup(&mut self, file_key: FileKey, file_id: u32) {
-        let hash = file_key.hash();
-        let mask = self.file_lookup.len() - 1;
+        let hash      = file_key.hash();
+        let mask      = self.file_lookup.len() - 1;
         let mut index = (hash as usize) & mask;
 
         // @Note: This might silently fail, which means this file will always
@@ -1381,17 +1383,17 @@ impl<S: CacheStorage> FragmentCache<S> {
     /// Calculate memory usage in bytes
     #[inline]
     pub fn memory_usage(&self) -> usize {
-        let num_fragments = self.num_fragments as usize;
-        let num_files = self.num_files as usize;
+        let num_fragments     = self.num_fragments as usize;
+        let num_files         = self.num_files as usize;
 
-        let fragments_size = num_fragments * size_of::<u32>();
-        let file_keys_size = num_files * size_of::<FileKey>();
-        let file_metas_size = num_files * size_of::<FileMeta>();
+        let fragments_size    = num_fragments * size_of::<u32>();
+        let file_keys_size    = num_files * size_of::<FileKey>();
+        let file_metas_size   = num_files * size_of::<FileMeta>();
 
-        let bits_per_file = num_fragments.div_ceil(64) * 64;
+        let bits_per_file     = num_fragments.div_ceil(64) * 64;
         let file_bitsets_size = num_files * (bits_per_file / 8);
 
-        let lookup_size = self.file_lookup.len() * size_of::<AtomicU32>();
+        let lookup_size       = self.file_lookup.len() * size_of::<AtomicU32>();
 
         fragments_size + file_keys_size + file_metas_size + file_bitsets_size + lookup_size
     }
@@ -1497,9 +1499,9 @@ impl<S: CacheStorage> FragmentCache<S> {
         fragment_hashes: &[u32],
         fragment_presence: &[u64],
     ) -> BatchPlan {
-        let num_fragments = self.num_fragments as usize;
+        let num_fragments     = self.num_fragments as usize;
         let bits_per_file_u64 = num_fragments.div_ceil(64).max(1);
-        let words_per_file = fragment_hashes.len().div_ceil(64);
+        let words_per_file    = fragment_hashes.len().div_ceil(64);
 
         //
         // Resolve fragments once, shared across every file below.
@@ -1525,7 +1527,7 @@ impl<S: CacheStorage> FragmentCache<S> {
         let mut changed = has_new_fragment;
 
         for file_index in 0..file_keys.len() {
-            let file_key = file_keys[file_index];
+            let file_key  = file_keys[file_index];
             let file_meta = file_metas[file_index];
 
             let existing_id = self.lookup_file_id(file_key);
@@ -1556,12 +1558,12 @@ impl<S: CacheStorage> FragmentCache<S> {
 
                 for (frag_i, frag_plan) in frags.iter().enumerate() {
                     // has_new_fragment is false here, so this is always Some.
-                    let frag_index = frag_plan.existing_index.unwrap() as usize;
-                    let is_present = (presence[frag_i / 64] & (1 << (frag_i % 64))) != 0;
+                    let frag_index     = frag_plan.existing_index.unwrap() as usize;
+                    let is_present     = (presence[frag_i / 64] & (1 << (frag_i % 64))) != 0;
                     let expect_bit_set = !is_present;
 
-                    let u64_index = offset + (frag_index >> 6);
-                    let bit_index = frag_index & 63;
+                    let u64_index      = offset + (frag_index >> 6);
+                    let bit_index      = frag_index & 63;
                     let actual_bit_set = (self.file_bitsets.get(u64_index) & (1u64 << bit_index)) != 0;
 
                     if actual_bit_set != expect_bit_set {
@@ -1711,8 +1713,8 @@ impl<S: CacheStorage> FragmentCache<S> {
         //
         //
 
-        let num_fragments = self.num_fragments as usize;
-        let bits_per_file_u64 = num_fragments.div_ceil(64).max(1);
+        let num_fragments      = self.num_fragments as usize;
+        let bits_per_file_u64  = num_fragments.div_ceil(64).max(1);
         let owned_file_bitsets = self.owned_file_bitsets.as_mut().unwrap();
 
         for (file_id, fragment_data, needs_full_reset) in file_updates {
@@ -1815,12 +1817,14 @@ impl<S: CacheStorage> FragmentCache<S> {
         let mut packed = Vec::with_capacity(file_keys.len() * words_per_file);
         for file_index in 0..file_keys.len() {
             let row = &fragment_presence[file_index * fragment_count..(file_index + 1) * fragment_count];
+
             let mut words = vec![0u64; words_per_file];
             for (frag_index, &present) in row.iter().enumerate() {
                 if present {
                     words[frag_index / 64] |= 1u64 << (frag_index % 64);
                 }
             }
+
             packed.extend_from_slice(&words);
         }
 

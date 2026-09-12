@@ -4,7 +4,7 @@ use crate::{tracy, util};
 use crate::util::{likely, unlikely, read_u16_unaligned_le, read_u32_unaligned_le, read_u8_unaligned};
 use crate::grep::{AnyNodeScratch, AnyNodeCache, NodeCacheStats};
 use crate::parser::{BufFatPtr, BufKind, FileId, FileNode, FileType, Parser, RawFs, binary_probe, FastDivU32};
-use crate::worker::STREAMING_CHUNK_SIZE;
+use crate::worker::{STREAMING_CHUNK_SIZE, PendingSubdir};
 
 use super::*;
 
@@ -42,6 +42,8 @@ pub struct Ext4Fs {
 }
 
 impl FileNode for Ext4Inode {
+    const POISONED: Self = Self::POISONED;
+
     #[inline(always)]
     fn file_id(&self) -> FileId {
         self.inode_num
@@ -88,48 +90,66 @@ impl RawFs for Ext4Fs {
         EXT4_ROOT_INODE as FileId
     }
 
-    #[inline]
+    #[inline(always)]
+    fn parse_node_cached(
+        &self,
+        file_id: FileId,
+        cache: &mut InodeBlockCache
+    ) -> (io::Result<Ext4Inode>, NodeCacheStats) {
+        let inode_num = file_id as INodeNum;
+        if unlikely(inode_num == 0) {
+            return (
+                Err(io::Error::new(io::ErrorKind::InvalidInput, "Invalid inode number 0")),
+                NodeCacheStats::default()
+            );
+        }
+
+        let block_size = self.sb.block_size as u64;
+        let inode_size = self.sb.inode_size as usize;
+
+        let inode_offset = self.inode_disk_offset(file_id);
+        let block_start  = (inode_offset / block_size) * block_size;
+
+        let mut stats = NodeCacheStats::default();
+
+        if block_start != cache.block_start {
+            stats.misses = 1;
+
+            let read_len = (block_size as usize).min(cache.buf.len());
+            if let Err(e) = self.read_at_offset(&mut cache.buf[..read_len], block_start) {
+                return (Err(e), stats);
+            }
+
+            cache.block_start = block_start;
+        } else {
+            stats.hits = 1;
+        }
+
+        let in_block = (inode_offset - block_start) as usize;
+        let end = (in_block + inode_size).min(cache.buf.len());
+        (Self::decode_inode(inode_num as u64, &cache.buf[in_block..end], self.sb.inode_size), stats)
+    }
+
+    #[inline(always)]
     fn parse_nodes_batch(
         &self,
         entries: &[(FileId, BufFatPtr)],
         cache: &mut InodeBlockCache,
-        out: &mut Vec<io::Result<Ext4Inode>>,
+        out: &mut Vec<Ext4Inode>,
     ) -> NodeCacheStats {
-        let block_size = self.sb.block_size as u64;
-        let inode_size = self.sb.inode_size as usize;
-
-        let mut stats = NodeCacheStats::default();
+        let mut total = NodeCacheStats::default();
 
         for &(file_id, _) in entries {
-            let inode_num = file_id as INodeNum;
-            if unlikely(inode_num == 0) {
-                out.push(Err(io::Error::new(io::ErrorKind::InvalidInput, "Invalid inode number 0")));
-                continue;
-            }
+            let (node_result, stats) = self.parse_node_cached(file_id, cache);
 
-            let inode_offset = self.inode_disk_offset(file_id);
-            let block_start = (inode_offset / block_size) * block_size;
+            let node = match node_result { Ok(node) => node, Err(_) => Ext4Inode::POISONED };
+            out.push(node);
 
-            if block_start != cache.block_start {
-                stats.misses += 1;
-
-                let read_len = (block_size as usize).min(cache.buf.len());
-                if let Err(e) = self.read_at_offset(&mut cache.buf[..read_len], block_start) {
-                    out.push(Err(e));  // @Speed: How much of these actually out there?... We most likely just should return the first error.
-                    continue;
-                }
-
-                cache.block_start = block_start;
-            } else {
-                stats.hits += 1;
-            }
-
-            let in_block = (inode_offset - block_start) as usize;
-            let end = (in_block + inode_size).min(cache.buf.len());
-            out.push(Self::decode_inode(inode_num as u64, &cache.buf[in_block..end], self.sb.inode_size));
+            total.hits += stats.hits;
+            total.misses += stats.misses;
         }
 
-        stats
+        total
     }
 
     #[inline]
@@ -154,6 +174,11 @@ impl RawFs for Ext4Fs {
         eprintln!("{}", entries.len());
 
         entries.sort_unstable_by_key(|(file_id, _)| self.inode_disk_offset(*file_id));
+    }
+
+    #[inline(always)]
+    fn sort_subdirs_by_offset(&self, subdirs: &mut [PendingSubdir]) {
+        subdirs.sort_unstable_by_key(|subdir| self.inode_disk_offset(subdir.file_id));
     }
 
     #[inline]
@@ -492,7 +517,7 @@ impl RawFs for Ext4Fs {
     }
 
     #[inline]
-    fn take_node_scratch(&self, shared: &mut AnyNodeScratch) -> Vec<io::Result<Ext4Inode>> {
+    fn take_node_scratch(&self, shared: &mut AnyNodeScratch) -> Vec<Ext4Inode> {
         match std::mem::replace(shared, AnyNodeScratch::Ext4(Vec::new())) {
             AnyNodeScratch::Ext4(v) => v,
             _ => Vec::new(), // Last job on this thread was a different FS...
@@ -508,7 +533,7 @@ impl RawFs for Ext4Fs {
     }
 
     #[inline]
-    fn erase_node_scratch(&self, scratch: Vec<io::Result<Ext4Inode>>) -> AnyNodeScratch { AnyNodeScratch::Ext4(scratch) }
+    fn erase_node_scratch(&self, scratch: Vec<Ext4Inode>) -> AnyNodeScratch { AnyNodeScratch::Ext4(scratch) }
 
     #[inline]
     fn erase_node_cache(&self, cache: InodeBlockCache) -> AnyNodeCache { AnyNodeCache::Ext4(cache) }
@@ -710,6 +735,7 @@ impl Ext4Fs {
     }
 
     /// Decode one inode from a byte slice already containing its raw record.
+    #[inline]
     fn decode_inode(inode_num: u64, mode_flags_src: &[u8], inode_size_field: u16) -> io::Result<Ext4Inode> {
         let raw_size = mem::size_of::<raw::Ext4Inode>().min(mode_flags_src.len());
         let raw = bytemuck::try_from_bytes::<raw::Ext4Inode>(  // @Speed

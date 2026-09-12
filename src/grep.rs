@@ -143,7 +143,6 @@ impl<S: MatchSink> RawGrepper<Ext4Fs, S> {
         unsafe {
             use std::os::fd::AsRawFd;
             libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_SEQUENTIAL);
-            libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_WILLNEED);
         }
 
         //
@@ -387,9 +386,9 @@ pub struct NodeCacheStats {
 }
 
 pub enum AnyNodeScratch {
-    Ext4(Vec<io::Result<Ext4Inode>>),
-    Apfs(Vec<io::Result<ApfsInode>>),
-    Ntfs(Vec<io::Result<NtfsInode>>),
+    Ext4(Vec<Ext4Inode>),
+    Apfs(Vec<ApfsInode>),
+    Ntfs(Vec<NtfsInode>),
 }
 
 pub enum AnyNodeCache {

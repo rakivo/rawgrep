@@ -76,6 +76,10 @@ pub struct Ext4Inode {
     pub blocks: [u32; 15],
 }
 
+impl Ext4Inode {
+    pub const POISONED: Self = unsafe { core::mem::zeroed() };
+}
+
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 #[repr(C)]
 pub struct Ext4Extent {

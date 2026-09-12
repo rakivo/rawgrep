@@ -408,10 +408,10 @@ impl PathArena {
 
 #[derive(Copy, Clone)]
 pub struct PendingSubdir {
-    file_id:    FileId,
-    path_start: u32,
-    path_len:   u16,
-    depth:      u16,
+    pub file_id:    FileId,
+    pub path_start: u32,
+    pub path_len:   u16,
+    pub depth:      u16,
 }
 
 /// Bitset of fragment presence, row-major: row `i` = fragments found in file `i`.
@@ -521,7 +521,7 @@ pub struct WorkerCtx<'a, F: RawFs, S: MatchSink> {
     pub      path_buf:      Box<SmallPathBuf>,  // 8
     pub      swap_path_buf: Box<SmallPathBuf>,  // 8
 
-    pub node_scratch:       Vec<io::Result<F::Node>>,
+    pub node_scratch:       Vec<F::Node>,
     pub node_cache:         F::NodeCache,
 
     pub batch_size_cached:  u32,
@@ -644,7 +644,10 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
 
     #[inline]
     pub fn dispatch_file(&mut self, work: FileWork) -> io::Result<()> {
-        let Ok(node) = self.fs.parse_node(work.file_id) else {
+        let (result, cache_stats) = self.fs.parse_node_cached(work.file_id, &mut self.node_cache);
+        self.stats.node_cache_hits   += cache_stats.hits;
+        self.stats.node_cache_misses += cache_stats.misses;
+        let Ok(node) = result else {
             return Ok(());
         };
 
@@ -675,7 +678,10 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
         self.path_buf.clear();
         self.path_buf.extend_from_slice(self.path_arena.slice(path_start, path_end));
 
-        let Ok(node) = self.fs.parse_node(file_id) else {
+        let (result, cache_stats) = self.fs.parse_node_cached(file_id, &mut self.node_cache);
+        self.stats.node_cache_hits   += cache_stats.hits;
+        self.stats.node_cache_misses += cache_stats.misses;
+        let Ok(node) = result else {
             return Ok(());
         };
 
@@ -755,9 +761,10 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
                     // Unknown - parse node to get the type...
                     //
 
-                    let Ok(child_node) = self.fs.parse_node(entry.file_id) else {
-                        continue
-                    };
+                    let (child_result, cache_stats) = self.fs.parse_node_cached(entry.file_id, &mut self.node_cache);
+                    self.stats.node_cache_hits   += cache_stats.hits;
+                    self.stats.node_cache_misses += cache_stats.misses;
+                    let Ok(child_node) = child_result else { continue };
 
                     if child_node.is_dir() { FileType::Dir } else { FileType::File }
                 }
@@ -858,6 +865,13 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
             }
         }
 
+        //
+        // Sort subdirs by disk offset, same rationale as the file sort above --
+        // makes the local half (below) a contiguous cache-friendly run,
+        // and gives the queued half a better starting order too.
+        //
+        self.fs.sort_subdirs_by_offset(unsafe { self.subdirs_arena.get_unchecked_mut(subdir_mark..) });
+
         let n = self.subdirs_arena.len() - subdir_mark;
         let keep_local = work_distribution_strategy(depth, n);
         let queue_start = subdir_mark + keep_local;
@@ -924,9 +938,10 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
 
         let mut nodes = std::mem::take(&mut self.node_scratch);
 
-        for (i, node_result) in (start_files..end_files).zip(nodes.drain(..)) {
+        for (i, node) in (start_files..end_files).zip(nodes.drain(..)) {
+            if node.file_id() == 0 { continue; }  // Poisoned...
+
             let (_, name_fat_ptr) = *unsafe { self.file_entries_arena.get_unchecked(i) };
-            let Ok(node) = node_result else { continue };
 
             self.process_file(&node, name_fat_ptr, parent_path, gitignore_chain)?;
 

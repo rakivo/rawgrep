@@ -132,6 +132,10 @@ pub struct ApfsInode {
     pub flags: u64,
 }
 
+impl ApfsInode {
+    pub const POISONED: Self = unsafe { core::mem::zeroed() };
+}
+
 pub mod raw {
     use bytemuck::{Pod, Zeroable};
 

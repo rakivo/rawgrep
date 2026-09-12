@@ -27,6 +27,8 @@ pub struct NtfsFs {
 }
 
 impl FileNode for NtfsInode {
+    const POISONED: Self = Self::POISONED;
+
     #[inline(always)]
     fn file_id(&self) -> FileId { self.record_num }
 
@@ -49,6 +51,16 @@ impl RawFs for NtfsFs {
     #[inline(always)] fn block_size(&self) -> u32 { self.sb.cluster_size }
     #[inline(always)] fn device_file(&self) -> &File { &self.file }
     #[inline(always)] fn root_id(&self) -> FileId { NTFS_ROOT_DIR_RECORD }
+
+    #[inline]
+    fn parse_node_cached(
+        &self,
+        file_id: FileId,
+        _cache: &mut Self::NodeCache
+    ) -> (io::Result<Self::Node>, crate::grep::NodeCacheStats)
+    {
+        (self.parse_node(file_id), Default::default()) // @Incomplete
+    }
 
     #[inline]
     fn parse_node(&self, file_id: FileId) -> io::Result<Self::Node> {

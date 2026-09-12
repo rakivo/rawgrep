@@ -52,6 +52,8 @@ pub struct ApfsFs {
 // -----------------------------------------------------------------------------
 
 impl FileNode for ApfsInode {
+    const POISONED: Self = Self::POISONED;
+
     #[inline(always)] fn file_id(&self) -> FileId { self.inode_num }
     #[inline(always)] fn size(&self)    -> u64    { self.size }
     #[inline(always)] fn mtime(&self)   -> i64    { self.mtime_sec }
@@ -71,6 +73,16 @@ impl RawFs for ApfsFs {
     #[inline(always)] fn device_file(&self) -> &File { &self.file }
     #[inline(always)] fn block_size(&self) -> u32 { self.sb.block_size }
     #[inline(always)] fn root_id(&self)    -> FileId { APFS_ROOT_DIR_INO_NUM }
+
+    #[inline]
+    fn parse_node_cached(
+        &self,
+        file_id: FileId,
+        _cache: &mut Self::NodeCache
+    ) -> (io::Result<Self::Node>, crate::grep::NodeCacheStats)
+    {
+        (self.parse_node(file_id), Default::default()) // @Incomplete
+    }
 
     fn parse_node(&self, file_id: FileId) -> io::Result<Self::Node> {
         let _span = tracy::span!("ApfsFs::parse_node");
