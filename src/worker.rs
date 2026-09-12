@@ -10,7 +10,7 @@ use crate::cache::{FileKey, FileMeta, FragmentCache};
 use crate::slab::{OutputSlab, SlotWriter, OwnedOverflow};
 use crate::cli::{should_enable_ansi_coloring, Cli};
 use crate::ignore::{Gitignore, GitignoreChain};
-use crate::matcher::Matcher;
+use crate::matcher::{Matcher, MatcherCache};
 use crate::binary::{is_binary_ext, is_reserved_tool_dir};
 use crate::path_buf::SmallPathBuf;
 use crate::fragments::FragmentLen;
@@ -31,7 +31,6 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use nohash_hasher::IntSet;
 use crossbeam_channel::{Receiver, Sender};
 use parking_lot::{Mutex, Condvar};
-use regex_automata::meta::Cache as MetaCache;
 use crossbeam_deque::{Injector, Steal, Stealer};
 pub use crossbeam_deque::Worker as DequeWorker;
 
@@ -534,7 +533,7 @@ pub struct WorkerCtx<'a, F: RawFs, S: MatchSink> {
     pub pending_file_metas:        Vec<FileMeta>,
     pub pending_fragment_presence: FragmentPresenceBits,
 
-    pub regex_cache:               Option<&'a mut MetaCache>,
+    pub matcher_cache:             Option<&'a mut MatcherCache>,
     pub worker_id:                 u16,
 
     // ----- Cold / output plumbing ----
@@ -1210,7 +1209,7 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
             self.ranges_scratch.clear();
             self.matcher.push_all_matches(
                 buf,
-                self.regex_cache.as_deref_mut(),
+                self.matcher_cache.as_deref_mut(),
                 &mut self.ranges_scratch
             );
 
@@ -1227,7 +1226,7 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
                 let m_start = unsafe { self.ranges_scratch.get_unchecked(i).0 } as usize;
 
                 //
-                // find_matches is expected to return sorted non-overlapping ranges.
+                // the matcher is expected to return sorted non-overlapping ranges.
                 //
                 debug_assert!(
                     m_start >= scan_pos,
@@ -1370,7 +1369,7 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
                 self.ranges_scratch.clear();
                 self.matcher.push_all_matches(
                     line,
-                    self.regex_cache.as_deref_mut(),
+                    self.matcher_cache.as_deref_mut(),
                     &mut self.ranges_scratch
                 );
 
@@ -1521,7 +1520,7 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
             self.ranges_scratch.clear();
             self.matcher.push_all_matches(
                 line,
-                self.regex_cache.as_deref_mut(),
+                self.matcher_cache.as_deref_mut(),
                 &mut self.ranges_scratch
             );
 
@@ -1604,7 +1603,7 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
         let decoded = self.parser.scratch.as_slice();
         self.matcher.push_all_matches(
             decoded,
-            self.regex_cache.as_deref_mut(),
+            self.matcher_cache.as_deref_mut(),
             &mut self.ranges_scratch
         );
         if self.ranges_scratch.is_empty() { return Ok(false); }
@@ -1623,7 +1622,7 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
             let m_start = unsafe { self.ranges_scratch.get_unchecked(i).0 } as usize;
 
             //
-            // find_matches is expected to return sorted non-overlapping ranges.
+            // the matcher is expected to return sorted non-overlapping ranges.
             //
             debug_assert!(
                 m_start >= scan_pos,

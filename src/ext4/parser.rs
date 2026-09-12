@@ -401,6 +401,14 @@ impl RawFs for Ext4Fs {
                     if to_read == 0 { continue; }
                 }
 
+                if let Some(last) = scratch_chunks.last_mut() {
+                    if last.0 + last.1 as u64 == disk_offset {
+                        last.1 += to_read as u32;
+                        total += to_read;
+                        continue;
+                    }
+                }
+
                 crate::parser::push_chunk(scratch_chunks, disk_offset, to_read as _);
                 total += to_read;
             }

@@ -34,6 +34,7 @@ pub mod fragments;
 pub mod platform;
 pub mod slab;
 pub mod thin_path_arc;
+pub mod extractor;
 pub mod liner;
 pub mod logger;
 
