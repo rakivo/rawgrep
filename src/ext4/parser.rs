@@ -2,6 +2,7 @@
 
 use crate::{tracy, util};
 use crate::util::{likely, unlikely, read_u16_unaligned_le, read_u32_unaligned_le, read_u8_unaligned};
+use crate::grep::{AnyNodeScratch, AnyNodeCache, NodeCacheStats};
 use crate::parser::{BufFatPtr, BufKind, FileId, FileNode, FileType, Parser, RawFs, binary_probe, FastDivU32};
 use crate::worker::STREAMING_CHUNK_SIZE;
 
@@ -12,6 +13,23 @@ use std::os::fd::AsRawFd;
 use std::fs::File;
 use std::{io, mem};
 use std::ops::ControlFlow;
+
+pub struct InodeBlockCache {
+    pub buf: Box<[u8; 8192]>,
+    pub block_start: u64, // u64::MAX = empty
+}
+
+impl Default for InodeBlockCache {
+    fn default() -> Self {
+        Self {
+            buf: {
+                let b: Box<std::mem::MaybeUninit<_>> = Box::new_uninit();
+                unsafe { b.assume_init() } // buf is only ever written before being read
+            },
+            block_start: u64::MAX,
+        }
+    }
+}
 
 /// Ext4 filesystem context
 pub struct Ext4Fs {
@@ -48,6 +66,7 @@ impl FileNode for Ext4Inode {
 impl RawFs for Ext4Fs {
     type Node = Ext4Inode;
     type Context<'b> = &'b Self where Self: 'b;
+    type NodeCache = InodeBlockCache;
 
     #[inline(always)]
     fn device_id(&self) -> u64 {
@@ -70,69 +89,63 @@ impl RawFs for Ext4Fs {
     }
 
     #[inline]
-    fn parse_node(&self, file_id: FileId) -> io::Result<Self::Node> {
-        let _span = tracy::span!("Ext4Fs::parse_node");
+    fn parse_nodes_batch(
+        &self,
+        entries: &[(FileId, BufFatPtr)],
+        cache: &mut InodeBlockCache,
+        out: &mut Vec<io::Result<Ext4Inode>>,
+    ) -> NodeCacheStats {
+        let block_size = self.sb.block_size as u64;
+        let inode_size = self.sb.inode_size as usize;
 
-        let inode_num = file_id as INodeNum;
+        let mut stats = NodeCacheStats::default();
 
-        if unlikely(inode_num == 0) {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "Invalid inode number 0"));
+        for &(file_id, _) in entries {
+            let inode_num = file_id as INodeNum;
+            if unlikely(inode_num == 0) {
+                out.push(Err(io::Error::new(io::ErrorKind::InvalidInput, "Invalid inode number 0")));
+                continue;
+            }
+
+            let inode_offset = self.inode_disk_offset(file_id);
+            let block_start = (inode_offset / block_size) * block_size;
+
+            if block_start != cache.block_start {
+                stats.misses += 1;
+
+                let read_len = (block_size as usize).min(cache.buf.len());
+                if let Err(e) = self.read_at_offset(&mut cache.buf[..read_len], block_start) {
+                    out.push(Err(e));  // @Speed: How much of these actually out there?... We most likely just should return the first error.
+                    continue;
+                }
+
+                cache.block_start = block_start;
+            } else {
+                stats.hits += 1;
+            }
+
+            let in_block = (inode_offset - block_start) as usize;
+            let end = (in_block + inode_size).min(cache.buf.len());
+            out.push(Self::decode_inode(inode_num as u64, &cache.buf[in_block..end], self.sb.inode_size));
         }
+
+        stats
+    }
+
+    #[inline]
+    fn parse_node(&self, file_id: FileId) -> io::Result<Ext4Inode> {
+        let _span = tracy::span!("Ext4Fs::parse_node");
 
         let inode_offset = self.inode_disk_offset(file_id);
 
-        let mut inode_buf = std::mem::MaybeUninit::<[u8; 256]>::uninit();  // Ext4 inode_size is 128 or 256 in virtually all real deployments
-        let inode_buf = unsafe {
-            std::slice::from_raw_parts_mut(inode_buf.as_mut_ptr() as *mut u8, self.sb.inode_size as usize)
+        let mut buf = std::mem::MaybeUninit::<[u8; 256]>::uninit();
+        let buf = unsafe {
+            std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u8, self.sb.inode_size as usize)
         };
 
-        debug_assert!(self.sb.inode_size as usize <= inode_buf.len());
+        self.read_at_offset(buf, inode_offset as _)?;
 
-        let inode_size = self.sb.inode_size as usize;
-        let to_read = inode_size.min(inode_buf.len());
-        let inode_buf_to_read = unsafe { inode_buf.get_unchecked_mut(..to_read) };
-        self.read_at_offset(inode_buf_to_read, inode_offset as _)?;          // @Cache @Syscall
-
-        let raw_inode_buf_to_read = unsafe {
-            inode_buf.get_unchecked(..std::mem::size_of::<raw::Ext4Inode>().min(to_read))
-        };
-        let raw = bytemuck::try_from_bytes::<raw::Ext4Inode>(
-            raw_inode_buf_to_read
-        ).map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid inode data"))?;
-
-        let mode      = u16::from_le(raw.mode);
-        let size_low  = u32::from_le(raw.size_lo);
-        let flags     = u32::from_le(raw.flags);
-        let mtime_sec = u32::from_le(raw.mtime) as i64;
-
-        let size_high = if self.sb.inode_size > 128 {
-            u32::from_le(raw.size_high)
-        } else {
-            0
-        };
-
-        let size = ((size_high as u64) << 32) | (size_low as u64);
-
-        #[cfg(target_endian = "little")]
-        let blocks: [u32; 15] = bytemuck::cast(raw.block);
-
-        #[cfg(target_endian = "big")]
-        let blocks: [u32; 15] = {
-            let raw_block = [raw.block];
-            let block_bytes = util::cast_slice::<[[u8; 12]; 5], u8>(&raw_block);
-
-            let as_u32: &[u32] = util::cast_slice(block_bytes);
-            std::array::from_fn(|i| u32::from_le(as_u32[i]))
-        };
-
-        Ok(Ext4Inode {
-            inode_num: inode_num as u64,
-            mode,
-            size,
-            flags,
-            mtime_sec,
-            blocks,
-        })
+        Self::decode_inode(file_id as u64, buf, self.sb.inode_size)
     }
 
     #[inline(always)]
@@ -477,6 +490,28 @@ impl RawFs for Ext4Fs {
         const MIN_ENTRY: usize = 12;
         buf.len() / MIN_ENTRY
     }
+
+    #[inline]
+    fn take_node_scratch(&self, shared: &mut AnyNodeScratch) -> Vec<io::Result<Ext4Inode>> {
+        match std::mem::replace(shared, AnyNodeScratch::Ext4(Vec::new())) {
+            AnyNodeScratch::Ext4(v) => v,
+            _ => Vec::new(), // Last job on this thread was a different FS...
+        }
+    }
+
+    #[inline]
+    fn take_node_cache(&self, shared: &mut AnyNodeCache) -> InodeBlockCache {
+        match std::mem::replace(shared, AnyNodeCache::Ext4(InodeBlockCache::default())) {
+            AnyNodeCache::Ext4(c) => c,
+            _ => InodeBlockCache::default(),
+        }
+    }
+
+    #[inline]
+    fn erase_node_scratch(&self, scratch: Vec<io::Result<Ext4Inode>>) -> AnyNodeScratch { AnyNodeScratch::Ext4(scratch) }
+
+    #[inline]
+    fn erase_node_cache(&self, cache: InodeBlockCache) -> AnyNodeCache { AnyNodeCache::Ext4(cache) }
 }
 
 // ext4-specific helper methods
@@ -672,5 +707,39 @@ impl Ext4Fs {
         }
 
         Ok(())
+    }
+
+    /// Decode one inode from a byte slice already containing its raw record.
+    fn decode_inode(inode_num: u64, mode_flags_src: &[u8], inode_size_field: u16) -> io::Result<Ext4Inode> {
+        let raw_size = mem::size_of::<raw::Ext4Inode>().min(mode_flags_src.len());
+        let raw = bytemuck::try_from_bytes::<raw::Ext4Inode>(  // @Speed
+            &mode_flags_src[..raw_size]
+        ).map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid inode data"))?;
+
+        let mode      = u16::from_le(raw.mode);
+        let size_low  = u32::from_le(raw.size_lo);
+        let flags     = u32::from_le(raw.flags);
+        let mtime_sec = u32::from_le(raw.mtime) as i64;
+
+        let size_high = if inode_size_field > 128 {
+            u32::from_le(raw.size_high)
+        } else {
+            0
+        };
+
+        let size = ((size_high as u64) << 32) | (size_low as u64);
+
+        #[cfg(target_endian = "little")]
+        let blocks: [u32; 15] = bytemuck::cast(raw.block);
+
+        #[cfg(target_endian = "big")]
+        let blocks: [u32; 15] = {
+            let raw_block = [raw.block];
+            let block_bytes = util::cast_slice::<[[u8; 12]; 5], u8>(&raw_block);
+            let as_u32: &[u32] = util::cast_slice(block_bytes);
+            std::array::from_fn(|i| u32::from_le(as_u32[i]))
+        };
+
+        Ok(Ext4Inode { inode_num, mode, size, flags, mtime_sec, blocks })
     }
 }

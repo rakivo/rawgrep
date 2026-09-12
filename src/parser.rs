@@ -1,4 +1,5 @@
 use crate::tracy;
+use crate::grep::{AnyNodeCache, AnyNodeScratch, NodeCacheStats};
 use crate::binary::{is_binary_chunk, is_dot_entry, is_hidden_entry};
 use crate::worker::BINARY_PROBE_BYTE_SIZE;
 use crate::cli::BufferConfig;
@@ -52,6 +53,7 @@ pub trait FileNode: Copy {
 pub trait RawFs: Sync + Send {
     /// Filesystem-specific file node type (e.g., Ext4Inode)
     type Node: FileNode;
+    type NodeCache: Default;
 
     /// Filesystem-specific context (e.g., superblock + mmap reference)
     type Context<'a>: Copy where Self: 'a;
@@ -71,6 +73,17 @@ pub trait RawFs: Sync + Send {
 
     /// Root file ID
     fn root_id(&self) -> FileId;
+
+    // @Incomplete
+    fn parse_nodes_batch(
+        &self,
+        entries: &[(FileId, BufFatPtr)],
+        _cache:  &mut Self::NodeCache,
+        out:     &mut Vec<io::Result<Self::Node>>,
+    ) -> NodeCacheStats {
+        out.extend(entries.iter().map(|&(id, _)| self.parse_node(id)));
+        NodeCacheStats { hits: 0, misses: entries.len() as u32 }
+    }
 
     /// Parse file node by ID
     fn parse_node(&self, file_id: FileId) -> io::Result<Self::Node>;
@@ -111,6 +124,11 @@ pub trait RawFs: Sync + Send {
     ) -> Option<R>;
 
     fn directory_entry_count_hint(&self, buf: &[u8]) -> usize;
+
+    fn take_node_scratch(&self,  _shared: &mut AnyNodeScratch)          -> Vec<io::Result<Self::Node>> { Default::default() } // @Incomplete
+    fn take_node_cache(&self,    _shared: &mut AnyNodeCache)            -> Self::NodeCache { Default::default() } // @Incomplete
+    fn erase_node_scratch(&self, _scratch: Vec<io::Result<Self::Node>>) -> AnyNodeScratch { Default::default() } // @Incomplete
+    fn erase_node_cache(&self,   _cache: Self::NodeCache)               -> AnyNodeCache { Default::default() } // @Incomplete
 }
 
 /// Result of scanning directory entries
@@ -125,20 +143,20 @@ pub struct DirScanResult {
 pub struct Parser {
     pub dont_skip_dot_entries: bool,
 
-    pub file:      Vec<u8>,                // 0
+    pub file:           Vec<u8>,                // 0
 
     // Filesystem-specific scratch space
-    pub scratch:   Vec<u8>,                // 24
-    pub scratch2:  Vec<u8>,                // 48
-    pub scratch3:  Vec<u64>,               // 48
+    pub scratch:        Vec<u8>,                // 24
+    pub scratch2:       Vec<u8>,                // 48
+    pub scratch3:       Vec<u64>,               // 48
 
     // =============== Cache line ======================
 
-    pub dir:       Vec<u8>,                // 72
-    pub gitignore: Vec<u8>,                // 96
-    pub chunk:     Vec<u8>,
+    pub dir:            Vec<u8>,                // 72
+    pub gitignore:      Vec<u8>,                // 96
+    pub chunk:          Vec<u8>,
 
-    pub scratch_chunks:  Vec<(u64, u32)>,
+    pub scratch_chunks: Vec<(u64, u32)>,
 }
 
 impl Parser {

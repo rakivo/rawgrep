@@ -9,6 +9,7 @@ use crate::pacer::FlushPacer;
 use crate::cache::{FileKey, FileMeta, FragmentCache};
 use crate::slab::{OutputSlab, SlotWriter, OwnedOverflow};
 use crate::cli::{should_enable_ansi_coloring, Cli};
+use crate::grep::{AnyNodeScratch, AnyNodeCache};
 use crate::ignore::{Gitignore, GitignoreChain};
 use crate::matcher::{Matcher, MatcherCache};
 use crate::binary::{is_binary_ext, is_reserved_tool_dir};
@@ -484,6 +485,9 @@ pub struct WorkerResult {
     pub       line_ranges_scratch: Vec<(u32, u32)>,
     pub fragment_presence_scratch: Vec<u64>,
 
+    pub node_scratch: AnyNodeScratch,
+    pub node_cache:   AnyNodeCache,
+
     pub         path_arena: PathArena,
     pub file_entries_arena: FileEntryArena,
     pub      subdirs_arena: SubdirsArena,
@@ -516,6 +520,9 @@ pub struct WorkerCtx<'a, F: RawFs, S: MatchSink> {
 
     pub      path_buf:      Box<SmallPathBuf>,  // 8
     pub      swap_path_buf: Box<SmallPathBuf>,  // 8
+
+    pub node_scratch:       Vec<io::Result<F::Node>>,
+    pub node_cache:         F::NodeCache,
 
     pub batch_size_cached:  u32,
     pub check_mask:         usize,
@@ -557,6 +564,8 @@ impl<'a, F: RawFs, S: MatchSink> WorkerCtx<'a, F, S> {
             stats: self.stats,
             entries_arena: self.entries_arena,
             parser: self.parser,
+            node_scratch: self.fs.erase_node_scratch(self.node_scratch),
+            node_cache:   self.fs.erase_node_cache(self.node_cache),
             path_arena: self.path_arena,
             file_entries_arena: self.file_entries_arena,
             swap_path_buf: self.swap_path_buf,
@@ -903,12 +912,21 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
     ) -> io::Result<()> {
         let _span = tracy::span!("process_files");
 
-        for i in start_files..end_files {
-            let (file_id, name_fat_ptr) = *unsafe { self.file_entries_arena.get_unchecked(i) };
+        self.node_scratch.clear();
+        let batch_stats = self.fs.parse_nodes_batch(
+            unsafe { self.file_entries_arena.get_unchecked(start_files..end_files) },
+            &mut self.node_cache,
+            &mut self.node_scratch
+        );
 
-            let Ok(node) = self.fs.parse_node(file_id) else {
-                continue;
-            };
+        self.stats.node_cache_hits   += batch_stats.hits;
+        self.stats.node_cache_misses += batch_stats.misses;
+
+        let mut nodes = std::mem::take(&mut self.node_scratch);
+
+        for (i, node_result) in (start_files..end_files).zip(nodes.drain(..)) {
+            let (_, name_fat_ptr) = *unsafe { self.file_entries_arena.get_unchecked(i) };
+            let Ok(node) = node_result else { continue };
 
             self.process_file(&node, name_fat_ptr, parent_path, gitignore_chain)?;
 
@@ -926,6 +944,8 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
                 self.flush_output();
             }
         }
+
+        self.node_scratch = nodes;
 
         Ok(())
     }

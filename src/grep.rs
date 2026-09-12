@@ -2,10 +2,10 @@ use std::path::{MAIN_SEPARATOR, MAIN_SEPARATOR_STR};
 use std::io::{self, Seek};
 use std::fs::{File, OpenOptions};
 
-use crate::apfs::{ApfsFs, ApfsVolume, APFS_NX_MAGIC};
+use crate::apfs::{ApfsFs, ApfsVolume, APFS_NX_MAGIC, ApfsInode};
 use crate::cli::Cli;
 use crate::matcher::Matcher;
-use crate::ntfs::NtfsFs;
+use crate::ntfs::{NtfsFs, NtfsInode};
 use crate::fragments::FragmentLen;
 use crate::util::read_at_offset;
 use crate::{Result, Error, tracy};
@@ -13,8 +13,9 @@ use crate::platform::device_id;
 use crate::cache::{CacheConfig, FragmentCache};
 use crate::parser::{BufKind, FileId, FileNode, Parser, RawFs};
 use crate::worker::{MatchSink, NoSink};
+use crate::ext4::parser::InodeBlockCache;
 use crate::ext4::{
-    EXT4_INODE_TABLE_OFFSET, EXT4_MAGIC_OFFSET, EXT4_SUPER_MAGIC, EXT4_SUPERBLOCK_OFFSET, EXT4_SUPERBLOCK_SIZE, Ext4Fs
+    EXT4_INODE_TABLE_OFFSET, EXT4_MAGIC_OFFSET, EXT4_SUPER_MAGIC, EXT4_SUPERBLOCK_OFFSET, EXT4_SUPERBLOCK_SIZE, Ext4Fs, Ext4Inode
 };
 
 use nohash_hasher::IntSet;
@@ -377,6 +378,36 @@ pub fn detect_fs_type(block0: &[u8]) -> Option<FsType> {
     }
 
     None
+}
+
+#[derive(Default, Clone, Copy)]
+pub struct NodeCacheStats {
+    pub hits:   u32,
+    pub misses: u32,
+}
+
+pub enum AnyNodeScratch {
+    Ext4(Vec<io::Result<Ext4Inode>>),
+    Apfs(Vec<io::Result<ApfsInode>>),
+    Ntfs(Vec<io::Result<NtfsInode>>),
+}
+
+pub enum AnyNodeCache {
+    Ext4(InodeBlockCache),
+    Apfs(()),
+    Ntfs(()),
+}
+
+impl Default for AnyNodeScratch {
+    fn default() -> Self {
+        AnyNodeScratch::Ext4(Vec::new()) // arbitrary starting arm -- see take_* fallback
+    }
+}
+
+impl Default for AnyNodeCache {
+    fn default() -> Self {
+        AnyNodeCache::Ext4(InodeBlockCache::default())
+    }
 }
 
 pub enum AnyGrepper<S: MatchSink = NoSink> {

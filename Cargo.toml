@@ -32,7 +32,7 @@ dhat = ["dep:dhat"]
 ignore-oracle-check = ["dep:ignore"]
 profile-sort-lens = []
 
-cache-stats = []
+no-cache-stats = []
 
 [dependencies]
 hyperscan = { version = "0.3", optional = true }

@@ -26,7 +26,7 @@ pub struct NtfsFs {
     pub dont_skip_dot_entries: bool,
 }
 
-impl FileNode for NtfsNode {
+impl FileNode for NtfsInode {
     #[inline(always)]
     fn file_id(&self) -> FileId { self.record_num }
 
@@ -41,8 +41,9 @@ impl FileNode for NtfsNode {
 }
 
 impl RawFs for NtfsFs {
-    type Node = NtfsNode;
+    type Node = NtfsInode;
     type Context<'b> = &'b Self where Self: 'b;
+    type NodeCache = ();
 
     #[inline(always)] fn device_id(&self) -> u64 { self.device_id }
     #[inline(always)] fn block_size(&self) -> u32 { self.sb.cluster_size }
@@ -127,7 +128,7 @@ impl RawFs for NtfsFs {
         _scratch2: &mut Vec<u8>,  // unused for NTFS cuz runlists are decoded inline
         _scratch3: &mut Vec<u64>,
         scratch_chunks: &mut Vec<(u64, u32)>,
-        node: &NtfsNode,
+        node: &NtfsInode,
         max_size: usize,
         check_binary: bool,
         buf: &mut Vec<u8>
@@ -327,7 +328,7 @@ impl NtfsFs {
     }
 
     #[inline]
-    fn read_dir_linearised(&self, node: &NtfsNode, parser: &mut Parser, kind: BufKind) -> io::Result<()> {
+    fn read_dir_linearised(&self, node: &NtfsInode, parser: &mut Parser, kind: BufKind) -> io::Result<()> {
         let _span = tracy::span!("NtfsFs::read_dir_linearised");
 
         let buf = parser.get_buf_mut(kind);
@@ -514,7 +515,7 @@ fn apply_fixups(buf: &mut [u8]) -> io::Result<()> {
 }
 
 #[inline]
-fn parse_mft_record(record: &[u8], record_num: u64) -> io::Result<NtfsNode> {
+fn parse_mft_record(record: &[u8], record_num: u64) -> io::Result<NtfsInode> {
     if record.len() < 48 {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "MFT record too short"));
     }
@@ -538,7 +539,7 @@ fn parse_mft_record(record: &[u8], record_num: u64) -> io::Result<NtfsNode> {
     }
 
     let size = find_data_size(record);
-    Ok(NtfsNode { record_num, flags, size, mtime_sec })
+    Ok(NtfsInode { record_num, flags, size, mtime_sec })
 }
 
 #[inline]

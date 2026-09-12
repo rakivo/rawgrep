@@ -1151,7 +1151,7 @@ impl<S: CacheStorage> FragmentCache<S> {
     ) -> bool {
         let Some(file_id) = self.lookup_file_id(file_key) else {
             // ----- Fast path
-            #[cfg(feature = "cache-stats")] {
+            #[cfg(not(feature = "no-cache-stats"))] {
                 self.stats.misses.fetch_add(1, Ordering::Relaxed);
             }
 
@@ -1175,7 +1175,7 @@ impl<S: CacheStorage> FragmentCache<S> {
         // ------- Validate metadata
         let stored_meta = self.file_metas.get(file_id as usize);
         if unlikely(!stored_meta.matches(file_meta)) {
-            #[cfg(feature = "cache-stats")] {
+            #[cfg(not(feature = "no-cache-stats"))] {
                 self.stats.invalidations.fetch_add(1, Ordering::Relaxed);
                 self.stats.misses.fetch_add(1, Ordering::Relaxed);
             }
@@ -1195,7 +1195,7 @@ impl<S: CacheStorage> FragmentCache<S> {
             let is_absent = (bitset_val & (1u64 << bit_index)) != 0;
 
             if likely(is_absent) {
-                #[cfg(feature = "cache-stats")] {
+                #[cfg(not(feature = "no-cache-stats"))] {
                     self.stats.hits.fetch_add(1, Ordering::Relaxed);
                 }
 
@@ -1203,7 +1203,7 @@ impl<S: CacheStorage> FragmentCache<S> {
             }
         }
 
-        #[cfg(feature = "cache-stats")] {
+        #[cfg(not(feature = "no-cache-stats"))] {
             self.stats.misses.fetch_add(1, Ordering::Relaxed);
         }
 

@@ -65,6 +65,7 @@ impl FileNode for ApfsInode {
 impl RawFs for ApfsFs {
     type Node = ApfsInode;
     type Context<'b> = &'b Self where Self: 'b;
+    type NodeCache = ();
 
     #[inline(always)] fn device_id(&self)  -> u64 { self.device_id }
     #[inline(always)] fn device_file(&self) -> &File { &self.file }

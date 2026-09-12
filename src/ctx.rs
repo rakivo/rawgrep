@@ -3,13 +3,14 @@ use crate::pacer::FlushPacer;
 use crate::error::Error;
 use crate::slab::{SlotPool, SlotWriter};
 use crate::RawGrepConfig;
+use crate::parser::RawFs;
 use crate::path_buf::SmallPathBuf;
 use crate::stdout::{RawStdout, OutputKind};
 use crate::{cli, ignore, platform, CursorHide};
 use crate::parser::Parser;
 use crate::cache::{FileKey, FileMeta, CacheStats};
 use crate::stats::{AtomicStats, Stats};
-use crate::grep::{AnyGrepper, FsType, RawGrepper, open_device_and_detect_fs};
+use crate::grep::{AnyGrepper, FsType, RawGrepper, open_device_and_detect_fs, AnyNodeScratch, AnyNodeCache};
 use crate::worker::{DirWork, FileWork, MatchSink, OutputWorker, WorkItem, WorkerCtx, PathArena, FileEntryArena, SubdirsArena, FragmentPresenceBits, OutputMessage, EntriesArena};
 
 use std::fs;
@@ -343,6 +344,9 @@ fn worker_thread_main<S: MatchSink + 'static>(
     let mut entries_arena             = EntriesArena::new();
     let mut output                    = SlotWriter::new(slot_pool, ctx.output_tx.clone());
 
+    let mut node_scratch              = AnyNodeScratch::default();
+    let mut node_cache                = AnyNodeCache::default();
+
     let mut matcher_cache             = None;
 
     let mut file_keys                 = Vec::new();
@@ -426,6 +430,8 @@ fn worker_thread_main<S: MatchSink + 'static>(
                     swap_path_buf,
                     matcher_cache: matcher_cache.as_mut(),
                     gitignore_enabled: job.gitignore_enabled,
+                    node_scratch: $g.fs().take_node_scratch(&mut node_scratch),
+                    node_cache:   $g.fs().take_node_cache(&mut node_cache),
                     entries_arena,
                     subdirs_arena,
                     newlines_scratch,

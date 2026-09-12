@@ -12,6 +12,8 @@ pub struct Stats {
     pub dirs_encountered: u32,
     pub dirs_skipped_path_too_long: u32,
     pub files_skipped_by_cache: u32,
+    pub node_cache_hits: u32,
+    pub node_cache_misses: u32,
 
     pub time_fragment_presence_checking_took_in_millis: u32,
 
@@ -98,6 +100,10 @@ impl Display for Stats {
         writeln_blue!(f, "\nTimings:")?;
         writeln!(f, "  Fragment Presence Checks: {}ms", self.time_fragment_presence_checking_took_in_millis)?;
 
+        writeln_blue!(f, "\nNode Cache:")?;
+        writeln!(f, "  Node Cache Hits:   {}", self.node_cache_hits)?;
+        writeln!(f, "  Node Cache Misses: {}", self.node_cache_misses)?;
+
         Ok(())
     }
 }
@@ -109,6 +115,8 @@ impl Stats {
         shared.files_searched.fetch_add(self.files_searched as _, Ordering::Relaxed);
         shared.bytes_searched.fetch_add(self.bytes_searched as _, Ordering::Relaxed);
         shared.files_skipped_large.fetch_add(self.files_skipped_large as _, Ordering::Relaxed);
+        shared.node_cache_hits.fetch_add(self.node_cache_hits as _, Ordering::Relaxed);
+        shared.node_cache_misses.fetch_add(self.node_cache_misses as _, Ordering::Relaxed);
         shared.files_skipped_as_binary_due_to_ext.fetch_add(self.files_skipped_as_binary_due_to_ext as _, Ordering::Relaxed);
         shared.files_skipped_as_binary_due_to_probe.fetch_add(self.files_skipped_as_binary_due_to_probe as _, Ordering::Relaxed);
         shared.files_skipped_gitignore.fetch_add(self.files_skipped_gitignore as _, Ordering::Relaxed);
@@ -129,6 +137,8 @@ pub struct AtomicStats {
     pub files_searched: AtomicU64,
     pub files_contained_matches: AtomicU64,
     pub bytes_searched: AtomicU64,
+    pub node_cache_misses: AtomicU64,
+    pub node_cache_hits: AtomicU64,
     pub dirs_encountered: AtomicU64,
     pub dirs_skipped_common: AtomicU64,
     pub dirs_skipped_gitignore: AtomicU64,
@@ -163,6 +173,8 @@ impl AtomicStats {
             dirs_skipped_path_too_long: AtomicU64::new(0),
             files_skipped_large: AtomicU64::new(0),
             files_skipped_as_binary_due_to_ext: AtomicU64::new(0),
+            node_cache_misses: AtomicU64::new(0),
+            node_cache_hits: AtomicU64::new(0),
             files_skipped_as_binary_due_to_probe: AtomicU64::new(0),
             files_skipped_gitignore: AtomicU64::new(0),
             files_skipped_by_cache: AtomicU64::new(0),
@@ -177,6 +189,8 @@ impl AtomicStats {
             time_fragment_presence_checking_took_in_millis: self.time_fragment_presence_checking_took_in_millis.load(Ordering::Relaxed) as _,
             dirs_skipped_path_too_long: self.dirs_skipped_path_too_long.load(Ordering::Relaxed) as _,
             files_encountered: self.files_encountered.load(Ordering::Relaxed) as _,
+            node_cache_hits: self.node_cache_hits.load(Ordering::Relaxed) as _,
+            node_cache_misses: self.node_cache_misses.load(Ordering::Relaxed) as _,
             files_searched: self.files_searched.load(Ordering::Relaxed) as _,
             files_contained_matches: self.files_contained_matches.load(Ordering::Relaxed) as _,
             bytes_searched: self.bytes_searched.load(Ordering::Relaxed) as _,

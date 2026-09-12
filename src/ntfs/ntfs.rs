@@ -104,7 +104,7 @@ impl Display for NtfsSuperBlock {
 
 /// Parsed MFT record / inode equivalent
 #[derive(Clone, Copy)]
-pub struct NtfsNode {
+pub struct NtfsInode {
     pub record_num: MftRecordNum,
     pub flags: u16,
     pub size: u64,          // from $FILE_NAME data size
