@@ -1,0 +1,12 @@
+# Single source of truth for the Rust toolchain: Cargo, rustup,
+# rust-analyzer, and rust-overlay (via Nix) all read this file.
+
+[toolchain]
+channel = "stable"  # or a pinned nightly: "nightly-2026-04-01"
+profile = "default" # includes clippy and rustfmt
+
+# rust-src is CRITICAL on NixOS: rust-analyzer can't find std without it.
+# Add "llvm-tools-preview" if you pull in cargo-llvm-cov.
+components = ["rust-src", "rust-analyzer"]
+
+# targets = ["wasm32-unknown-unknown", "aarch64-unknown-linux-gnu"]
