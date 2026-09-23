@@ -1,68 +1,48 @@
 {
   description = "rawgrep";
 
+  nixConfig = {
+    extra-substituters = [];
+    extra-trusted-public-keys = [];
+  };
+
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-    crane.url = "github:ipetkov/crane";
+
+    flake-parts = {
+      url = "github:hercules-ci/flake-parts";
+      inputs.nixpkgs-lib.follows = "nixpkgs";
+    };
+
+    rust-overlay = {
+      url = "github:oxalica/rust-overlay";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+
+    crane = {
+      url = "github:ipetkov/crane";
+    };
+
+    treefmt-nix = {
+      url = "github:numtide/treefmt-nix";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
-  outputs = {
-    nixpkgs,
-    crane,
-    ...
-  }: let
-    mkRawgrep = system: let
-      pkgs = nixpkgs.legacyPackages.${system};
-      craneLib = crane.mkLib pkgs;
-      src = craneLib.cleanCargoSource ./.;
+  outputs = inputs @ {flake-parts, ...}:
+    flake-parts.lib.mkFlake {inherit inputs;} {
+      # Linux only: rawgrep uses posix_fadvise and raw block devices.
+      systems = [
+        "x86_64-linux"
+        "aarch64-linux"
+      ];
 
-      commonArgs = {
-        inherit src;
-        strictDeps = true;
-        buildInputs = [];
-      };
-
-      cargoArtifacts = craneLib.buildDepsOnly commonArgs;
-    in
-      craneLib.buildPackage (commonArgs
-        // {
-          inherit cargoArtifacts;
-          meta = with pkgs.lib; {
-            description = "Grep at the speed of raw disk";
-            homepage = "https://github.com/rakivo/rawgrep";
-            license = licenses.mit;
-            maintainers = [];
-          };
-        });
-  in {
-    packages.x86_64-linux.default = mkRawgrep "x86_64-linux";
-    packages.aarch64-linux.default = mkRawgrep "aarch64-linux";
-
-    devShells.x86_64-linux.default = let
-      pkgs = nixpkgs.legacyPackages.x86_64-linux;
-    in
-      pkgs.mkShell {
-        inputsFrom = [(mkRawgrep "x86_64-linux")];
-        buildInputs = with pkgs; [
-          rustc
-          cargo
-          rust-analyzer
-          rustfmt
-          clippy
-        ];
-      };
-    devShells.aarch64-linux.default = let
-      pkgs = nixpkgs.legacyPackages.aarch64-linux;
-    in
-      pkgs.mkShell {
-        inputsFrom = [(mkRawgrep "aarch64-linux")];
-        buildInputs = with pkgs; [
-          rustc
-          cargo
-          rust-analyzer
-          rustfmt
-          clippy
-        ];
-      };
-  };
+      imports = [
+        inputs.treefmt-nix.flakeModule
+        ./nix/toolchain.nix
+        ./nix/packages.nix
+        ./nix/devshell.nix
+        ./nix/fmt.nix
+      ];
+    };
 }
