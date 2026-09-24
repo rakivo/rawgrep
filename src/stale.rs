@@ -16,6 +16,10 @@
 // written for files that were quiet before this run's sync() (ctime < run_start - KERNEL_THRESHOLD),
 // because for those, whatever we read after dropping is what's final on disk.
 //
+// A memo entry only certifies bytes that were actually re-read after the drop, so it's only
+// written when the drop covered the whole file (max_size >= file_size) -- otherwise a later run
+// reading further into the file would wrongly trust an unverified tail.
+//
 
 use crate::debug;
 use crate::util::likely;
