@@ -25,14 +25,14 @@ use crate::debug;
 use crate::util::likely;
 use crate::parser::FileId;
 use crate::index_::{Index_, IndexMut_};
-use crate::util::{read_u32_unaligned_le, mmap_populate};
+use crate::util::{RawAppend, read_u32_unaligned_le, mmap_populate};
 
 use std::io::Write;
 use std::path::PathBuf;
 use std::fs::OpenOptions;
 use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering::Relaxed};
 
 // Kernel timestamps are coarse and taken separately from ours
 const KERNEL_THRESHOLD_SECS: i64 = 2;
@@ -181,7 +181,6 @@ struct Memo {
     added:  Mutex<Vec<(u32, u32)>>,
     path:   PathBuf,
     header: [u8; HEADER_LEN],
-    reset:  AtomicBool,  // File missing / Other boot / Corrupt: rewrite it on the next save
 }
 
 static MEMO: OnceLock<Memo> = OnceLock::new();
@@ -226,8 +225,6 @@ pub fn init(device_path: &str) {
     let n = boot_id.len().min(BOOT_ID_LEN);
     header.get_mut_(8..8 + n).copy_from_slice(boot_id.as_bytes().get_(..n));
 
-    let mut reset = true;
-
     let known = if let Some(mmap) = mmap_populate(&path) {
         let valid =
                 mmap.len() >= HEADER_LEN
@@ -235,8 +232,6 @@ pub fn init(device_path: &str) {
             && (mmap.len() - HEADER_LEN) % RECORD_LEN == 0;
 
         if likely(valid) {
-            reset = false;
-
             let record_count = (mmap.len() - HEADER_LEN) / RECORD_LEN;
 
             let mut table = InodeTable::with_capacity(record_count);
@@ -257,7 +252,7 @@ pub fn init(device_path: &str) {
         InodeTable::with_capacity(0)     // No file yet, or couldn't map it
     };
 
-    let memo = Memo { known, path, header, reset: AtomicBool::new(reset), added: Default::default() };
+    let memo = Memo { known, path, header, added: Default::default() };
 
     if MEMO.set(memo).is_ok() {
         unsafe { libc::atexit(save_at_exit); }
@@ -282,42 +277,53 @@ pub fn save() {
 
     if added.is_empty() { return; }
 
-    let write_header = m.reset.swap(false, Relaxed);
-    let total_len = (if write_header { HEADER_LEN } else { 0 }) + added.len() * RECORD_LEN;
-
-    let mut buf = Vec::with_capacity(total_len);
 
     //
-    // SAFETY: 'buf' was reserved for exactly 'total_len' bytes above, and the writes below
-    // fill '0..total_len' in order with no gaps before 'set_len' makes them visible.
+    // The file is a compacted snapshot, not an append log. Every save() rewrites it from
+    // scratch as the union of known and added (max ctime wins per inode), so re-settling
+    // the same file across many runs this boot never grows the file past one record per
+    // distinct memoized inode.
     //
-    unsafe {
-        let mut p = buf.as_mut_ptr();
+    let mut merged = InodeTable::with_capacity(m.known.len + added.len());
 
-        if write_header {
-            core::ptr::copy_nonoverlapping(m.header.as_ptr(), p, HEADER_LEN);
-            p = p.add(HEADER_LEN);
+    for &slot in &m.known.slots {
+        if slot != 0 {
+            let (ino, ctime) = InodeTable::unpack(slot);
+            merged.insert_max(ino, ctime);
         }
-
-        for &(ino, ctime) in &added {
-            // (ctime << 32 | ino)
-
-            let packed = ((ctime as u64) << 32) | ino as u64;
-            core::ptr::copy_nonoverlapping(packed.to_le_bytes().as_ptr(), p, RECORD_LEN);
-            p = p.add(RECORD_LEN);
-        }
-
-        buf.set_len(total_len);
     }
 
-    let file = if write_header {
-        OpenOptions::new().write(true).create(true).truncate(true).open(&m.path)
-    } else {
-        OpenOptions::new().append(true).open(&m.path)
-    };
+    for (ino, ctime) in added {
+        merged.insert_max(ino, ctime);
+    }
 
-    if let Ok(mut f) = file {
-        _ = f.write_all(&buf);
+    let total_len = HEADER_LEN + merged.len * RECORD_LEN;
+    let mut buf = Vec::with_capacity(total_len);
+
+    let mut cursor = RawAppend::new(&mut buf);
+    unsafe {
+        cursor.extend(&m.header);
+
+        for &slot in &merged.slots {
+            if slot != 0 {
+                let (ino, ctime) = InodeTable::unpack(slot);
+                let packed = ((ctime as u64) << 32) | ino as u64;
+                cursor.extend(&packed.to_le_bytes());
+            }
+        }
+    }
+    cursor.finish();
+
+    let tmp_path = PathBuf::from(format!("{}.tmp.{}", m.path.display(), std::process::id()));
+
+    let wrote = OpenOptions::new()
+        .write(true).create(true).truncate(true)
+        .open(&tmp_path)
+        .and_then(|mut f| f.write_all(&buf));
+
+    match wrote {
+        Ok(())  => { _ = std::fs::rename(&tmp_path, &m.path); }
+        Err(_)  => { _ = std::fs::remove_file(&tmp_path); }  // Don't leave droppings on failure
     }
 }
 
