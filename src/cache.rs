@@ -557,7 +557,11 @@ impl FragmentCache<DiskStorage> {
 
         // No usable cache yet. Try to become the sole builder for this run.
         let lock_path = path.with_extension("lock");
-        let lock_file = std::fs::OpenOptions::new().create(true).write(true).open(&lock_path)?;
+        let lock_file = std::fs::OpenOptions::new()
+            .truncate(false)
+            .create(true)
+            .write(true)
+            .open(&lock_path)?;
         let fd = lock_file.as_raw_fd();
 
         if unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } == 0 {

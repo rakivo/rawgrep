@@ -27,7 +27,10 @@ fn lock_path(any_cache_file: &Path) -> PathBuf {
 
 fn open_lock(path: &Path) -> Option<File> {
     let f = OpenOptions::new()
-        .create(true).write(true).open(path).ok()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(path).ok()
         .or_else(|| OpenOptions::new().read(true).open(path).ok())?;
 
     _ = crate::cache::fix_ownership(path);
@@ -104,7 +107,7 @@ fn run(paths: Vec<PathBuf>) -> ! {
             // Publishing is tmp+rename, so a new cache means a new inode. Our old
             // mapping keeps the old inode alive (so its number can't be reused).
             //
-            let stale = slot.as_ref().map_or(true, |(ino, _)| Some(*ino) != current);
+            let stale = slot.as_ref().is_none_or(|(ino, _)| Some(*ino) != current);
             if stale {
                 *slot = None;       // munmap the old mapping, releasing its lock
                 *slot = pin(path);  // None if the file is missing or not published yet

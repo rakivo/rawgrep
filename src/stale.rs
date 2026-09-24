@@ -206,7 +206,7 @@ pub fn init(device_path: &str) {
 
     let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
     if unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut ts) } == 0 {
-        CANDIDATE_FROM.store(now - ts.tv_sec as i64 - BOOT_MARGIN_SECS, Relaxed);
+        CANDIDATE_FROM.store(now - ts.tv_sec - BOOT_MARGIN_SECS, Relaxed);
     }
 
     //
