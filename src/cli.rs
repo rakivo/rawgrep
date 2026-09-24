@@ -166,7 +166,7 @@ pub struct Cli {
     #[bpaf(long("cache-size"), argument("MB"), fallback(100))]
     pub cache_size_mb: usize,
 
-    /// Cache directory // nocheckin (default: ~/.cache/rawgrep/)
+    /// Cache directory (default is XDG_RUNTIME_DIR, i.e. ~/.cache/rawgrep/)
     #[bpaf(long("cache-dir"), argument("DIR"), fallback(Some(crate::resolve_cache_dir())))]
     pub cache_dir: Option<std::path::PathBuf>,
 
