@@ -77,7 +77,7 @@ pub struct Ext4NodeHot {
     pub inode_num: u32,
     pub size:      u64,
     pub mtime_sec: i64,
-    pub mode:      u16,   // kept for is_dir(), unused by process_files but needed by the trait
+    pub mode:      u16,   // kept for is_dir()
     pub flags:     u32,
 }
 
