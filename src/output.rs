@@ -19,7 +19,7 @@
 // letting a live producer write into slot N+1 corrupt a page the kernel still holds open for slot N's vmsplice.
 
 use crate::index_::IndexMut_;
-use crate::worker::OutputMessage;
+use crate::output_worker::OutputMessage;
 
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::ops::{Deref, DerefMut};

@@ -8,10 +8,11 @@ use crate::liner::*;
 use crate::index_::{Index_, IndexMut_};
 use crate::pacer::FlushPacer;
 use crate::unwrap_::Unwrap_;
+use crate::sink::MatchSink;
 use crate::binary_verdicts::{self, BinaryVerdicts};
 use crate::binary_verdicts::binary_worker_table::{self, DirTally};
 use crate::cache::FragmentCache;
-use crate::output::{OutputSlab, OutputSlotWriter, OutputSlotOwnedOverflow};
+use crate::output::OutputSlotWriter;
 use crate::cli::{should_enable_ansi_coloring, Cli};
 use crate::ignore::{Gitignore, GitignoreChain};
 use crate::matcher::{Matcher, MatcherCache};
@@ -23,21 +24,18 @@ use crate::stats::Stats;
 use crate::ext4::Ext4Fs;
 use crate::apfs::ApfsFs;
 use crate::ntfs::NtfsFs;
-use crate::stdout::{RawStdout, IOV_MAX};
 use crate::thin_path_arc::ThinPathArc;
 use crate::parser::{BufFatPtr, FileIdentifier, BufKind, UniversalFileId, FileNode, FileType, ParsedEntry, Parser, RawFs, FileId};
 use crate::util::{likely, truncate_utf8, unlikely, prefetch_read, RawAppend};
 use crate::tracy;
 
+use std::io;
 use std::ops::Not;
 use std::path::MAIN_SEPARATOR;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
-use std::io::{self, Write, IoSlice};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use nohash_hasher::IntSet;
-use crossbeam_channel::{Receiver, Sender};
 use crossbeam_deque::{Injector, Steal, Stealer};
 pub use crossbeam_deque::Worker as DequeWorker;
 
@@ -121,210 +119,6 @@ impl DirWork {
     #[inline]
     pub fn depth(&self) -> u16 {
         self.path_bytes.depth()
-    }
-}
-
-pub trait MatchSink: Send + Sync + Clone {
-    const STDOUT_NOP: bool;
-
-    fn push(&self, path: &[u8], line_num: u32, text: &[u8], ranges: &[(u32, u32)]);
-}
-
-#[derive(Copy, Clone)]
-pub struct NoSink;
-
-impl MatchSink for NoSink {
-    const STDOUT_NOP: bool = false;
-
-    #[inline(always)]
-    fn push(&self, _: &[u8], _: u32, _: &[u8], _: &[(u32, u32)]) {}
-}
-
-#[derive(Debug)]
-pub struct RawMatch {
-    pub path:     Box<[u8]>,          // Full file path
-    pub line_num: u32,                // 1-indexed line number
-    pub text:     Box<[u8]>,          // The matched line content
-    pub ranges:   Box<[(u32, u32)]>,  // Byte ranges of match spans within text
-}
-
-#[derive(Clone)]
-pub struct ChannelSink(pub Sender<RawMatch>);
-
-impl MatchSink for ChannelSink {
-    const STDOUT_NOP: bool = true;
-
-    #[inline(always)]
-    fn push(
-        &self,
-        path:   &[u8],
-        line_num: u32,
-        text:   &[u8],
-        ranges: &[(u32, u32)]
-    ) {
-        self.0.send(RawMatch {
-            path:     path.into(),
-            line_num,
-            text:     text.into(),
-            ranges:   ranges.into(),
-        }).ok();
-    }
-}
-
-pub struct CallbackSink<F>(pub Arc<F>);
-
-impl<F> Clone for CallbackSink<F>
-where
-    F: Fn(&[u8], u32, &[u8], &[(u32, u32)]) + Send + Sync
-{
-    #[inline]
-    fn clone(&self) -> Self {
-        Self(Arc::clone(&self.0))
-    }
-}
-
-impl<F> MatchSink for CallbackSink<F>
-where
-    F: Fn(&[u8], u32, &[u8], &[(u32, u32)]) + Send + Sync
-{
-    const STDOUT_NOP: bool = true;
-
-    #[inline(always)]
-    fn push(&self, path: &[u8], line_num: u32, text: &[u8], ranges: &[(u32, u32)]) {
-        (self.0)(path, line_num, text, ranges);
-    }
-}
-
-pub enum OutputMessage {
-    Slot { slab: &'static OutputSlab, slot: u16, len: u32 },
-    Owned(OutputSlotOwnedOverflow),
-    FlushReq,
-}
-
-pub enum PendingBuf {
-    Slot { slab: &'static OutputSlab, slot: u16, len: u32 },
-    Owned(OutputSlotOwnedOverflow),
-}
-
-impl PendingBuf {
-    /// # Safety
-    /// Caller must hold read-side
-    #[inline]
-    pub unsafe fn as_slice(&self) -> &[u8] {
-        match self {
-            PendingBuf::Slot { slab, slot, len, .. } => unsafe { slab.slot(*slot as usize) }.get_(..*len as usize),
-            PendingBuf::Owned(v) => v,
-        }
-    }
-}
-
-pub struct OutputWorker {
-    pub rx: Receiver<OutputMessage>,
-    pub flush_ack_tx: Sender<()>,
-    pub writer: RawStdout,
-
-    pub batch:       Vec<PendingBuf>,
-    pub batch_bytes: usize,
-    pub iov_scratch: Vec<IoSlice<'static>>,
-}
-
-impl OutputWorker {
-    #[inline]
-    pub fn run(mut self) {
-        let _span = tracy::span!("OutputThread::run");
-
-        'outer: while let Ok(msg) = self.rx.recv() {
-            if !self.absorb(msg) { break 'outer }
-
-            while let Ok(msg) = self.rx.try_recv() {
-                if !self.absorb(msg) { break 'outer } // absorb() already flushes when full
-            }
-
-            if self.flush_batch().is_err() { break 'outer }
-        }
-
-        _ = self.flush_batch();
-    }
-
-    #[inline]
-    fn absorb(&mut self, msg: OutputMessage) -> bool {
-        match msg {
-            OutputMessage::Slot { slab, slot, len } => {
-                self.batch_bytes += len as usize;
-                self.batch.push(PendingBuf::Slot { slab, slot, len });
-            }
-
-            OutputMessage::Owned(v) => {
-                self.batch_bytes += v.len();
-                self.batch.push(PendingBuf::Owned(v));
-            }
-
-            OutputMessage::FlushReq => {
-                if self.flush_batch().is_err() { return false; }
-                _ = self.flush_ack_tx.send(());
-
-                return true;
-            }
-        }
-
-        if self.batch_bytes >= OUTPUTTER_FLUSH_BATCH || self.batch.len() >= IOV_MAX {
-            if self.flush_batch().is_err() {
-                return false;
-            }
-        }
-
-        true
-    }
-
-    #[inline]
-    fn flush_batch(&mut self) -> io::Result<()> {
-        if self.batch.is_empty() { return Ok(()) }
-
-        self.flush_batch_writev()
-    }
-
-    #[inline]
-    fn flush_batch_writev(&mut self) -> io::Result<()> {
-        self.iov_scratch.clear();
-
-        for b in &self.batch {
-            // SAFETY: Slot ownership moved to us via the channel send;
-            // the sender relinquished it and cannot touch it again until we release it below.
-            let bytes = unsafe { b.as_slice() };
-
-            // SAFETY: Every referent here is kept alive by an Arc/Vec still
-            // sitting in self.batch, which outlives this function's use of
-            // iov_scratch (we don't drain batch until after writev_all() returns Ok).
-            let bytes: &'static [u8] = unsafe { std::mem::transmute(bytes) };
-            self.iov_scratch.push(IoSlice::new(bytes));
-        }
-
-        self.writev_all()?;
-
-        for b in self.batch.drain(..) {
-            if let PendingBuf::Slot { slab, slot, .. } = b {
-                slab.release(slot as usize);
-            }
-        }
-        self.batch_bytes = 0;
-
-        Ok(())
-    }
-
-    #[inline]
-    fn writev_all(&mut self) -> io::Result<()> {
-        let mut slices = &mut self.iov_scratch[..];
-        while !slices.is_empty() {
-            match self.writer.write_vectored(slices) {
-                Ok(0) => return Err(io::Error::new(io::ErrorKind::WriteZero, "write_vectored wrote 0")),
-                Ok(n) => IoSlice::advance_slices(&mut slices, n),
-
-                Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                Err(e)                 => return Err(e),
-            }
-        }
-
-        Ok(())
     }
 }
 

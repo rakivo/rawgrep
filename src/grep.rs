@@ -10,7 +10,7 @@ use crate::platform::device_id;
 use crate::cache::{CacheConfig, FragmentCache};
 use crate::parser::{BufKind, UniversalFileId, FileNode, Parser, RawFs, FileId};
 use crate::binary_verdicts::BinaryVerdicts;
-use crate::worker::{MatchSink, NoSink};
+use crate::sink::{MatchSink, NoSink};
 use crate::ext4::parser::InodeBlockCache;
 use crate::ext4::{
     EXT4_INODE_TABLE_OFFSET, EXT4_MAGIC_OFFSET, EXT4_SUPER_MAGIC, EXT4_SUPERBLOCK_OFFSET, EXT4_SUPERBLOCK_SIZE, Ext4Fs, Ext4NodeHot,Ext4NodeCold

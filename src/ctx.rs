@@ -4,15 +4,17 @@ use crate::error::Error;
 use crate::output::{OutputSlotPool, OutputSlotWriter};
 use crate::RawGrepConfig;
 use crate::parser::RawFs;
+use crate::sink::MatchSink;
 use crate::unwrap_::Unwrap_;
 use crate::path_buf::SmallPathBuf;
+use crate::output_worker::OutputMessage;
 use crate::stdout::{RawStdout, OutputKind};
 use crate::{cli, ignore, platform, CursorHide};
 use crate::parser::{Parser, FileIdentifier};
 use crate::cache::CacheStats;
 use crate::stats::{AtomicStats, Stats};
 use crate::grep::{AnyGrepper, FileSystem, RawGrepper, open_device_and_detect_fs, AnyNodeHotScratch, AnyNodeColdScratch, AnyNodeCache};
-use crate::worker::{DirWork, FileWork, MatchSink, OutputWorker, WorkItem, WorkerCtx, PathArena, FragmentPresenceBits, OutputMessage, AnySubdirsArena, AnyFileEntryArena, AnyEntriesArena};
+use crate::worker::{DirWork, FileWork, WorkItem, WorkerCtx, PathArena, FragmentPresenceBits, AnySubdirsArena, AnyFileEntryArena, AnyEntriesArena};
 
 use std::fs;
 use std::time::Instant;
@@ -686,7 +688,7 @@ fn setup_output_plumbing(worker_count: usize) -> OutputPlumbing {
             .spawn(move || {
                 place_output_worker(topology, worker_count);
 
-                OutputWorker {
+                crate::output_worker::OutputWorker {
                     rx: output_rx,
                     flush_ack_tx,
                     batch_bytes: 0,

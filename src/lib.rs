@@ -21,6 +21,8 @@ compile_error!(
 
 pub mod ctx;
 pub mod cli;
+pub mod sink;
+pub mod output_worker;
 pub mod stale;
 pub mod binary_verdicts;
 pub mod grep;
@@ -81,7 +83,7 @@ pub use grep::RawGrepper;
 pub use ctx::RawGrepCtx;
 
 use grep::FileSystem;
-use worker::MatchSink;
+use sink::MatchSink;
 
 pub const CURSOR_HIDE:   &str = "\x1b[?25l";
 pub const CURSOR_UNHIDE: &str = "\x1b[?25h";

@@ -10,7 +10,7 @@ static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 static ALLOC: dhat::Alloc = dhat::Alloc;
 
 use rawgrep::cli::Cli;
-use rawgrep::worker::NoSink;
+use rawgrep::sink::NoSink;
 use rawgrep::{Error, RawGrepConfig, eprint_blue, eprint_green, eprintln_red};
 
 fn main() {
