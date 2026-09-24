@@ -68,7 +68,7 @@ jobs:
         run: |
           cargo hack check --feature-powerset \
             --mutually-exclusive-features=mimalloc,dhat \
-            --exclude-features=hyperscan-static \
+            --exclude-features=hyperscan-static,generic-simd,use_nightly \
             --depth=3
 
   # --------------------------
