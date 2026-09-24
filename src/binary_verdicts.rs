@@ -193,18 +193,18 @@ pub fn fingerprint(id: FileIdentifier) -> u64 {
 
 #[derive(Debug)]
 pub struct BinaryVerdicts {
-    known: Vec<u64>,       // Sorted and unique
-    index: Vec<u32>,       // Bucket -> first position in 'known'
-    shift: u32,            // 64 - log2(buckets)
-    used:  Vec<AtomicU64>, // Bit per 'known' entry -- matched a file this run
+    known: Box<[u64]>,       // Sorted and unique
+    index: Box<[u32]>,       // Bucket -> first position in 'known'
+    shift: u32,              // 64 - log2(buckets)
+    used:  Box<[AtomicU64]>, // Bit per 'known' entry -- matched a file this run
 }
 
 impl BinaryVerdicts {
     pub fn empty() -> Self {
-        Self::from_sorted(Vec::new())
+        Self::from_sorted(Default::default())
     }
 
-    fn from_sorted(known: Vec<u64>) -> Self {
+    fn from_sorted(known: Box<[u64]>) -> Self {
         //
         // ~4 entries per bucket capped at 2^24 buckets
         //
@@ -216,13 +216,15 @@ impl BinaryVerdicts {
         let shift   = 64 - bits;
 
         // index[b] = first position whose top bits are >= b; index[buckets] = known.len()
-        let mut index = vec![0u32; buckets + 1];
+        let mut index = Box::<[u32]>::new_uninit_slice(buckets + 1);
         let mut p     = 0usize;
 
         for (b, slot) in index.iter_mut().enumerate() {
             while p < known.len() && ((known.get_(p) >> shift) as usize) < b { p += 1 }
-            *slot = p as u32;
+            slot.write(p as u32);
         }
+
+        let index: Box<[u32]> = unsafe { index.assume_init() };
 
         Self {
             used: (0..known.len().div_ceil(64)).map(|_| AtomicU64::new(0)).collect(),
@@ -261,11 +263,11 @@ impl BinaryVerdicts {
         if count > MAX_LOADED { return None; }
 
         let end   = off.checked_add(count.checked_mul(8)?)?;
-        let known = buf
+        let known: Box<[_]> = buf
             .get(off..end)?
             .chunks_exact(8)
             .map(|c| read_u64_unaligned_le(c, 0))
-            .collect::<Vec<_>>();
+            .collect();
 
         // Must be sorted and unique
         if !known.windows(2).all(|w| w[0] < w[1]) { return None; }
@@ -422,7 +424,7 @@ mod tests {
     fn make(mut v: Vec<u64>) -> BinaryVerdicts {
         v.sort_unstable();
         v.dedup();
-        BinaryVerdicts::from_sorted(v)
+        BinaryVerdicts::from_sorted(v.into())
     }
 
     #[test]

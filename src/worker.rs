@@ -420,25 +420,14 @@ pub struct WorkerCtx<'a, F: RawFs, S: MatchSink> {
     pub output:             OutputSlotWriter,         //  ?         len check every file
     pub path_buf:           Box<SmallPathBuf>,        //  8         built per surviving file
 
-    //
-    // Accessed once per directory in process_directory; never in the tight
-    // per-file loop (subdirs_arena, entries_arena are fully consumed before
-    // process_files is called).
-    //
-    pub path_arena:         PathArena,                // 24
+    pub    path_arena:      PathArena,                // 24
     pub subdirs_arena:      SubdirsArena<F::FileId>,  // 24
     pub entries_arena:      EntriesArena<F::FileId>,  // 24
     pub swap_path_buf:      Box<SmallPathBuf>,        //  8         swapped once per directory
 
-    //
-    // node_hot_scratch and node_cold_scratch are taken via mem::take at the
-    // START of process_files and put back at the END - their Vec descriptors
-    // in WorkerCtx are NOT accessed during the mid-loop per-file iterations.
-    // node_cache is passed into parse_nodes_batch once per directory.
-    //
-    pub node_hot_scratch:   Vec<F::NodeHot>,       // 24
-    pub node_cache:         F::NodeCache,          //  ?
-    pub node_cold_scratch:  Vec<F::NodeCold>,      // 24
+    pub node_hot_scratch:   Vec<F::NodeHot>,          // 24
+    pub node_cache:         F::NodeCache,             //  ?
+    pub node_cold_scratch:  Vec<F::NodeCold>,         // 24
 
     //
     //

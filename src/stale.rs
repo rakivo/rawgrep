@@ -93,7 +93,7 @@ pub fn note_invalidated(inode: u64, ctime_sec: i64, complete: bool) {
 
 // Flat open-addressing table for the (inode -> ctime) memo, built once at load and read-only
 // for the rest of the run. Inode 0 is never allocated on ext4 (this module is only ever
-// used from the ext4 path for now (@Incomplete)), so it doubles as the 'empty slot' sentinel for free.
+// used from the ext4 path for now (@Incomplete)), so it doubles as a sentinel.
 //
 // Each slot packs (ctime << 32 | inode) into one u64.
 struct InodeTable {
