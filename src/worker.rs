@@ -569,14 +569,12 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
     fn try_load_gitignore(&mut self, gi_file_id: F::FileId) -> Option<Gitignore> {
         let _span = tracy::span!("WorkerCtx::try_load_gitignore");
 
-        if let Ok(gi_node) = self.fs.parse_node(gi_file_id) {
-            let size = (gi_node.size() as usize).min(self.max_file_byte_size());
-            if likely(self.fs.read_file_content(&mut self.parser, &gi_node, size, BufKind::Gitignore, true, false).is_ok()) {
-                let matcher = crate::ignore::build_gitignore_from_bytes(
-                    &self.parser.gitignore
-                );
-                return Some(matcher)
-            }
+        let gi_node = self.fs.parse_node(gi_file_id).ok()?;
+        let size = (gi_node.size() as usize).min(self.max_file_byte_size());
+
+        if likely(self.fs.read_file_content(&mut self.parser, &gi_node, size, BufKind::File, true, false).is_ok()) {
+            let matcher = crate::ignore::build_gitignore_from_bytes(&self.parser.file);
+            return Some(matcher)
         }
 
         None
@@ -1321,12 +1319,7 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
         let mut carry = self.chunk_carry.take().unwrap_or_else(|| ChunkCarry::new().into());
         carry.reset();
 
-        let buf = Parser::get_buf_mut_impl(
-            &mut self.parser.file,
-            &mut self.parser.dir,
-            &mut self.parser.gitignore,
-            BufKind::File
-        );
+        let buf = crate::parser::get_buf_mut!(self.parser, BufKind::File);
         buf.clear();
 
         if !self.fs.collect_file_chunks(
@@ -1360,12 +1353,7 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
         // Any partial last line lands in carry.tail and is picked up by chunk 0.
         //
         {
-            let head = std::mem::take(Parser::get_buf_mut_impl(
-                &mut self.parser.file,
-                &mut self.parser.dir,
-                &mut self.parser.gitignore,
-                BufKind::File
-            ));
+            let head = std::mem::take(crate::parser::get_buf_mut!(self.parser, BufKind::File));
 
             planned += head.len();
 
@@ -1380,12 +1368,7 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
                 }
             }
 
-            *Parser::get_buf_mut_impl(
-                &mut self.parser.file,
-                &mut self.parser.dir,
-                &mut self.parser.gitignore,
-                BufKind::File
-            ) = head;
+            *crate::parser::get_buf_mut!(self.parser, BufKind::File) = head;
 
             result?;
         }

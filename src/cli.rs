@@ -38,7 +38,6 @@ pub struct BufferConfig {
     pub output_buf: usize,
     pub dir_buf: usize,
     pub file_buf: usize,
-    pub gitignore_buf: usize,
     pub extent_buf: usize,
 }
 
@@ -241,7 +240,6 @@ impl Cli {
                 dir_buf:  1 * 1024 * 1024,    // 1 MB
                 file_buf: 2 * 1024 * 1024,    // 2 MB
                 output_buf: 1 * 1024 * 1024,  // 1 MB
-                gitignore_buf: 0,             // 0 KB - not using .gitignore
                 extent_buf: 1024,             // Large files have more extents
             }
         } else {
@@ -250,7 +248,6 @@ impl Cli {
                 dir_buf: 256 * 1024,          // 256 KB
                 file_buf: 1 * 1024 * 1024,    // 1 MB
                 output_buf: 256 * 1024,       // 256 KB
-                gitignore_buf: if self.should_ignore_gitignore() { 0 } else { 16 * 1024 },
                 extent_buf: 256,              // Most text files fit in few extents
             }
         }

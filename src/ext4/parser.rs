@@ -307,7 +307,7 @@ impl RawFs for Ext4Fs {
     ) -> io::Result<bool> {
         let _span = tracy::span!("Ext4Fs::read_file_content");
 
-        let buf = Parser::get_buf_mut_impl(&mut parser.file, &mut parser.dir, &mut parser.gitignore, kind);
+        let buf = crate::parser::get_buf_mut!(parser, kind);
         buf.clear();
 
         let file_size = node.size() as usize;
@@ -396,7 +396,7 @@ impl RawFs for Ext4Fs {
                 }
             }
 
-            let buf = Parser::get_buf_mut_impl(&mut parser.file, &mut parser.dir, &mut parser.gitignore, kind);
+            let buf = crate::parser::get_buf_mut!(parser, kind);
 
             let old_len = buf.len();
             let new_len = old_len + len as usize;

@@ -16,7 +16,7 @@ pub enum FileType { Dir, File, Other }
 
 #[repr(u8)]
 #[derive(Copy, Clone)]
-pub enum BufKind { Dir, File, Gitignore }
+pub enum BufKind { Dir, File }
 
 #[derive(Copy, Clone)]
 pub struct BufFatPtr {
@@ -322,14 +322,21 @@ pub struct DirScanResult {
     pub entries_end:   usize,
 }
 
+macro_rules! get_buf_mut {
+    ($parser:expr, $kind:expr) => {
+        $crate::parser::Parser::get_buf_mut_impl(&mut $parser.file, &mut $parser.dir, $kind)
+    };
+}
+pub(crate) use get_buf_mut;
+
 /// Filesystem-agnostic parser with reusable buffers
 ///
 /// Buffer lifetimes -- what's safe to repurpose and what isn't:
 ///
-///  - 'file' / 'dir' / 'gitignore': One destination buffer per BufKind.
+///  - 'file' / 'dir': One destination buffer per BufKind.
 ///    A directory's entries can still be live in 'dir' (mid-iteration)
-///    while a file inside it is being read into 'file', with its '.gitignore' simultaneously
-///    live in 'gitignore'. Each owns its content for as long as its own traversal needs it,
+///    while a file inside it is being read into 'file'.
+///    Each owns its content for as long as its own traversal needs it,
 ///    independent of the other two.
 ///
 ///  - 'scratch' / 'scratch3': Transient, used only inside 'collect_file_chunks'
@@ -359,7 +366,6 @@ pub struct Parser {
     pub scratch3:       Vec<u64>,
     pub stream_chunk:   Vec<u8>,
     pub scratch_chunks: Vec<(u64, u32)>,
-    pub gitignore:      Vec<u8>,
 
     pub dont_skip_dot_entries: bool,
 }
@@ -372,7 +378,6 @@ impl Parser {
             file: Vec::new(),
             dir: Vec::new(),
             scratch3: Vec::new(),
-            gitignore: Vec::new(),
             scratch: Vec::new(),
             scratch_chunks: Vec::new(),
             scratch2: Vec::new(),
@@ -384,7 +389,6 @@ impl Parser {
     pub fn init(&mut self, config: &BufferConfig) {
         self.dir.reserve(config.dir_buf);
         self.file.reserve(config.file_buf);
-        self.gitignore.reserve(config.gitignore_buf);
         self.scratch.reserve(config.extent_buf * 8);  // Extents are ~8 bytes each
         self.stream_chunk.reserve(2 * STREAMING_CHUNK_SIZE); // Covers tail carry + one full chunk without growing
     }
@@ -461,26 +465,23 @@ impl Parser {
         match kind {
             BufKind::File      => &self.file,
             BufKind::Dir       => &self.dir,
-            BufKind::Gitignore => &self.gitignore,
         }
     }
 
     #[inline(always)]
     pub fn get_buf_mut(&mut self, kind: BufKind) -> &mut Vec<u8> {
-        Self::get_buf_mut_impl(&mut self.file, &mut self.dir, &mut self.gitignore, kind)
+        Self::get_buf_mut_impl(&mut self.file, &mut self.dir, kind)
     }
 
     #[inline(always)]
     pub fn get_buf_mut_impl<'b>(
         file: &'b mut Vec<u8>,
         dir: &'b mut Vec<u8>,
-        gitignore: &'b mut Vec<u8>,
         kind: BufKind
     ) -> &'b mut Vec<u8> {
         match kind {
             BufKind::File      => file,
             BufKind::Dir       => dir,
-            BufKind::Gitignore => gitignore,
         }
     }
 

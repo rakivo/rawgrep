@@ -111,7 +111,7 @@ impl RawFs for NtfsFs {
             return self.read_dir_linearised(node, parser, kind).map(|_| true);
         }
 
-        let buf = Parser::get_buf_mut_impl(&mut parser.file, &mut parser.dir, &mut parser.gitignore, kind);
+        let buf = crate::parser::get_buf_mut!(parser, kind);
         buf.clear();
 
         let file_size   = node.size as usize;
@@ -144,7 +144,7 @@ impl RawFs for NtfsFs {
         }
 
         for &(disk_offset, len) in &parser.scratch_chunks {
-            let buf = Parser::get_buf_mut_impl(&mut parser.file, &mut parser.dir, &mut parser.gitignore, kind);
+            let buf = crate::parser::get_buf_mut!(parser, kind);
 
             let old_len = buf.len();
             buf.resize(old_len + len as usize, 0);

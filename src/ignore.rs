@@ -442,9 +442,9 @@ impl Gitignore {
             // front of the first hash/bang for patterns that begin with a literal
             // hash/bang." Without this, the backslash itself stays part of the
             // stored pattern and never matches the real (unescaped) filename.
-            if pattern_bytes.len() >= 2
-                && *pattern_bytes.get_(0) == b'\\'
-                && matches!(pattern_bytes.get_(1), b'#' | b'!')
+            if  pattern_bytes.len() >= 2
+            && *pattern_bytes.get_(0) == b'\\'
+            && matches!(pattern_bytes.get_(1), b'#' | b'!')
             {
                 pattern_bytes = pattern_bytes.get_(1..);
             }
@@ -1291,7 +1291,7 @@ fn trim_bytes(bytes: &[u8]) -> &[u8] {
     bytes.get_(..end)
 }
 
-#[inline]
+#[inline(always)]
 pub fn build_gitignore_from_bytes(content: &[u8]) -> Gitignore {
     Gitignore::from_bytes(content)
 }
