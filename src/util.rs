@@ -123,12 +123,16 @@ pub static SECTOR_SIZE: OnceLock<u64> = OnceLock::new();
 #[cfg(windows)]
 const DEFAULT_SECTOR_SIZE: u64 = 512;
 
-#[inline]
-pub fn read_at_offset(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
-    #[cfg(unix)] {
-        use std::os::fd::AsRawFd;
+use std::os::fd::{RawFd, AsRawFd};
 
-        let fd = file.as_raw_fd();
+#[inline(always)]
+pub fn read_at_offset(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+    read_at_offset_impl(file.as_raw_fd(), buf, offset)
+}
+
+#[inline]
+pub fn read_at_offset_impl(fd: RawFd, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+    #[cfg(unix)] {
         let ret = unsafe {
             libc::syscall(
                 libc::SYS_pread64,

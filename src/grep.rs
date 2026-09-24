@@ -8,7 +8,7 @@ use crate::util::read_at_offset;
 use crate::{Result, Error, tracy};
 use crate::platform::device_id;
 use crate::cache::{CacheConfig, FragmentCache};
-use crate::parser::{BufKind, FileId, FileNode, Parser, RawFs};
+use crate::parser::{BufKind, UniversalFileId, FileNode, Parser, RawFs, FileId};
 use crate::binary_verdicts::BinaryVerdicts;
 use crate::worker::{MatchSink, NoSink};
 use crate::ext4::parser::InodeBlockCache;
@@ -17,6 +17,7 @@ use crate::ext4::{
 };
 
 use std::time::Instant;
+use std::os::fd::AsRawFd;
 use std::path::{MAIN_SEPARATOR, MAIN_SEPARATOR_STR};
 use std::io::{self, Seek};
 use std::fs::{File, OpenOptions};
@@ -138,11 +139,11 @@ impl<F: RawFs, S: MatchSink> RawGrepper<F, S> {
 
     /// Resolve a path like "/usr/bin" or "etc" into a file ID.
     #[inline]
-    pub fn try_resolve_path_to_file_id(&self, path: &str) -> io::Result<FileId> {
+    pub fn try_resolve_path_to_file_id(&self, path: &str) -> io::Result<UniversalFileId> {
         let _span = tracy::span!("RawGrepper::try_resolve_path_to_file_id");
 
         if path == MAIN_SEPARATOR_STR || path.is_empty() {
-            return Ok(self.fs.root_id());
+            return Ok(self.fs.root_id().into_uni());
         }
 
         let mut parser = Parser::new(false);
@@ -171,7 +172,7 @@ impl<F: RawFs, S: MatchSink> RawGrepper<F, S> {
             ))?;
         }
 
-        Ok(file_id)
+        Ok(file_id.into_uni())
     }
 }
 
@@ -238,7 +239,10 @@ impl<S: MatchSink> RawGrepper<Ext4Fs, S> {
         #[cfg(target_os = "linux")]
         crate::stale::init(device_path);
 
-        let fs = Ext4Fs { sb, device_id, max_block, file, inode_table_blocks };
+        let fs = Ext4Fs {
+            file_as_fd: file.as_raw_fd(), file,
+            sb, device_id, max_block, inode_table_blocks
+        };
         Self::new_with_fs(cli, fs, sink).map(AnyGrepper::Ext4)
     }
 }
@@ -256,7 +260,10 @@ impl<S: MatchSink> RawGrepper<ApfsFs, S> {
 
         let device_id = device_id(&file)?;
 
-        let fs = ApfsFs { file, sb, device_id, volume: ApfsVolume { omap_root_paddr: 0, root_tree_paddr: 0 } };
+        let fs = ApfsFs {
+            file_as_fd: file.as_raw_fd(), file, sb,
+            device_id, volume: ApfsVolume { omap_root_paddr: 0, root_tree_paddr: 0 }
+        };
 
         // parse_volume() needs self.file + self.sb, so we construct a temporary
         // ApfsFs first, resolve the volume, then patch it in.
@@ -317,7 +324,7 @@ pub fn open_device_impl(path: &str) -> io::Result<File> {
 }
 
 #[inline]
-pub fn open_device_and_detect_fs(device_path: &str) -> Result<(File, FsType)> {
+pub fn open_device_and_detect_fs(device_path: &str) -> Result<(File, FileSystem)> {
     let file = open_device(device_path).map_err(|e| match e.kind() {
         io::ErrorKind::NotFound         => Error::DeviceNotFound(device_path.into()),
         io::ErrorKind::PermissionDenied => Error::PermissionDenied(device_path.into()),
@@ -414,24 +421,24 @@ pub fn open_device_and_detect_fs(device_path: &str) -> Result<(File, FsType)> {
     read_at_offset(&file, &mut probe, 0)?;
 
     match detect_fs_type(&file, &probe) {
-        FsProbe::Supported(fs) => Ok((file, fs)),
-        FsProbe::Recognized(name) => Err(Error::UnsupportedFilesystem {
+        FileSystemProbe::Supported(fs) => Ok((file, fs)),
+        FileSystemProbe::Recognized(name) => Err(Error::UnsupportedFilesystem {
             device: device_path.into(),
             fs: name.into(),
         }),
-        FsProbe::Unknown => Err(Error::UnknownFilesystem(device_path.into())),
+        FileSystemProbe::Unknown => Err(Error::UnknownFilesystem(device_path.into())),
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FsType {
+pub enum FileSystem {
     Ext4, Apfs, Ntfs
 }
 
 /// Result of probing a device's boot sector / superblock region.
-pub enum FsProbe {
+pub enum FileSystemProbe {
     /// A filesystem rawgrep knows how to search.
-    Supported(FsType),
+    Supported(FileSystem),
     /// A filesystem we recognized the magic for, but don't support searching yet.
     Recognized(&'static str),
     /// Nothing we recognize -- probably the wrong partition, an unpartitioned
@@ -446,7 +453,7 @@ pub enum FsProbe {
 /// boot-sector fields, and XFS's magic at offset 0. Btrfs' magic sits
 /// much further in, so if nothing in 'block0' matches, this does one
 /// extra small read via 'file' before giving up.
-pub fn detect_fs_type(file: &File, block0: &[u8]) -> FsProbe {
+pub fn detect_fs_type(file: &File, block0: &[u8]) -> FileSystemProbe {
     const XFS_MAGIC: [u8; 4]      = *b"XFSB";
     const EXFAT_OEM_ID: [u8; 8]   = *b"EXFAT   ";
     const BTRFS_MAGIC: [u8; 8]    = *b"_BHRfS_M";
@@ -459,20 +466,20 @@ pub fn detect_fs_type(file: &File, block0: &[u8]) -> FsProbe {
         let off = EXT4_SUPERBLOCK_OFFSET as usize + EXT4_MAGIC_OFFSET;
         let magic = u16::from_le_bytes(block0[off..off + 2].try_into().unwrap_());
         if magic == EXT4_SUPER_MAGIC {
-            return FsProbe::Supported(FsType::Ext4);
+            return FileSystemProbe::Supported(FileSystem::Ext4);
         }
     }
 
     // NTFS: OEM ID at offset 3, 8 bytes: "NTFS    "
     if block0.len() >= 11 && &block0[3..11] == b"NTFS    " {
-        return FsProbe::Supported(FsType::Ntfs);
+        return FileSystemProbe::Supported(FileSystem::Ntfs);
     }
 
     // APFS: NX magic at offset 32 in block 0
     if block0.len() >= 36 {
         let magic = u32::from_le_bytes(block0[32..36].try_into().unwrap_());
         if magic == APFS_NX_MAGIC {
-            return FsProbe::Supported(FsType::Apfs);
+            return FileSystemProbe::Supported(FileSystem::Apfs);
         }
     }
 
@@ -480,12 +487,12 @@ pub fn detect_fs_type(file: &File, block0: &[u8]) -> FsProbe {
 
     // XFS: "XFSB" at offset 0
     if block0.len() >= 4 && block0[0..4] == XFS_MAGIC {
-        return FsProbe::Recognized("XFS");
+        return FileSystemProbe::Recognized("XFS");
     }
 
     // exFAT: OEM ID at offset 3, 8 bytes: "EXFAT   "
     if block0.len() >= 11 && block0[3..11] == EXFAT_OEM_ID {
-        return FsProbe::Recognized("exFAT");
+        return FileSystemProbe::Recognized("exFAT");
     }
 
     // FAT12/16/32: 0x55AA boot signature at 510..512, plus a FAT-ish label
@@ -497,14 +504,14 @@ pub fn detect_fs_type(file: &File, block0: &[u8]) -> FsProbe {
             || block0.get(54..62) == Some(b"FAT16   ".as_slice())
             || block0.get(82..90) == Some(b"FAT32   ".as_slice()))
     {
-        return FsProbe::Recognized("FAT");
+        return FileSystemProbe::Recognized("FAT");
     }
 
     // HFS+ / HFSX: "H+" or "HX" at offset 1024
     if block0.len() >= 1026 {
         let magic = u16::from_be_bytes(block0[1024..1026].try_into().unwrap_());
         if magic == HFSPLUS_MAGIC || magic == HFSX_MAGIC {
-            return FsProbe::Recognized("HFS+");
+            return FileSystemProbe::Recognized("HFS+");
         }
     }
 
@@ -514,10 +521,10 @@ pub fn detect_fs_type(file: &File, block0: &[u8]) -> FsProbe {
     if read_at_offset(file, &mut btrfs_magic, BTRFS_MAGIC_OFFSET).is_ok()
         && btrfs_magic == BTRFS_MAGIC
     {
-        return FsProbe::Recognized("Btrfs");
+        return FileSystemProbe::Recognized("Btrfs");
     }
 
-    FsProbe::Unknown
+    FileSystemProbe::Unknown
 }
 
 #[derive(Default, Clone, Copy)]
@@ -565,7 +572,7 @@ pub enum AnyGrepper<S: MatchSink = NoSink> {
 
 impl<S: MatchSink> AnyGrepper<S> {
     #[inline]
-    pub fn try_resolve_path_to_file_id(&self, path: &str) -> io::Result<FileId> {
+    pub fn try_resolve_path_to_file_id(&self, path: &str) -> io::Result<UniversalFileId> {
         match self {
             AnyGrepper::Ext4(g) => g.try_resolve_path_to_file_id(path),
             AnyGrepper::Apfs(g) => g.try_resolve_path_to_file_id(path),

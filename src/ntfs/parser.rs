@@ -4,11 +4,10 @@ use crate::smallvec::SmallVec;
 
 use crate::{tracy, util};
 use crate::unwrap_::Unwrap_;
-use crate::grep::{AnyNodeHotScratch, AnyNodeColdScratch};
 use crate::cli::Cli;
 use crate::binary::{is_dot_entry, is_hidden_entry};
 use crate::util::{read_at_offset, read_u8_unaligned, read_u32_unaligned_le, read_u64_unaligned_le};
-use crate::parser::{BufKind, FileId, FileNode, FileType, Parser, RawFs, binary_probe};
+use crate::parser::{BufKind, UniversalFileId, FileNode, FileType, Parser, RawFs, binary_probe};
 use crate::worker::STREAMING_CHUNK_SIZE;
 
 use super::*;
@@ -16,45 +15,55 @@ use super::*;
 use std::io;
 use std::fs::File;
 use std::ops::ControlFlow;
+use std::os::fd::{RawFd, AsRawFd};
 
 // "$I30" in UTF-16LE - the name of the $FILE_NAME index on every directory
 const I30: [u16; 4] = [0x0024, 0x0049, 0x0033, 0x0030];
 
 pub struct NtfsFs {
     pub file: File,
+    pub file_as_fd: RawFd,
     pub sb: NtfsSuperBlock,
     pub device_id: u64,
     pub mft_runs: SmallVec<[NtfsExtent; 8]>,
     pub dont_skip_dot_entries: bool,
 }
 
-impl FileNode for NtfsNodeHot {
+impl FileNode<ntfs::FileId> for NtfsNodeHot {
     const POISONED: Self = Self::POISONED;
-    #[inline(always)] fn file_id(&self)   -> FileId { self.record_num }
+    #[inline(always)] fn file_id(&self)   -> ntfs::FileId { self.record_num }
     #[inline(always)] fn size(&self)      -> u64    { self.size }
     #[inline(always)] fn mtime_sec(&self) -> i64    { self.mtime_sec }
     #[inline(always)] fn is_dir(&self)    -> bool   { self.flags & NTFS_MFT_RECORD_FLAG_IS_DIR != 0 }
 }
 
-impl FileNode for NtfsNode {
+impl FileNode<ntfs::FileId> for NtfsNode {
     const POISONED: Self = Self::POISONED;
-    #[inline(always)] fn file_id(&self) -> FileId { self.hot.file_id() }
-    #[inline(always)] fn size(&self) -> u64 { self.hot.size() }
+    #[inline(always)] fn file_id(&self)   -> ntfs::FileId { self.hot.file_id() }
+    #[inline(always)] fn size(&self)      -> u64 { self.hot.size() }
     #[inline(always)] fn mtime_sec(&self) -> i64 { self.hot.mtime_sec() }
-    #[inline(always)] fn is_dir(&self) -> bool { self.hot.is_dir() }
+    #[inline(always)] fn is_dir(&self)    -> bool { self.hot.is_dir() }
 }
 
 impl RawFs for NtfsFs {
-    type Node     = NtfsNode;
-    type NodeHot  = NtfsNodeHot;
-    type NodeCold = NtfsNodeCold;
+    type Node        = NtfsNode;
+    type NodeHot     = NtfsNodeHot;
+    type NodeCold    = NtfsNodeCold;
     type Context<'b> = &'b Self where Self: 'b;
-    type NodeCache = ();
+    type NodeCache   = ();
+    type FileId      = ntfs::FileId;
+
+    const FILE_SYSTEM: crate::grep::FileSystem = crate::grep::FileSystem::Ntfs;
 
     #[inline(always)] fn device_id(&self) -> u64 { self.device_id }
     #[inline(always)] fn block_size(&self) -> u32 { self.sb.cluster_size }
     #[inline(always)] fn device_file(&self) -> &File { &self.file }
-    #[inline(always)] fn root_id(&self) -> FileId { NTFS_ROOT_DIR_RECORD }
+    #[inline(always)] fn root_id(&self) -> UniversalFileId { NTFS_ROOT_DIR_RECORD }
+
+    #[inline(always)]
+    fn read_at_offset(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+        crate::util::read_at_offset_impl(self.file_as_fd, buf, offset)
+    }
 
     #[inline(always)]
     fn split_node(&self, node: Self::Node) -> (Self::NodeHot, Self::NodeCold) {
@@ -69,7 +78,7 @@ impl RawFs for NtfsFs {
     #[inline]
     fn parse_node_cached(
         &self,
-        file_id: FileId,
+        file_id: UniversalFileId,
         _cache: &mut Self::NodeCache
     ) -> (io::Result<Self::Node>, crate::grep::NodeCacheStats)
     {
@@ -77,7 +86,7 @@ impl RawFs for NtfsFs {
     }
 
     #[inline]
-    fn parse_node(&self, file_id: FileId) -> io::Result<Self::Node> {
+    fn parse_node(&self, file_id: UniversalFileId) -> io::Result<Self::Node> {
         let _span = tracy::span!("NtfsFs::parse_node");
 
         let mut record = vec![0u8; self.sb.mft_record_size as usize]; // @Heap
@@ -249,7 +258,7 @@ impl RawFs for NtfsFs {
     fn with_directory_entries<R>(
         &self,
         buf: &[u8],
-        mut callback: impl FnMut(FileId, usize, usize, FileType) -> ControlFlow<R>
+        mut callback: impl FnMut(UniversalFileId, usize, usize, FileType) -> ControlFlow<R>
     ) -> Option<R> {
         let _span = tracy::span!("NtfsFs::with_directory_entries");
 
@@ -294,24 +303,7 @@ impl RawFs for NtfsFs {
         read_u32_unaligned_le(buf, 0) as _
     }
 
-    #[inline]
-    fn take_node_hot_scratch(&self, shared: &mut AnyNodeHotScratch) -> Vec<NtfsNodeHot> {
-        match std::mem::replace(shared, AnyNodeHotScratch::Ntfs(Vec::new())) {
-            AnyNodeHotScratch::Ntfs(v) => v,
-            _ => Vec::new(),
-        }
-    }
-    #[inline]
-    fn take_node_cold_scratch(&self, shared: &mut AnyNodeColdScratch) -> Vec<NtfsNodeCold> {
-        match std::mem::replace(shared, AnyNodeColdScratch::Ntfs(Vec::new())) {
-            AnyNodeColdScratch::Ntfs(v) => v,
-            _ => Vec::new(),
-        }
-    }
-    #[inline]
-    fn erase_node_hot_scratch(&self, scratch: Vec<NtfsNodeHot>) -> AnyNodeHotScratch { AnyNodeHotScratch::Ntfs(scratch) }
-    #[inline]
-    fn erase_node_cold_scratch(&self, scratch: Vec<NtfsNodeCold>) -> AnyNodeColdScratch { AnyNodeColdScratch::Ntfs(scratch) }
+    crate::impl_node_scratch!(Ntfs);
 }
 
 impl NtfsFs {
@@ -333,7 +325,11 @@ impl NtfsFs {
             _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "Could not find $MFT $DATA attribute")),
         };
 
-        Ok(NtfsFs { file, sb, device_id, mft_runs, dont_skip_dot_entries: cli.hidden })
+        Ok(NtfsFs {
+            file_as_fd: file.as_raw_fd(), file,
+            sb, device_id, mft_runs,
+            dont_skip_dot_entries: cli.hidden
+        })
     }
 
     #[inline]
@@ -341,11 +337,6 @@ impl NtfsFs {
         let offset = mft_record_offset(&self.mft_runs, record_num, &self.sb)?;
         self.read_at_offset(buf, offset)?;
         apply_fixups(buf)
-    }
-
-    #[inline]
-    fn read_at_offset(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
-        read_at_offset(&self.file, buf, offset)
     }
 
     #[inline]

@@ -20,9 +20,12 @@ use crate::path_buf::SmallPathBuf;
 use crate::color::COLOR_RESET;
 use crate::fragments::FragmentLen;
 use crate::stats::Stats;
+use crate::ext4::Ext4Fs;
+use crate::apfs::ApfsFs;
+use crate::ntfs::NtfsFs;
 use crate::stdout::{RawStdout, IOV_MAX};
 use crate::thin_path_arc::ThinPathArc;
-use crate::parser::{BufFatPtr, FileIdentifier, BufKind, FileId, FileNode, FileType, ParsedEntry, Parser, RawFs};
+use crate::parser::{BufFatPtr, FileIdentifier, BufKind, UniversalFileId, FileNode, FileType, ParsedEntry, Parser, RawFs, FileId};
 use crate::util::{likely, truncate_utf8, unlikely, prefetch_read, RawAppend};
 use crate::tracy;
 
@@ -88,12 +91,12 @@ pub enum WorkItem {
 }
 
 pub struct FileWork {
-    pub file_id: FileId,
+    pub file_id: UniversalFileId,
     pub gitignore_chain: GitignoreChain,
 }
 
 pub struct DirWork {
-    pub file_id: FileId,
+    pub file_id: UniversalFileId,
     pub path_bytes: ThinPathArc,
     pub gitignore_chain: GitignoreChain,
 }
@@ -101,7 +104,7 @@ pub struct DirWork {
 impl DirWork {
     #[inline]
     pub fn new(
-        file_id: FileId,
+        file_id: UniversalFileId,
         path: &[u8],
         depth: u16,
         gitignore_chain: GitignoreChain,
@@ -407,9 +410,9 @@ macro_rules! dispatch_wide {
     };
 }
 
-pub type FileEntryArena = Vec<(FileId, BufFatPtr)>;
-pub type SubdirsArena   = Vec<PendingSubdir>;
-pub type EntriesArena   = Vec<ParsedEntry>;
+pub type FileEntryArena<FileId> = Vec<(FileId, BufFatPtr)>;
+pub type   SubdirsArena<FileId> = Vec<PendingSubdir<FileId>>;
+pub type   EntriesArena<FileId> = Vec<ParsedEntry<FileId>>;
 
 #[repr(transparent)]
 pub struct PathArena {
@@ -454,7 +457,7 @@ impl PathArena {
 }
 
 #[derive(Copy, Clone)]
-pub struct PendingSubdir {
+pub struct PendingSubdir<FileId: Copy> {
     pub file_id:    FileId,
     pub path_start: u32,
     pub path_len:   u16,
@@ -514,6 +517,54 @@ impl FragmentPresenceBits {
     }
 }
 
+/// $Any:              the type-erased enum       (AnyFileEntryArena)
+/// $Slot:             trait to take/erase per FS (FileEntryArenaSlot)
+/// $Arena:            the generic alias          (FileEntryArena)
+/// $Ext4/$Apfs/$Ntfs: the concrete RawFs implementor types
+macro_rules! define_any_arena {
+    ($Any:ident, $Slot:ident, $Arena:ident, $Ext4:ty, $Apfs:ty, $Ntfs:ty) => {
+        pub enum $Any {
+            Ext4($Arena<<$Ext4 as RawFs>::FileId>),
+            Apfs($Arena<<$Apfs as RawFs>::FileId>),
+            Ntfs($Arena<<$Ntfs as RawFs>::FileId>),
+        }
+
+        impl Default for $Any {
+            fn default() -> Self { Self::Ext4(Default::default()) }
+        }
+
+        pub trait $Slot<F: RawFs> {
+            /// Take the arena out, leaving an empty one of the same variant.
+            /// Returns a fresh default if the last job was a different FS.
+            fn take(&mut self) -> $Arena<F::FileId>;
+            fn erase(arena: $Arena<F::FileId>) -> Self;
+        }
+
+        define_any_arena!(@impl $Any, $Slot, $Arena, Ext4, $Ext4);
+        define_any_arena!(@impl $Any, $Slot, $Arena, Apfs, $Apfs);
+        define_any_arena!(@impl $Any, $Slot, $Arena, Ntfs, $Ntfs);
+    };
+
+    (@impl $Any:ident, $Slot:ident, $Arena:ident, $V:ident, $Fs:ty) => {
+        impl $Slot<$Fs> for $Any {
+            #[inline]
+            fn take(&mut self) -> $Arena<<$Fs as RawFs>::FileId> {
+                match std::mem::replace(self, $Any::$V(Default::default())) {
+                    $Any::$V(v) => v,
+                    _ => Default::default(), // Last job on this thread was a different FS...
+                }
+            }
+            #[inline]
+            fn erase(arena: $Arena<<$Fs as RawFs>::FileId>) -> Self { $Any::$V(arena) }
+        }
+    };
+}
+
+// Replace Ext4Fs / ApfsFs / NtfsFs with the real types that implement RawFs.
+define_any_arena!(AnyFileEntryArena, FileEntryArenaSlot, FileEntryArena, Ext4Fs, ApfsFs, NtfsFs);
+define_any_arena!(AnySubdirsArena,   SubdirsArenaSlot,   SubdirsArena,   Ext4Fs, ApfsFs, NtfsFs);
+define_any_arena!(AnyEntriesArena,   EntriesArenaSlot,   EntriesArena,   Ext4Fs, ApfsFs, NtfsFs);
+
 pub struct WorkerResult {
     pub stats: Box<Stats>,
 
@@ -533,9 +584,9 @@ pub struct WorkerResult {
     pub fragment_presence_scratch: Vec<u64>,
 
     pub         path_arena: PathArena,
-    pub file_entries_arena: FileEntryArena,
-    pub      subdirs_arena: SubdirsArena,
-    pub      entries_arena: EntriesArena,
+    pub file_entries_arena: AnyFileEntryArena,
+    pub      subdirs_arena: AnySubdirsArena,
+    pub      entries_arena: AnyEntriesArena,
 
     pub fragment_presence:  FragmentPresenceBits,
 }
@@ -565,7 +616,7 @@ pub struct WorkerCtx<'a, F: RawFs, S: MatchSink> {
     pub single_literal_fragments: bool,               //  1  [ 71]  cache record logic
     pub gitignore_enabled:  bool,                     //  1  [ 72]  should_ignore_gitignore()
     pub dir_tally:          DirTally,                 //  8  [ 76]  binary_hints + record every file
-    pub file_entries_arena: FileEntryArena,           // 24  [ ??]  name lookup in lookahead + main loop
+    pub file_entries_arena: FileEntryArena<F::FileId>,// 24  [ ??]  name lookup in lookahead + main loop
 
     //
     // output.len() is the final check every file iteration.
@@ -580,10 +631,10 @@ pub struct WorkerCtx<'a, F: RawFs, S: MatchSink> {
     // per-file loop (subdirs_arena, entries_arena are fully consumed before
     // process_files is called).
     //
-    pub path_arena:         PathArena,             // 24
-    pub subdirs_arena:      SubdirsArena,          // 24
-    pub entries_arena:      EntriesArena,          // 24
-    pub swap_path_buf:      Box<SmallPathBuf>,     //  8         swapped once per directory
+    pub path_arena:         PathArena,                // 24
+    pub subdirs_arena:      SubdirsArena<F::FileId>,  // 24
+    pub entries_arena:      EntriesArena<F::FileId>,  // 24
+    pub swap_path_buf:      Box<SmallPathBuf>,        //  8         swapped once per directory
 
     //
     // node_hot_scratch and node_cold_scratch are taken via mem::take at the
@@ -602,10 +653,10 @@ pub struct WorkerCtx<'a, F: RawFs, S: MatchSink> {
     // pacer: only at i & check_mask == 0 intervals (rare).
     // selected_fragment_hash_len: only in presence checking.
     //
-    pub fragment_hashes:          &'a [u32],       // 16
-    pub fragment_index:           &'a IntSet<u32>, //  8
-    pub matcher:                  &'a Matcher,     //  8
-    pub pacer:                    &'a FlushPacer,  //  8
+    pub fragment_hashes:        &'a [u32],         // 16
+    pub fragment_index:         &'a IntSet<u32>,   //  8
+    pub matcher:                &'a Matcher,       //  8
+    pub pacer:                  &'a FlushPacer,    //  8
     pub selected_fragment_hash_len: FragmentLen,   //  4
 
     //
@@ -653,6 +704,9 @@ impl<'a, F: RawFs, S: MatchSink> WorkerCtx<'a, F, S> {
         let config = self.cli.get_buffer_config();
         self.parser.init(&config);
         self.newlines_scratch.reserve(1024);  // 4KB @Tune @Constant
+
+        self.subdirs_arena.clear();
+        self.entries_arena.clear();
     }
 
     #[inline(always)]
@@ -662,14 +716,14 @@ impl<'a, F: RawFs, S: MatchSink> WorkerCtx<'a, F, S> {
         WorkerResult {
             stats: self.stats,
             verdict_fingerprints: self.pending_verdict_fingerprints,
-            entries_arena: self.entries_arena,
+            entries_arena: self.fs.erase_entries_arena(self.entries_arena),
             parser: self.parser,
             path_arena: self.path_arena,
-            file_entries_arena: self.file_entries_arena,
+            file_entries_arena: self.fs.erase_file_entry_arena(self.file_entries_arena),
             swap_path_buf: self.swap_path_buf,
             output: self.output,
             path_buf: self.path_buf,
-            subdirs_arena: self.subdirs_arena,
+            subdirs_arena: self.fs.erase_subdirs_arena(self.subdirs_arena),
             ranges_scratch: self.ranges_scratch,
             line_ranges_scratch: self.line_ranges_scratch,
             newlines_scratch: self.newlines_scratch,
@@ -718,7 +772,7 @@ impl<'a, F: RawFs, S: MatchSink> WorkerCtx<'a, F, S> {
 // impl block of gitignore helper functions
 impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
     #[inline]
-    fn try_load_gitignore(&mut self, gi_file_id: FileId) -> Option<Gitignore> {
+    fn try_load_gitignore(&mut self, gi_file_id: F::FileId) -> Option<Gitignore> {
         let _span = tracy::span!("WorkerCtx::try_load_gitignore");
 
         if let Ok(gi_node) = self.fs.parse_node(gi_file_id) {
@@ -735,7 +789,7 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
     }
 
     #[inline(always)]
-    fn find_gitignore_file_id_in_buf(&self, kind: BufKind) -> Option<FileId> {
+    fn find_gitignore_file_id_in_buf(&self, kind: BufKind) -> Option<F::FileId> {
         self.parser.find_file_id_in_buf(self.fs, b".gitignore", kind)
     }
 }
@@ -753,7 +807,11 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
         let (start, end) = self.path_arena.push_path(&[], false, work.path_bytes());
 
         let result = self.dispatch_directory_bytes(
-            work.file_id, start, end, &work.gitignore_chain, work.depth(), local, injector,
+            F::FileId::from_uni(work.file_id),
+            start, end,
+            &work.gitignore_chain,
+            work.depth(),
+            local, injector,
         );
 
         //
@@ -770,7 +828,9 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
 
     #[inline]
     pub fn dispatch_file(&mut self, work: FileWork) -> io::Result<()> {
-        let (result, cache_stats) = self.fs.parse_node_cached(work.file_id, &mut self.node_cache);
+        let file_id = F::FileId::from_uni(work.file_id);
+
+        let (result, cache_stats) = self.fs.parse_node_cached(file_id, &mut self.node_cache);
         self.stats.node_cache_hits   += cache_stats.hits;
         self.stats.node_cache_misses += cache_stats.misses;
         let Ok(node) = result else {
@@ -794,7 +854,7 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
     #[allow(clippy::too_many_arguments, reason = "@Incomplete?..")]
     pub fn dispatch_directory_bytes(
         &mut self,
-        file_id: u64,
+        file_id: F::FileId,
         path_start: u32,
         path_end: u32,
         gitignore_chain: &GitignoreChain,
@@ -1007,7 +1067,7 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
         for i in (queue_start..queue_end).rev() {
             let p = *self.subdirs_arena.get_(i);
             local.push(WorkItem::Directory(DirWork::new(
-                p.file_id,
+                p.file_id.into_uni(),
                 self.path_arena.slice(p.path_start, p.path_start + p.path_len as u32),
                 p.depth,
                 gitignore_chain.clone(),
@@ -1110,7 +1170,7 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
             }
 
             let node = *nodes.get_(node_index);
-            if node.file_id() == 0 { continue; }  // Poisoned...
+            if node.is_poisoned() { continue; }
 
             let (_, name_fat_ptr) = *self.file_entries_arena.get_(i);
 
@@ -1177,7 +1237,7 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
         entry_index: usize,
         batch_cold: &mut Option<bool>
     ) -> LookaheadResult {
-        if hot.file_id() == 0 { return LookaheadResult::NONE; }  // Poisoned...
+        if hot.is_poisoned() { return LookaheadResult::NONE; }
 
         if !self.cli.should_ignore_all_filters() && hot.size() > self.max_file_byte_size() as u64 {
             return LookaheadResult::NONE;
@@ -1354,7 +1414,7 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
                 .and_then(|p| if p + 1 < file_name.len() { Some(file_name.get_(p + 1..)) } else { None })
                 .unwrap_or(file_name);
 
-            binary_worker_table::record(file_ext_or_name, node.file_id(), rejected);
+            binary_worker_table::record(file_ext_or_name, node.file_id().into_uni(), rejected);
 
             self.dir_tally.record(rejected);
 

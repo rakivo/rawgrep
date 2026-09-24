@@ -23,7 +23,7 @@
 
 use crate::debug;
 use crate::util::likely;
-use crate::parser::FileId;
+use crate::parser::UniversalFileId;
 use crate::index_::{Index_, IndexMut_};
 use crate::util::{RawAppend, read_u64_unaligned_le, mmap_populate};
 
@@ -65,7 +65,7 @@ pub fn holder_path() -> Option<PathBuf> {
 
 // Might this file's data blocks be stale in the device page cache?
 #[inline(always)]
-pub fn needs_invalidation(inode: FileId, ctime_sec: i64) -> bool {
+pub fn needs_invalidation(inode: UniversalFileId, ctime_sec: i64) -> bool {
     debug_assert_eq!(inode >> 32, 0, "inode doesn't fit in u32 since stale module assumes ext4 (@Incomplete)");
 
     if likely(ctime_sec < CANDIDATE_FROM.load(Relaxed)) { return false; }

@@ -80,7 +80,7 @@ pub use cache::CacheStats;
 pub use grep::RawGrepper;
 pub use ctx::RawGrepCtx;
 
-use grep::FsType;
+use grep::FileSystem;
 use worker::MatchSink;
 
 pub const CURSOR_HIDE:   &str = "\x1b[?25l";
@@ -293,7 +293,7 @@ pub fn run_with_inspect<S: MatchSink + 'static>(
     config: RawGrepConfig,
     running: Arc<AtomicBool>,
     sink: S,
-    inspect_before_search: impl FnOnce(&Path, &str, FsType, &str) // (search root, device, fs, pattern)
+    inspect_before_search: impl FnOnce(&Path, &str, FileSystem, &str) // (search root, device, fs, pattern)
 ) -> Result<(Stats, Option<CacheStats>)> {
     let mut ctx = RawGrepCtx::new(config.threads.get(), running);
     ctx.search(&config, sink, inspect_before_search)?;
@@ -305,7 +305,7 @@ pub fn run_with_inspect_for_single_search<S: MatchSink + 'static>(
     config: RawGrepConfig,
     running: Arc<AtomicBool>,
     sink: S,
-    inspect_before_search: impl FnOnce(&Path, &str, FsType, &str) // (search root, device, fs, pattern)
+    inspect_before_search: impl FnOnce(&Path, &str, FileSystem, &str) // (search root, device, fs, pattern)
 ) -> Result<(Stats, Option<CacheStats>)> {
     let mut ctx = RawGrepCtx::new_for_single_search(
         config.threads.get(), running, &config,

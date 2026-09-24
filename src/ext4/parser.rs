@@ -6,14 +6,13 @@ use crate::{tracy, util, stale};
 use crate::index_::{Index_, IndexMut_};
 use crate::binary_verdicts;
 use crate::util::{likely, unlikely, read_u16_unaligned_le, read_u32_unaligned_le, read_u64_unaligned_le, read_u64_as_u32_and_u16_unaligned_le};
-use crate::grep::{AnyNodeHotScratch, AnyNodeColdScratch, AnyNodeCache, NodeCacheStats};
-use crate::parser::{BufFatPtr, BufKind, FileId, FileNode, FileType, Parser, RawFs, binary_probe, FastDivU32};
+use crate::grep::NodeCacheStats;
+use crate::parser::{BufFatPtr, BufKind, FileNode, FileType, Parser, RawFs, binary_probe, FastDivU32};
 use crate::worker::{STREAMING_CHUNK_SIZE, PendingSubdir};
 
 use super::*;
 
-#[cfg(unix)]
-use std::os::fd::AsRawFd;
+use std::os::fd::{RawFd, AsRawFd};
 use std::fs::File;
 use std::{io, mem};
 use std::ops::ControlFlow;
@@ -70,42 +69,35 @@ impl Default for InodeBlockCache {
 /// Ext4 filesystem context
 pub struct Ext4Fs {
     pub file: File,
+    pub file_as_fd: RawFd,
     pub sb: Ext4SuperBlock,
     pub device_id: u64,
     pub max_block: u64,
     pub inode_table_blocks: Vec<u64>,
 }
 
-impl FileNode for Ext4Node {
+impl FileNode<ext4::FileId> for Ext4Node {
     const POISONED: Self = Self::POISONED;
-    #[inline(always)] fn file_id(&self) -> FileId { self.hot.file_id() }
+    #[inline(always)] fn file_id(&self) -> ext4::FileId { self.hot.file_id() }
     #[inline(always)] fn size(&self) -> u64 { self.hot.size() }
     #[inline(always)] fn mtime_sec(&self) -> i64 { self.hot.mtime_sec() }
     #[inline(always)] fn is_dir(&self) -> bool { self.hot.is_dir() }
 }
 
-impl FileNode for Ext4NodeHot {
+impl FileNode<ext4::FileId> for Ext4NodeHot {
     const POISONED: Self = Self::POISONED;
 
     #[inline(always)]
-    fn file_id(&self) -> FileId {
-        self.inode_num as _
-    }
+    fn file_id(&self) -> ext4::FileId { self.inode_num }
 
     #[inline(always)]
-    fn size(&self) -> u64 {
-        self.size
-    }
+    fn size(&self) -> u64 { self.size }
 
     #[inline(always)]
-    fn mtime_sec(&self) -> i64 {
-        self.mtime_sec
-    }
+    fn mtime_sec(&self) -> i64 { self.mtime_sec }
 
     #[inline(always)]
-    fn is_dir(&self) -> bool {
-        (self.mode & super::EXT4_S_IFMT) == super::EXT4_S_IFDIR
-    }
+    fn is_dir(&self) -> bool { (self.mode & super::EXT4_S_IFMT) == super::EXT4_S_IFDIR }
 }
 
 impl RawFs for Ext4Fs {
@@ -113,27 +105,27 @@ impl RawFs for Ext4Fs {
     type NodeCold  = Ext4NodeCold;
     type NodeHot   = Ext4NodeHot;
     type NodeCache = InodeBlockCache;
+    type FileId    = ext4::FileId;
+
+    const FILE_SYSTEM: crate::grep::FileSystem = crate::grep::FileSystem::Ext4;
 
     type Context<'b> = &'b Self where Self: 'b;
 
     #[inline(always)]
-    fn device_id(&self) -> u64 {
-        self.device_id
-    }
+    fn device_id(&self) -> u64 { self.device_id }
 
     #[inline(always)]
-    fn device_file(&self) -> &File {
-        &self.file
-    }
+    fn device_file(&self) -> &File { &self.file }
 
     #[inline(always)]
-    fn block_size(&self) -> u32 {
-        self.sb.block_size
-    }
+    fn block_size(&self) -> u32 { self.sb.block_size }
 
     #[inline(always)]
-    fn root_id(&self) -> FileId {
-        EXT4_ROOT_INODE as FileId
+    fn root_id(&self) -> Self::FileId { EXT4_ROOT_INODE }
+
+    #[inline(always)]
+    fn read_at_offset(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+        crate::util::read_at_offset_impl(self.file_as_fd, buf, offset)
     }
 
     #[inline(always)]
@@ -148,7 +140,7 @@ impl RawFs for Ext4Fs {
     #[inline(always)]
     fn parse_node_cached(
         &self,
-        file_id: FileId,
+        file_id: Self::FileId,
         cache: &mut InodeBlockCache
     ) -> (io::Result<Ext4Node>, NodeCacheStats) {
         let inode_num = file_id as INodeNum;
@@ -162,7 +154,7 @@ impl RawFs for Ext4Fs {
         let block_size = self.sb.block_size as u64;
         let inode_size = self.sb.inode_size as usize;
 
-        let inode_offset = self.inode_disk_offset(file_id);
+        let inode_offset = self.inode_disk_offset(file_id as _);
         let block_start  = (inode_offset / block_size) * block_size;
 
         let mut stats = NodeCacheStats::default();
@@ -188,7 +180,7 @@ impl RawFs for Ext4Fs {
     #[inline(always)]
     fn parse_nodes_batch(
         &self,
-        entries: &[(FileId, BufFatPtr)],
+        entries: &[(Self::FileId, BufFatPtr)],
         cache: &mut InodeBlockCache,
         hot_out:  &mut Vec<Self::NodeHot>,
         cold_out: &mut Vec<Self::NodeCold>,
@@ -218,10 +210,10 @@ impl RawFs for Ext4Fs {
     }
 
     #[inline]
-    fn parse_node(&self, file_id: FileId) -> io::Result<Ext4Node> {
+    fn parse_node(&self, file_id: Self::FileId) -> io::Result<Ext4Node> {
         let _span = tracy::span!("Ext4Fs::parse_node");
 
-        let inode_offset = self.inode_disk_offset(file_id);
+        let inode_offset = self.inode_disk_offset(file_id as _);
 
         let mut buf = std::mem::MaybeUninit::<[u8; 256]>::uninit();
         let buf = unsafe {
@@ -234,7 +226,7 @@ impl RawFs for Ext4Fs {
     }
 
     #[inline(always)]
-    fn sort_entries_by_offset(&self, entries: &mut [(FileId, BufFatPtr)]) {
+    fn sort_entries_by_offset(&self, entries: &mut [(Self::FileId, BufFatPtr)]) {
         #[cfg(feature = "profile-sort-lens")]
         eprintln!("{}", entries.len());
 
@@ -242,7 +234,7 @@ impl RawFs for Ext4Fs {
     }
 
     #[inline(always)]
-    fn sort_subdirs_by_offset(&self, subdirs: &mut [PendingSubdir]) {
+    fn sort_subdirs_by_offset(&self, subdirs: &mut [PendingSubdir<Self::FileId>]) {
         subdirs.sort_unstable_by_key(|subdir| self.inode_disk_offset(subdir.file_id));
 
         //
@@ -476,12 +468,12 @@ impl RawFs for Ext4Fs {
             // This needs the whole extent list, so it's parsed here rather than after the probe.
             //
             #[cfg(target_os = "linux")]
-            if unlikely(!node.is_dir() && stale::needs_invalidation(node.file_id(), node.cold.ctime_sec)) {
+            if unlikely(!node.is_dir() && stale::needs_invalidation(node.file_id() as _, node.cold.ctime_sec)) {
                 self.parse_extent_node_into(scratch, scratch3, block_bytes, 0)?;
                 parsed = true;
 
                 let ok = self.drop_stale_extents(Self::scratch_as_extents(scratch), max_size);
-                stale::note_invalidated(node.file_id(), node.cold.ctime_sec, ok && max_size >= file_size);
+                stale::note_invalidated(node.file_id() as _, node.cold.ctime_sec, ok && max_size >= file_size);
             }
 
             let mut first_start = if !check_binary {
@@ -612,7 +604,7 @@ impl RawFs for Ext4Fs {
         // Same as in the extents branch ...
         //
         #[cfg(target_os = "linux")]
-        if unlikely(!node.is_dir() && stale::needs_invalidation(node.file_id(), node.cold.ctime_sec)) {
+        if unlikely(!node.is_dir() && stale::needs_invalidation(node.file_id() as _, node.cold.ctime_sec)) {
             let mut left = max_size as u64;
             let mut ok   = true;
 
@@ -626,7 +618,7 @@ impl RawFs for Ext4Fs {
                 ok &= self.drop_stale_range(b as u64 * block_size, n);
             }
 
-            stale::note_invalidated(node.file_id(), node.cold.ctime_sec, ok && max_size >= file_size);
+            stale::note_invalidated(node.file_id() as _, node.cold.ctime_sec, ok && max_size >= file_size);
         }
 
         let mut skip_first = 0usize;
@@ -696,7 +688,7 @@ impl RawFs for Ext4Fs {
     fn with_directory_entries<R>(
         &self,
         buf: &[u8],
-        mut callback: impl FnMut(FileId, usize, usize, FileType) -> ControlFlow<R>
+        mut callback: impl FnMut(Self::FileId, usize, usize, FileType) -> ControlFlow<R>
     ) -> Option<R> {
         let _span = tracy::span!("Ext4Fs::with_directory_entries");
 
@@ -740,7 +732,7 @@ impl RawFs for Ext4Fs {
                 _ => FileType::Other,
             };
 
-            match callback(inode as FileId, name_start, name_len as usize, file_type) {
+            match callback(inode, name_start, name_len as usize, file_type) {
                 ControlFlow::Break(b) => return Some(b),
                 ControlFlow::Continue(_) => {}
             }
@@ -756,43 +748,14 @@ impl RawFs for Ext4Fs {
         buf.len() / MIN_ENTRY
     }
 
-    #[inline]
-    fn take_node_hot_scratch(&self, shared: &mut AnyNodeHotScratch) -> Vec<Ext4NodeHot> {
-        match std::mem::replace(shared, AnyNodeHotScratch::Ext4(Vec::new())) {
-            AnyNodeHotScratch::Ext4(v) => v,
-            _ => Vec::new(), // Last job on this thread was a different FS...
-        }
-    }
-
-    #[inline]
-    fn take_node_cold_scratch(&self, shared: &mut AnyNodeColdScratch) -> Vec<Ext4NodeCold> {
-        match std::mem::replace(shared, AnyNodeColdScratch::Ext4(Vec::new())) {
-            AnyNodeColdScratch::Ext4(v) => v,
-            _ => Vec::new(), // Last job on this thread was a different FS...
-        }
-    }
-
-    #[inline]
-    fn take_node_cache(&self, shared: &mut AnyNodeCache) -> InodeBlockCache {
-        match std::mem::replace(shared, AnyNodeCache::Ext4(InodeBlockCache::default())) {
-            AnyNodeCache::Ext4(c) => c,
-            _ => InodeBlockCache::default(),
-        }
-    }
-
-    #[inline]
-    fn erase_node_hot_scratch(&self, scratch: Vec<Ext4NodeHot>) -> AnyNodeHotScratch { AnyNodeHotScratch::Ext4(scratch) }
-    #[inline]
-    fn erase_node_cold_scratch(&self, scratch: Vec<Ext4NodeCold>) -> AnyNodeColdScratch { AnyNodeColdScratch::Ext4(scratch) }
-    #[inline]
-    fn erase_node_cache(&self, cache: InodeBlockCache) -> AnyNodeCache { AnyNodeCache::Ext4(cache) }
+    crate::impl_node_scratch!(Ext4);
 }
 
 // ext4-specific helper methods
 impl Ext4Fs {
     #[inline(always)]
-    pub fn inode_disk_offset(&self, inode_num: u64) -> u64 {
-        let (group, index) = self.sb.inodes_per_group_recip.divmod(inode_num - 1);
+    pub fn inode_disk_offset(&self, inode_num: u32) -> u64 {
+        let (group, index) = self.sb.inodes_per_group_recip.divmod(inode_num as u64 - 1);
 
         self.inode_table_blocks.get_(group as usize)
             * self.sb.block_size as u64
@@ -1143,7 +1106,7 @@ impl Ext4Fs {
     /// that are equal or adjacent (the common case once ids are sorted by inode_disk_offset)
     /// collapse into one range. Unsorted input is still correct, just coalesces less.
     #[cfg(unix)]
-    fn hint_inode_blocks(&self, file_ids: impl Iterator<Item = FileId>) {
+    fn hint_inode_blocks(&self, file_ids: impl Iterator<Item = ext4::FileId>) {
         use run_temperature::INODES;
 
         let mut want_sample = INODES.want_sample();

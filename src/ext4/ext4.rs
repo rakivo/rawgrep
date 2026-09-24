@@ -6,6 +6,7 @@ use std::fmt::Display;
 use crate::parser::FastDivU32;
 
 pub type INodeNum = u32;
+pub type FileId   = INodeNum;
 
 // pub const MAX_SYMLINK_TARGET_SIZE: usize = 4096;
 // pub const FAST_SYMLINK_SIZE: usize = 60; // Symlinks < 60 bytes stored in inode

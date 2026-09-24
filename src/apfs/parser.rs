@@ -14,13 +14,12 @@
 //!   - Snapshots / multiple transaction epochs
 //!   - Encryption (wrapped keys)
 
-use crate::tracy;
+use crate::{util, tracy};
 use crate::unwrap_::Unwrap_;
-use crate::util::{self, read_at_offset};
-use crate::grep::{AnyNodeHotScratch, AnyNodeColdScratch};
-use crate::parser::{BufKind, FileId, FileNode, FileType, Parser, RawFs, binary_probe};
+use crate::parser::{BufKind, UniversalFileId, FileNode, FileType, Parser, RawFs, binary_probe};
 
-use super::{
+use super::apfs::{
+    self,
     raw, ApfsNode, ApfsSuperBlock, ApfsVolume,
     APFS_NX_MAGIC, APFS_APSB_MAGIC,
     APFS_NX_BLOCK_SIZE_OFFSET, APFS_NX_OMAP_OID_OFFSET, APFS_NX_FS_OID_OFFSET,
@@ -35,6 +34,7 @@ use super::{
 
 use std::fs::File;
 use std::{io, mem};
+use std::os::fd::RawFd;
 use std::ops::ControlFlow;
 
 // -----------------------------------------------------------------------------
@@ -44,31 +44,32 @@ use std::ops::ControlFlow;
 /// APFS container (one or more volumes).  We expose the *first* volume only,
 /// which matches the common single-volume case seen in practice.
 pub struct ApfsFs {
-    pub file:      File,
-    pub sb:        ApfsSuperBlock,
-    pub volume:    ApfsVolume,
-    pub device_id: u64,
+    pub file:       File,
+    pub file_as_fd: RawFd,
+    pub sb:         ApfsSuperBlock,
+    pub volume:     ApfsVolume,
+    pub device_id:  u64,
 }
 
 // -----------------------------------------------------------------------------
 // FileNode impl
 // -----------------------------------------------------------------------------
 
-impl FileNode for ApfsNodeHot {
+impl FileNode<apfs::FileId> for ApfsNodeHot {
     const POISONED: Self = Self::POISONED;
-    #[inline(always)] fn file_id(&self)   -> FileId { self.inode_num }
+    #[inline(always)] fn file_id(&self)   -> apfs::FileId { self.inode_num }
     #[inline(always)] fn size(&self)      -> u64    { self.size }
     #[inline(always)] fn mtime_sec(&self) -> i64    { self.mtime_sec }
     #[inline(always)] fn is_dir(&self)    -> bool   { (self.mode & S_IFMT) == S_IFDIR }
 }
 
-impl FileNode for ApfsNode {
+impl FileNode<apfs::FileId> for ApfsNode {
     const POISONED: Self = Self::POISONED;
 
-    #[inline(always)] fn file_id(&self) -> FileId { self.inode_num }
-    #[inline(always)] fn size(&self)    -> u64    { self.size }
-    #[inline(always)] fn mtime_sec(&self)   -> i64    { self.mtime_sec }
-    #[inline(always)] fn is_dir(&self)  -> bool   { (self.mode & S_IFMT) == S_IFDIR }
+    #[inline(always)] fn file_id(&self)   -> apfs::FileId { self.inode_num }
+    #[inline(always)] fn size(&self)      -> u64    { self.size }
+    #[inline(always)] fn mtime_sec(&self) -> i64    { self.mtime_sec }
+    #[inline(always)] fn is_dir(&self)    -> bool   { (self.mode & S_IFMT) == S_IFDIR }
 }
 
 // -----------------------------------------------------------------------------
@@ -76,16 +77,24 @@ impl FileNode for ApfsNode {
 // -----------------------------------------------------------------------------
 
 impl RawFs for ApfsFs {
-    type Node     = ApfsNode;
-    type NodeHot  = ApfsNodeHot;
-    type NodeCold = ApfsNodeCold;
+    type Node        = ApfsNode;
+    type NodeHot     = ApfsNodeHot;
+    type NodeCold    = ApfsNodeCold;
     type Context<'b> = &'b Self where Self: 'b;
-    type NodeCache = ();
+    type NodeCache   = ();
+    type FileId      = apfs::FileId;
+
+    const FILE_SYSTEM: crate::grep::FileSystem = crate::grep::FileSystem::Apfs;
 
     #[inline(always)] fn device_id(&self)   -> u64 { self.device_id }
     #[inline(always)] fn device_file(&self) -> &File { &self.file }
     #[inline(always)] fn block_size(&self)  -> u32 { self.sb.block_size }
-    #[inline(always)] fn root_id(&self)     -> FileId { APFS_ROOT_DIR_INO_NUM }
+    #[inline(always)] fn root_id(&self)     -> UniversalFileId { APFS_ROOT_DIR_INO_NUM }
+
+    #[inline(always)]
+    fn read_at_offset(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+        crate::util::read_at_offset_impl(self.file_as_fd, buf, offset)
+    }
 
     #[inline(always)]
     fn split_node(&self, node: Self::Node) -> (Self::NodeHot, Self::NodeCold) {
@@ -103,7 +112,7 @@ impl RawFs for ApfsFs {
     #[inline]
     fn parse_node_cached(
         &self,
-        file_id: FileId,
+        file_id: UniversalFileId,
         _cache: &mut Self::NodeCache
     ) -> (io::Result<Self::Node>, crate::grep::NodeCacheStats)
     {
@@ -111,7 +120,7 @@ impl RawFs for ApfsFs {
     }
 
     #[inline]
-    fn parse_node(&self, file_id: FileId) -> io::Result<Self::Node> {
+    fn parse_node(&self, file_id: UniversalFileId) -> io::Result<Self::Node> {
         let _span = tracy::span!("ApfsFs::parse_node");
         self.lookup_inode(file_id)
     }
@@ -201,7 +210,7 @@ impl RawFs for ApfsFs {
     fn with_directory_entries<R>(
         &self,
         buf: &[u8],
-        mut callback: impl FnMut(FileId, usize, usize, FileType) -> ControlFlow<R>,
+        mut callback: impl FnMut(UniversalFileId, usize, usize, FileType) -> ControlFlow<R>,
     ) -> Option<R> {
         let _span = tracy::span!("ApfsFs::with_directory_entries");
 
@@ -235,24 +244,7 @@ impl RawFs for ApfsFs {
     #[inline]
     fn directory_entry_count_hint(&self, _buf: &[u8]) -> usize { 0 } // @Incomplete
 
-    #[inline]
-    fn take_node_hot_scratch(&self, shared: &mut AnyNodeHotScratch) -> Vec<ApfsNodeHot> {
-        match std::mem::replace(shared, AnyNodeHotScratch::Apfs(Vec::new())) {
-            AnyNodeHotScratch::Apfs(v) => v,
-            _ => Vec::new(),
-        }
-    }
-    #[inline]
-    fn take_node_cold_scratch(&self, shared: &mut AnyNodeColdScratch) -> Vec<ApfsNodeCold> {
-        match std::mem::replace(shared, AnyNodeColdScratch::Apfs(Vec::new())) {
-            AnyNodeColdScratch::Apfs(v) => v,
-            _ => Vec::new(),
-        }
-    }
-    #[inline]
-    fn erase_node_hot_scratch(&self, scratch: Vec<ApfsNodeHot>) -> AnyNodeHotScratch { AnyNodeHotScratch::Apfs(scratch) }
-    #[inline]
-    fn erase_node_cold_scratch(&self, scratch: Vec<ApfsNodeCold>) -> AnyNodeColdScratch { AnyNodeColdScratch::Apfs(scratch) }
+    crate::impl_node_scratch!(Apfs);
 }
 
 // -----------------------------------------------------------------------------
@@ -343,11 +335,6 @@ impl ApfsFs {
 // -----------------------------------------------------------------------------
 
 impl ApfsFs {
-    #[inline]
-    fn read_at_offset(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
-        read_at_offset(&self.file, buf, offset)
-    }
-
     #[inline]
     fn read_block(&self, buf: &mut [u8], paddr: u64) -> io::Result<()> {
         let offset = paddr * self.sb.block_size as u64;
@@ -615,7 +602,7 @@ impl ApfsFs {
     fn scan_dir_entries<R>(
         &self,
         dir_ino:  u64,
-        mut cb:   impl FnMut(FileId, &[u8], u8) -> ControlFlow<R>,
+        mut cb:   impl FnMut(UniversalFileId, &[u8], u8) -> ControlFlow<R>,
     ) -> io::Result<Option<R>> {
         self.walk_fs_tree(dir_ino, APFS_TYPE_DIR_REC, |key, val| {
             // key: JDrecHashedKey (16 bytes: JKey(8) + name_len_and_hash(4) + _pad(4)) + name

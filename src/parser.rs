@@ -1,8 +1,9 @@
 use crate::tracy;
 use crate::index_::Index_;
-use crate::grep::{AnyNodeCache, AnyNodeHotScratch, AnyNodeColdScratch, NodeCacheStats};
+use crate::grep::{FileSystem, AnyNodeCache, AnyNodeHotScratch, AnyNodeColdScratch, NodeCacheStats};
 use crate::binary::{is_binary_chunk, is_dot_entry, is_hidden_entry};
 use crate::worker::{BINARY_PROBE_BYTE_SIZE, PendingSubdir, STREAMING_CHUNK_SIZE};
+use crate::worker::{AnyFileEntryArena, AnySubdirsArena, AnyEntriesArena, FileEntryArena, SubdirsArena, EntriesArena};
 use crate::cli::BufferConfig;
 
 use std::fs::File;
@@ -10,34 +11,26 @@ use std::io;
 use std::ops::ControlFlow;
 
 #[repr(u8)]
+#[derive(Copy, Clone, PartialEq, Eq)]
+pub enum FileType { Dir, File, Other }
+
+#[repr(u8)]
 #[derive(Copy, Clone)]
-pub enum BufKind {
-    Dir,
-    File,
-    Gitignore
-}
+pub enum BufKind { Dir, File, Gitignore }
 
 #[derive(Copy, Clone)]
 pub struct BufFatPtr {
     pub offset: u32,
-    pub len: u32,
-    pub kind: BufKind
+    pub len:    u32,
+    pub kind:   BufKind
 }
 
 #[derive(Clone, Copy)]
-pub struct ParsedEntry {
-    pub file_id: FileId,
+pub struct ParsedEntry<FileId: Copy> {
+    pub file_id:     FileId,
     pub name_offset: u32,
-    pub name_len: u16,
-    pub file_type: FileType
-}
-
-#[repr(u8)]
-#[derive(Copy, Clone, PartialEq, Eq)]
-pub enum FileType {
-    File,
-    Dir,
-    Other
+    pub name_len:    u16,
+    pub file_type:   FileType
 }
 
 /// Uniquely identifies a file across reboots
@@ -45,12 +38,12 @@ pub enum FileType {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FileKey {
     pub device_id: u64,
-    pub inode:     u64,
+    pub inode:     UniversalFileId,
 }
 
 impl FileKey {
     #[inline(always)]
-    pub const fn new(device_id: u64, inode: u64) -> Self {
+    pub const fn new(device_id: u64, inode: UniversalFileId) -> Self {
         Self { device_id, inode }
     }
 
@@ -82,29 +75,40 @@ pub struct FileIdentifier {
     pub meta: FileMeta
 }
 
-pub type FileId = u64;
+pub type UniversalFileId = u64;
+
+pub trait FileId: Copy {
+    fn from_uni(id: UniversalFileId) -> Self;
+    fn into_uni(self)                -> UniversalFileId;
+}
 
 /// Filesystem-agnostic file node info
-pub trait FileNode: Copy {
+pub trait FileNode<FileId: self::FileId>: Copy {
     /// Sentinel written into a batch slot when `parse_node` fails, so callers
     /// get a fixed-size Vec<Node> back instead of Vec<Result<Node, _>> / Vec<Option<Node>>.
     const POISONED: Self;
 
-    fn file_id(&self) -> FileId;
-    fn size(&self) -> u64;
+    #[inline(always)]
+    fn is_poisoned(&self) -> bool { self.file_id().into_uni() == 0 }
+
+    fn file_id(&self)   -> FileId;
+    fn size(&self)      -> u64;
     fn mtime_sec(&self) -> i64;
-    fn is_dir(&self) -> bool;
+    fn is_dir(&self)    -> bool;
 }
 
 /// Raw filesystem abstraction
 pub trait RawFs: Sync + Send {
     /// Filesystem-specific file node type (e.g., Ext4Inode)
-    type Node: FileNode;
+    type FileId: FileId;
+    type Node: FileNode<Self::FileId>;
 
-    type NodeHot:  Copy + FileNode;   // file_id, size, mtime_sec, mode/is_dir
-    type NodeCold: Copy + Default;    // flags, blocks, whatever only a surviving file reads
+    type NodeHot:  Copy + FileNode<Self::FileId>;  // file_id, size, mtime_sec, mode/is_dir
+    type NodeCold: Copy + Default;                 // flags, blocks, whatever only a surviving file reads
 
     type NodeCache: Default;
+
+    const FILE_SYSTEM: FileSystem;
 
     /// Filesystem-specific context (e.g., superblock + mmap reference)
     type Context<'a>: Copy where Self: 'a;
@@ -115,9 +119,9 @@ pub trait RawFs: Sync + Send {
     fn device_file(&self) -> &File;
 
     #[inline(always)]
-    fn file_identifier<N: FileNode>(&self, node: N) -> FileIdentifier {
+    fn file_identifier<N: FileNode<Self::FileId>>(&self, node: N) -> FileIdentifier {
         FileIdentifier {
-            key: FileKey::new(self.device_id(), node.file_id()),
+            key: FileKey::new(self.device_id(), node.file_id().into_uni()),
             meta: FileMeta::new(node.mtime_sec(), node.size())
         }
     }
@@ -125,7 +129,7 @@ pub trait RawFs: Sync + Send {
     fn split_node(&self, node: Self::Node) -> (Self::NodeHot, Self::NodeCold);
     fn merge_node(&self, hot: Self::NodeHot, cold: Self::NodeCold) -> Self::Node;
 
-    #[inline]
+    #[inline(always)]
     fn read_at_offset(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
         crate::util::read_at_offset(self.device_file(), buf, offset)
     }
@@ -134,12 +138,12 @@ pub trait RawFs: Sync + Send {
     fn block_size(&self) -> u32;
 
     /// Root file ID
-    fn root_id(&self) -> FileId;
+    fn root_id(&self) -> Self::FileId;
 
     // @Incomplete
     fn parse_nodes_batch(
         &self,
-        entries:  &[(FileId, BufFatPtr)],
+        entries:  &[(Self::FileId, BufFatPtr)],
         _cache:   &mut Self::NodeCache,
         hot_out:  &mut Vec<Self::NodeHot>,
         cold_out: &mut Vec<Self::NodeCold>,
@@ -162,18 +166,18 @@ pub trait RawFs: Sync + Send {
     /// Parse file node by ID
     fn parse_node_cached(
         &self,
-        file_id: FileId,
+        file_id: Self::FileId,
         cache: &mut Self::NodeCache
     ) -> (io::Result<Self::Node>, NodeCacheStats);
 
     /// Parse file node by ID
-    fn parse_node(&self, file_id: FileId) -> io::Result<Self::Node>;
+    fn parse_node(&self, file_id: Self::FileId) -> io::Result<Self::Node>;
 
     #[inline]
-    fn sort_entries_by_offset(&self, _entries: &mut [(FileId, BufFatPtr)]) {}
+    fn sort_entries_by_offset(&self, _entries: &mut [(Self::FileId, BufFatPtr)]) {}
 
     #[inline]
-    fn sort_subdirs_by_offset(&self, _subdirs: &mut [PendingSubdir]) {}
+    fn sort_subdirs_by_offset(&self, _subdirs: &mut [PendingSubdir<Self::FileId>]) {}
 
     #[cfg(unix)]
     fn prefetch_file_head(&self, _node: &Self::Node, _max_size: usize) {}
@@ -214,16 +218,100 @@ pub trait RawFs: Sync + Send {
     fn with_directory_entries<R>(
         &self,
         buf: &[u8],
-        callback: impl FnMut(FileId, usize, usize, FileType) -> ControlFlow<R>
+        callback: impl FnMut(Self::FileId, usize, usize, FileType) -> ControlFlow<R>
     ) -> Option<R>;
 
-    fn take_node_hot_scratch(&self,  _shared: &mut AnyNodeHotScratch)  -> Vec<Self::NodeHot>  { Default::default() } // @Incomplete
-    fn take_node_cold_scratch(&self, _shared: &mut AnyNodeColdScratch) -> Vec<Self::NodeCold> { Default::default() } // @Incomplete
-    fn take_node_cache(&self,        _shared: &mut AnyNodeCache)       -> Self::NodeCache     { Default::default() } // @Incomplete
+    // Generated by the impl_node_scratch below in every RawFs impl.
+    fn take_node_hot_scratch(&self,  shared: &mut AnyNodeHotScratch)       -> Vec<Self::NodeHot>;
+    fn take_node_cold_scratch(&self, shared: &mut AnyNodeColdScratch)      -> Vec<Self::NodeCold>;
+    fn take_node_cache(&self,        shared: &mut AnyNodeCache)            -> Self::NodeCache;
+    fn take_file_entry_arena(&self,  shared: &mut AnyFileEntryArena)       -> FileEntryArena<Self::FileId>;
+    fn take_subdirs_arena(&self,     shared: &mut AnySubdirsArena)         -> SubdirsArena<Self::FileId>;
+    fn take_entries_arena(&self,     shared: &mut AnyEntriesArena)         -> EntriesArena<Self::FileId>;
+    fn erase_file_entry_arena(&self,  arena: FileEntryArena<Self::FileId>) -> AnyFileEntryArena;
+    fn erase_subdirs_arena(&self,     arena: SubdirsArena<Self::FileId>)   -> AnySubdirsArena;
+    fn erase_entries_arena(&self,     arena: EntriesArena<Self::FileId>)   -> AnyEntriesArena;
+    fn erase_node_hot_scratch(&self,  scratch: Vec<Self::NodeHot>)         -> AnyNodeHotScratch;
+    fn erase_node_cold_scratch(&self, scratch: Vec<Self::NodeCold>)        -> AnyNodeColdScratch;
+    fn erase_node_cache(&self,        cache: Self::NodeCache)              -> AnyNodeCache;
+}
 
-    fn erase_node_hot_scratch(&self,  _scratch: Vec<Self::NodeHot>)  -> AnyNodeHotScratch  { Default::default() }    // @Incomplete
-    fn erase_node_cold_scratch(&self, _scratch: Vec<Self::NodeCold>) -> AnyNodeColdScratch { Default::default() }    // @Incomplete
-    fn erase_node_cache(&self,        _cache: Self::NodeCache)       -> AnyNodeCache      { Default::default() }     // @Incomplete
+/// Generates take_*/erase_* for the impl it is invoked in.
+#[macro_export]
+macro_rules! impl_node_scratch {
+    ($fs:ident) => {
+        #[inline]
+        fn take_node_hot_scratch(&self, shared: &mut $crate::grep::AnyNodeHotScratch) -> Vec<Self::NodeHot> {
+            debug_assert!(matches!(Self::FILE_SYSTEM, $crate::grep::FileSystem::$fs));
+            match std::mem::replace(shared, $crate::grep::AnyNodeHotScratch::$fs(Vec::new())) {
+                $crate::grep::AnyNodeHotScratch::$fs(v) => v,
+                _ => Vec::new(), // Last job on this thread was a different FS...
+            }
+        }
+        #[inline]
+        fn take_node_cold_scratch(&self, shared: &mut $crate::grep::AnyNodeColdScratch) -> Vec<Self::NodeCold> {
+            debug_assert!(matches!(Self::FILE_SYSTEM, $crate::grep::FileSystem::$fs));
+            match std::mem::replace(shared, $crate::grep::AnyNodeColdScratch::$fs(Vec::new())) {
+                $crate::grep::AnyNodeColdScratch::$fs(v) => v,
+                _ => Vec::new(),
+            }
+        }
+        #[inline]
+        fn take_node_cache(&self, shared: &mut $crate::grep::AnyNodeCache) -> Self::NodeCache {
+            debug_assert!(matches!(Self::FILE_SYSTEM, $crate::grep::FileSystem::$fs));
+            match std::mem::replace(shared, $crate::grep::AnyNodeCache::$fs(Default::default())) {
+                $crate::grep::AnyNodeCache::$fs(c) => c,
+                _ => Default::default(),
+            }
+        }
+        #[inline]
+        fn take_file_entry_arena(&self, shared: &mut $crate::worker::AnyFileEntryArena) -> $crate::worker::FileEntryArena<Self::FileId> {
+            match std::mem::replace(shared, $crate::worker::AnyFileEntryArena::$fs(Vec::new())) {
+                $crate::worker::AnyFileEntryArena::$fs(v) => v,
+                _ => Vec::new(), // Last job on this thread was a different FS...
+            }
+        }
+        #[inline]
+        fn take_subdirs_arena(&self, shared: &mut $crate::worker::AnySubdirsArena) -> $crate::worker::SubdirsArena<Self::FileId> {
+            match std::mem::replace(shared, $crate::worker::AnySubdirsArena::$fs(Vec::new())) {
+                $crate::worker::AnySubdirsArena::$fs(v) => v,
+                _ => Vec::new(),
+            }
+        }
+        #[inline]
+        fn take_entries_arena(&self, shared: &mut $crate::worker::AnyEntriesArena) -> $crate::worker::EntriesArena<Self::FileId> {
+            match std::mem::replace(shared, $crate::worker::AnyEntriesArena::$fs(Vec::new())) {
+                $crate::worker::AnyEntriesArena::$fs(v) => v,
+                _ => Vec::new(),
+            }
+        }
+
+        #[inline]
+        fn erase_file_entry_arena(&self, arena: $crate::worker::FileEntryArena<Self::FileId>) -> $crate::worker::AnyFileEntryArena {
+            $crate::worker::AnyFileEntryArena::$fs(arena)
+        }
+        #[inline]
+        fn erase_subdirs_arena(&self, arena: $crate::worker::SubdirsArena<Self::FileId>) -> $crate::worker::AnySubdirsArena {
+            $crate::worker::AnySubdirsArena::$fs(arena)
+        }
+        #[inline]
+        fn erase_entries_arena(&self, arena: $crate::worker::EntriesArena<Self::FileId>) -> $crate::worker::AnyEntriesArena {
+            $crate::worker::AnyEntriesArena::$fs(arena)
+        }
+
+        #[inline]
+        fn erase_node_hot_scratch(&self, scratch: Vec<Self::NodeHot>) -> $crate::grep::AnyNodeHotScratch {
+            $crate::grep::AnyNodeHotScratch::$fs(scratch)
+        }
+        #[inline]
+        fn erase_node_cold_scratch(&self, scratch: Vec<Self::NodeCold>) -> $crate::grep::AnyNodeColdScratch {
+            $crate::grep::AnyNodeColdScratch::$fs(scratch)
+        }
+        #[inline]
+        fn erase_node_cache(&self, cache: Self::NodeCache) -> $crate::grep::AnyNodeCache {
+            $crate::grep::AnyNodeCache::$fs(cache)
+        }
+    };
 }
 
 /// Result of scanning directory entries
@@ -231,7 +319,7 @@ pub struct DirScanResult {
     pub file_count:    u32,
     pub dir_count:     u32,
     pub entries_start: usize,
-    pub entries_end:  usize,
+    pub entries_end:   usize,
 }
 
 /// Filesystem-agnostic parser with reusable buffers
@@ -303,7 +391,7 @@ impl Parser {
 
     /// Find a file id by name in buf
     #[inline]
-    pub fn find_file_id_in_buf<F: RawFs>(&self, fs: &F, name: &[u8], kind: BufKind) -> Option<FileId> {
+    pub fn find_file_id_in_buf<F: RawFs>(&self, fs: &F, name: &[u8], kind: BufKind) -> Option<F::FileId> {
         fs.with_directory_entries(
             self.get_buf(kind),
             |entry_id, name_start, name_len, _file_type| {
@@ -320,7 +408,7 @@ impl Parser {
     }
 
     #[inline]
-    pub fn scan_directory_entries<F: RawFs>(&self, fs: &F, entries_arena: &mut Vec<ParsedEntry>) -> DirScanResult {
+    pub fn scan_directory_entries<F: RawFs>(&self, fs: &F, entries_arena: &mut Vec<ParsedEntry<F::FileId>>) -> DirScanResult {
         let _span = tracy::span!("scan_directory_entries");
 
         let mut file_count = 0;
@@ -491,3 +579,21 @@ impl FastDivU32 {
         (q, r)
     }
 }
+
+macro_rules! impl_file_id_for_int {
+    ($($t:ty),* $(,)?) => {$(
+        impl FileId for $t {
+            #[inline]
+            fn from_uni(id: UniversalFileId) -> Self {
+                debug_assert!(id <= <$t>::MAX as u64, "FileId does not fit in {}", stringify!($t));
+                id as $t
+            }
+            #[inline]
+            fn into_uni(self) -> UniversalFileId {
+                self as UniversalFileId
+            }
+        }
+    )*};
+}
+
+impl_file_id_for_int!(u32, u64);

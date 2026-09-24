@@ -11,8 +11,8 @@ use crate::{cli, ignore, platform, CursorHide};
 use crate::parser::{Parser, FileIdentifier};
 use crate::cache::CacheStats;
 use crate::stats::{AtomicStats, Stats};
-use crate::grep::{AnyGrepper, FsType, RawGrepper, open_device_and_detect_fs, AnyNodeHotScratch, AnyNodeColdScratch, AnyNodeCache};
-use crate::worker::{DirWork, FileWork, MatchSink, OutputWorker, WorkItem, WorkerCtx, PathArena, FileEntryArena, SubdirsArena, FragmentPresenceBits, OutputMessage, EntriesArena};
+use crate::grep::{AnyGrepper, FileSystem, RawGrepper, open_device_and_detect_fs, AnyNodeHotScratch, AnyNodeColdScratch, AnyNodeCache};
+use crate::worker::{DirWork, FileWork, MatchSink, OutputWorker, WorkItem, WorkerCtx, PathArena, FragmentPresenceBits, OutputMessage, AnySubdirsArena, AnyFileEntryArena, AnyEntriesArena};
 
 use std::fs;
 use std::time::Instant;
@@ -144,7 +144,7 @@ impl<S: MatchSink + 'static> RawGrepCtx<S> {
         running: Arc<AtomicBool>,
         config: &RawGrepConfig,
         sink: S,
-        inspect_before_search: impl FnOnce(&Path, &str, FsType, &str),
+        inspect_before_search: impl FnOnce(&Path, &str, FileSystem, &str),
     ) -> Result<Self, Error> {
         _ = cli::SHOULD_ENABLE_ANSI_COLORING.set(config.enable_color(std::io::stdout().is_terminal()));
 
@@ -288,7 +288,7 @@ impl<S: MatchSink + 'static> RawGrepCtx<S> {
         &self,
         config: &RawGrepConfig,
         sink: S,
-        inspect_before_search: impl FnOnce(&Path, &str, FsType, &str) // (search root, device, fs, pattern)
+        inspect_before_search: impl FnOnce(&Path, &str, FileSystem, &str) // (search root, device, fs, pattern)
     ) -> Result<(), Error> {
         _ = cli::SHOULD_ENABLE_ANSI_COLORING.set(config.enable_color(std::io::stdout().is_terminal()));
 
@@ -361,9 +361,9 @@ fn worker_thread_main<S: MatchSink + 'static>(
     let mut line_ranges_scratch       = Vec::with_capacity(64); // @Speed @Note: If this reallocates we're gonna be really sad.
     let mut fragment_presence_scratch = Vec::with_capacity(16);
     let mut path_arena                = PathArena::new();
-    let mut file_entries_arena        = FileEntryArena::new();
-    let mut subdirs_arena             = SubdirsArena::new();
-    let mut entries_arena             = EntriesArena::new();
+    let mut file_entries_arena        = AnyFileEntryArena::default();
+    let mut subdirs_arena             = AnySubdirsArena::default();
+    let mut entries_arena             = AnyEntriesArena::default();
     let mut output                    = OutputSlotWriter::new(slot_pool, ctx.output_tx.clone());
 
     let mut node_hot_scratch          = AnyNodeHotScratch::default();
@@ -418,9 +418,7 @@ fn worker_thread_main<S: MatchSink + 'static>(
         unsafe { swap_path_buf.set_len(0); }
         newlines_scratch.clear();
         ranges_scratch.clear();
-        subdirs_arena.clear();
         path_arena.clear();
-        entries_arena.clear();
         parser.dont_skip_dot_entries = cli.hidden;
         if fragment_presence_scratch.is_empty() {
             let fragment_hash_count = job.grepper.fragment_hashes().len();
@@ -465,13 +463,13 @@ fn worker_thread_main<S: MatchSink + 'static>(
                     node_hot_scratch: $g.fs().take_node_hot_scratch(&mut node_hot_scratch),
                     node_cold_scratch: $g.fs().take_node_cold_scratch(&mut node_cold_scratch),
                     node_cache:   $g.fs().take_node_cache(&mut node_cache),
-                    entries_arena,
-                    subdirs_arena,
+                    entries_arena: $g.fs().take_entries_arena(&mut entries_arena),
+                    subdirs_arena: $g.fs().take_subdirs_arena(&mut subdirs_arena),
+                    file_entries_arena: $g.fs().take_file_entry_arena(&mut file_entries_arena),
                     newlines_scratch,
                     line_ranges_scratch,
                     ranges_scratch,
                     path_arena,
-                    file_entries_arena,
                     fragment_presence_scratch,
 
                     batch_size_cached: 0,
@@ -557,7 +555,7 @@ fn worker_thread_main<S: MatchSink + 'static>(
 fn build_job_and_initial_work<S: MatchSink + 'static>(
     config: &RawGrepConfig,
     sink: S,
-    inspect_before_search: impl FnOnce(&Path, &str, FsType, &str),
+    inspect_before_search: impl FnOnce(&Path, &str, FileSystem, &str),
 ) -> Result<(SearchJob<S>, WorkItem), Error> {
     let cli = config.to_cli();
 
@@ -594,9 +592,9 @@ fn build_job_and_initial_work<S: MatchSink + 'static>(
     //
 
     let grepper = match fs_type {
-        FsType::Apfs => RawGrepper::new_apfs(&cli, &device, file, sink),
-        FsType::Ext4 => RawGrepper::new_ext4(&cli, &device, file, sink),
-        FsType::Ntfs => RawGrepper::new_ntfs(&cli, &device, file, sink),
+        FileSystem::Apfs => RawGrepper::new_apfs(&cli, &device, file, sink),
+        FileSystem::Ext4 => RawGrepper::new_ext4(&cli, &device, file, sink),
+        FileSystem::Ntfs => RawGrepper::new_ntfs(&cli, &device, file, sink),
     }?;
 
     //

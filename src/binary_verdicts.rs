@@ -14,7 +14,7 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
 use crate::index_::Index_;
-use crate::parser::FileIdentifier;
+use crate::parser::{FileIdentifier, UniversalFileId};
 use crate::util::{read_u32_unaligned_le, read_u64_unaligned_le};
 
 use std::{fs, io, path::Path};
@@ -118,7 +118,7 @@ pub mod binary_worker_table {
 
     /// Record one probe outcome (binary = the probe rejected the file).
     #[inline]
-    pub fn record(file_ext_or_name: &[u8], file_id: u64, binary: bool) {
+    pub fn record(file_ext_or_name: &[u8], file_id: UniversalFileId, binary: bool) {
         let s = slot(file_ext_or_name);
         let v = s.load(Relaxed);
         let (bin, text) = (v >> 16, v & 0xFFFF);

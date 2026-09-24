@@ -3,7 +3,8 @@
 use std::ops::Deref;
 use std::fmt::Display;
 
-pub type ObjId = u64;
+pub type ObjId  = u64;
+pub type FileId = ObjId;
 
 // --- Container Superblock (NX) -----------------------------------------------
 

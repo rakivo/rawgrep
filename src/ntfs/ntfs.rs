@@ -4,6 +4,7 @@ use std::ops::Deref;
 use std::fmt::Display;
 
 pub type MftRecordNum = u64;
+pub type FileId       = MftRecordNum;
 
 // Boot sector
 pub const NTFS_SIGNATURE: &[u8; 8] = b"NTFS    ";
