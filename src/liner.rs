@@ -1,3 +1,6 @@
+use crate::index_::Index_;
+use crate::util::{read_u16_unaligned_le, read_u32_unaligned_le, read_u16_unaligned_be, read_u32_unaligned_be};
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Encoding { Utf32LE, Utf32BE, Utf8, Utf16LE, Utf16BE }
 
@@ -17,8 +20,9 @@ impl Encoding {
 /// handing back valid UTF-8 to the matcher/printer.
 ///
 /// Every codec below is a zero-sized type, so dispatching
-/// through `C: LineCodec` monomorphizes down to fully specialized code
-/// per encoding -- for `RawCodec` (plain bytes / UTF-8).
+/// through `C: LineCodec` monomorphizes down to fully specialized code per
+/// encoding. `RawCodec` (plain bytes / UTF-8) compiles down to nothing
+/// but the newline search.
 pub trait LineCodec {
     /// Byte width of one code unit -- also the width of a raw "\n"
     /// sequence, since a line break is always exactly one code unit.
@@ -52,9 +56,13 @@ pub trait LineCodec {
 
     #[inline(always)]
     fn strip_trailing_cr(line: &[u8]) -> &[u8] {
-        let cr = Self::CR_SUFFIX;
-        if line.len() >= cr.len() && &line[line.len() - cr.len()..] == cr {
-            &line[..line.len() - cr.len()]
+        let n = Self::CR_SUFFIX.len();
+        let m = line.len();
+
+        if  m >= n
+        && (m - n) % Self::UNIT_WIDTH == 0
+        &&  line.get_(m - n..) == Self::CR_SUFFIX {
+            line.get_(..m - n)
         } else {
             line
         }
@@ -95,7 +103,7 @@ impl LineCodec for Utf16LeCodec {
     fn find_newline(data: &[u8]) -> Option<usize> {
         let mut start = 0;
         loop {
-            let pos = start + memchr::memmem::find(&data[start..], &[0x0A, 0x00])?;
+            let pos = start + memchr::memmem::find(data.get_(start..), &[0x0A, 0x00])?;
             if pos % 2 == 0 { return Some(pos); }
             start = pos + 1;
         }
@@ -105,7 +113,7 @@ impl LineCodec for Utf16LeCodec {
     fn rfind_newline(data: &[u8]) -> Option<usize> {
         let mut end = data.len();
         loop {
-            let pos = memchr::memmem::rfind(&data[..end], &[0x0A, 0x00])?;
+            let pos = memchr::memmem::rfind(data.get_(..end), &[0x0A, 0x00])?;
             if pos % 2 == 0 { return Some(pos); }
             end = pos;
         }
@@ -121,16 +129,16 @@ impl LineCodec for Utf16LeCodec {
 
         let mut i = 0;
         while i + 1 < raw.len() {
-            let lo = raw[i];
-            let hi = raw[i + 1];
-            if hi != 0 || lo & 0x80 != 0 { break; }
-            dst.push(lo);
+            let unit = read_u16_unaligned_le(raw, i);
+            if unit & 0xFF80 != 0 { break; }   // hi byte != 0 or bit 7 of lo set
+
+            dst.push(unit as u8);
             i += 2;
         }
 
         if i >= raw.len() { return; }
 
-        let units = raw[i..].chunks_exact(2).map(|b| u16::from_le_bytes([b[0], b[1]]));
+        let units = raw.get_(i..).chunks_exact(2).map(|b| read_u16_unaligned_le(b, 0));
         let mut buf = [0u8; 4];
         for ch in std::char::decode_utf16(units) {
             let ch = ch.unwrap_or(char::REPLACEMENT_CHARACTER);
@@ -150,7 +158,7 @@ impl LineCodec for Utf16BeCodec {
     fn find_newline(data: &[u8]) -> Option<usize> {
         let mut start = 0;
         loop {
-            let pos = start + memchr::memmem::find(&data[start..], &[0x00, 0x0A])?;
+            let pos = start + memchr::memmem::find(data.get_(start..), &[0x00, 0x0A])?;
             if pos % 2 == 0 { return Some(pos); }
             start = pos + 1;
         }
@@ -160,7 +168,7 @@ impl LineCodec for Utf16BeCodec {
     fn rfind_newline(data: &[u8]) -> Option<usize> {
         let mut end = data.len();
         loop {
-            let pos = memchr::memmem::rfind(&data[..end], &[0x00, 0x0A])?;
+            let pos = memchr::memmem::rfind(data.get_(..end), &[0x00, 0x0A])?;
             if pos % 2 == 0 { return Some(pos); }
             end = pos;
         }
@@ -172,16 +180,16 @@ impl LineCodec for Utf16BeCodec {
 
         let mut i = 0;
         while i + 1 < raw.len() {
-            let hi = raw[i];
-            let lo = raw[i + 1];
-            if hi != 0 || lo & 0x80 != 0 { break; }
-            dst.push(lo);
+            let unit = read_u16_unaligned_be(raw, i);
+            if unit & 0xFF80 != 0 { break; }   // hi != 0 or bit 7 of lo set
+
+            dst.push(unit as u8);
             i += 2;
         }
 
         if i >= raw.len() { return; }
 
-        let units = raw[i..].chunks_exact(2).map(|b| u16::from_be_bytes([b[0], b[1]]));
+        let units = raw.get_(i..).chunks_exact(2).map(|b| read_u16_unaligned_be(b, 0));
         let mut buf = [0u8; 4];
         for ch in std::char::decode_utf16(units) {
             let ch = ch.unwrap_or(char::REPLACEMENT_CHARACTER);
@@ -201,7 +209,7 @@ impl LineCodec for Utf32LeCodec {
     fn find_newline(data: &[u8]) -> Option<usize> {
         let mut start = 0;
         loop {
-            let pos = start + memchr::memmem::find(&data[start..], &[0x0A, 0, 0, 0])?;
+            let pos = start + memchr::memmem::find(data.get_(start..), &[0x0A, 0, 0, 0])?;
             if pos % 4 == 0 { return Some(pos); }
             start = pos + 1;
         }
@@ -211,7 +219,7 @@ impl LineCodec for Utf32LeCodec {
     fn rfind_newline(data: &[u8]) -> Option<usize> {
         let mut end = data.len();
         loop {
-            let pos = memchr::memmem::rfind(&data[..end], &[0x0A, 0, 0, 0])?;
+            let pos = memchr::memmem::rfind(data.get_(..end), &[0x0A, 0, 0, 0])?;
             if pos % 4 == 0 { return Some(pos); }
             end = pos;
         }
@@ -223,17 +231,18 @@ impl LineCodec for Utf32LeCodec {
 
         let mut i = 0;
         while i + 3 < raw.len() {
-            let ascii = raw[i];
-            if ascii & 0x80 != 0 || raw[i + 1] != 0 || raw[i + 2] != 0 || raw[i + 3] != 0 { break; }
-            dst.push(ascii);
+            let unit = read_u32_unaligned_le(raw, i);
+            if unit & 0xFFFF_FF80 != 0 { break; }   // upper 3 bytes zero, bit 7 clear
+
+            dst.push(unit as u8);
             i += 4;
         }
 
         if i >= raw.len() { return; }
 
         let mut buf = [0u8; 4];
-        for chunk in raw[i..].chunks_exact(4) {
-            let cp = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        for chunk in raw.get_(i..).chunks_exact(4) {
+            let cp = read_u32_unaligned_le(chunk, 0);
             let ch = char::from_u32(cp).unwrap_or(char::REPLACEMENT_CHARACTER);
             dst.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
         }
@@ -251,7 +260,7 @@ impl LineCodec for Utf32BeCodec {
     fn find_newline(data: &[u8]) -> Option<usize> {
         let mut start = 0;
         loop {
-            let pos = start + memchr::memmem::find(&data[start..], &[0, 0, 0, 0x0A])?;
+            let pos = start + memchr::memmem::find(data.get_(start..), &[0, 0, 0, 0x0A])?;
             if pos % 4 == 0 { return Some(pos); }
             start = pos + 1;
         }
@@ -261,7 +270,7 @@ impl LineCodec for Utf32BeCodec {
     fn rfind_newline(data: &[u8]) -> Option<usize> {
         let mut end = data.len();
         loop {
-            let pos = memchr::memmem::rfind(&data[..end], &[0, 0, 0, 0x0A])?;
+            let pos = memchr::memmem::rfind(data.get_(..end), &[0, 0, 0, 0x0A])?;
             if pos % 4 == 0 { return Some(pos); }
             end = pos;
         }
@@ -273,17 +282,19 @@ impl LineCodec for Utf32BeCodec {
 
         let mut i = 0;
         while i + 3 < raw.len() {
-            let ascii = raw[i + 3];
-            if ascii & 0x80 != 0 || raw[i] != 0 || raw[i + 1] != 0 || raw[i + 2] != 0 { break; }
-            dst.push(ascii);
+            // Bytes are [b0, b1, b2, b3]; an LE read puts b3 in the top byte.
+            let unit = read_u32_unaligned_be(raw, i);
+            if unit & 0xFFFF_FF80 != 0 { break; }   // b0..b2 zero, bit 7 of b3 clear
+
+            dst.push(unit as u8);
             i += 4;
         }
 
         if i >= raw.len() { return; }
 
         let mut buf = [0u8; 4];
-        for chunk in raw[i..].chunks_exact(4) {
-            let cp = u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        for chunk in raw.get_(i..).chunks_exact(4) {
+            let cp = read_u32_unaligned_be(chunk, 0);
             let ch = char::from_u32(cp).unwrap_or(char::REPLACEMENT_CHARACTER);
             dst.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
         }

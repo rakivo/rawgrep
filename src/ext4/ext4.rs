@@ -1,6 +1,8 @@
 #![allow(dead_code)]
 
+use std::ops::Deref;
 use std::fmt::Display;
+
 use crate::parser::FastDivU32;
 
 pub type INodeNum = u32;
@@ -68,17 +70,39 @@ impl Display for Ext4SuperBlock {
     }
 }
 
+#[repr(C)]
 #[derive(Clone, Copy)]
-pub struct Ext4Inode {
-    pub inode_num: u64,
-    pub mode: u16,
-    pub size: u64,
-    pub flags: u32,
+pub struct Ext4NodeHot {
+    pub inode_num: u32,
+    pub size:      u64,
     pub mtime_sec: i64,
-    pub blocks: [u32; 15],
+    pub mode:      u16,   // kept for is_dir(), unused by process_files but needed by the trait
+    pub flags:     u32,
 }
 
-impl Ext4Inode {
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct Ext4NodeCold {
+    pub ctime_sec:  i64,
+    pub blocks:    [u32; 15],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Ext4Node {
+    pub hot:  Ext4NodeHot,
+    pub cold: Ext4NodeCold,
+}
+
+impl Deref for Ext4Node {
+    type Target = Ext4NodeHot;
+    fn deref(&self) -> &Self::Target { &self.hot }
+}
+
+impl Ext4Node {
+    pub const POISONED: Self = unsafe { core::mem::zeroed() };
+}
+impl Ext4NodeHot {
     pub const POISONED: Self = unsafe { core::mem::zeroed() };
 }
 

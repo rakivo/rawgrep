@@ -5,13 +5,17 @@ use crate::{writeln_blue, writeln_green};
 
 #[derive(Default)]
 pub struct Stats {
-    // Hot: Incremented almost every file
+    // Hotter
+    pub bytes_searched: u64,
     pub files_encountered: u32,
     pub files_searched: u32,
-    pub bytes_searched: u64,
-    pub dirs_encountered: u32,
-    pub dirs_skipped_path_too_long: u32,
     pub files_skipped_by_cache: u32,
+    pub dirs_encountered: u32,
+
+    pub files_contained_matches: u32,
+    pub files_skipped_as_binary_cached: u32,
+    pub files_skipped_as_binary_due_to_probe: u32,
+
     pub node_cache_hits: u32,
     pub node_cache_misses: u32,
 
@@ -19,17 +23,12 @@ pub struct Stats {
     pub time_spent_finding_and_printing_matches_in_nanos: u64,
 
     // Colder
-    pub files_contained_matches: u32,
-    pub files_skipped_large: u32,
-    pub files_skipped_as_binary_due_to_ext: u32,
-    pub files_skipped_as_binary_cached: u32,
-    pub files_skipped_as_binary_due_to_probe: u32,
     pub files_skipped_gitignore: u32,
+    pub files_skipped_large: u32,
     pub files_skipped_unreadable: u32,
     pub dirs_skipped_gitignore: u32,
     pub dirs_skipped_reserved: u32,
-    pub symlinks_followed: u32,
-    pub symlinks_broken: u32,
+    pub dirs_skipped_path_too_long: u32,
 }
 
 impl Display for Stats {
@@ -37,8 +36,6 @@ impl Display for Stats {
         let total_files = self.files_encountered;
 
         let total_dirs = self.dirs_encountered;
-
-        let total_symlinks = self.symlinks_followed + self.symlinks_broken;
 
         writeln_green!(f, "\nSearch complete")?;
         writeln_blue!(f, "Files Summary:")?;
@@ -54,25 +51,11 @@ impl Display for Stats {
         file_row!("Files searched", self.files_searched);
         file_row!("Files contained matches", self.files_contained_matches);
         file_row!("Skipped (large)", self.files_skipped_large);
-        file_row!("Skipped (binary ext)", self.files_skipped_as_binary_due_to_ext);
         file_row!("Skipped (binary probe)", self.files_skipped_as_binary_due_to_probe);
         file_row!("Skipped (binary cached)", self.files_skipped_as_binary_cached);
         file_row!("Skipped (unreadable)", self.files_skipped_unreadable);
         file_row!("Skipped (gitignore)", self.files_skipped_gitignore);
         file_row!("Skipped (cache)", self.files_skipped_by_cache);
-
-        if total_symlinks > 0 {
-            writeln_blue!(f, "\nSymlinks Summary:")?;
-            macro_rules! symlink_row {
-                ($label:expr, $count:expr) => {
-                    let pct = if total_symlinks == 0 { 0.0 } else { ($count as f64 / total_symlinks as f64) * 100.0 };
-                    writeln!(f, "  {:<25} {:>8} ({:>5.1}%)", $label, $count, pct)?;
-                };
-            }
-            symlink_row!("Total symlinks", total_symlinks);
-            symlink_row!("Followed successfully", self.symlinks_followed);
-            symlink_row!("Broken/skipped", self.symlinks_broken);
-        }
 
         writeln_blue!(f, "\nBytes Summary:")?;
         macro_rules! bytes_row {
@@ -146,7 +129,6 @@ impl Stats {
         shared.node_cache_hits.fetch_add(self.node_cache_hits as _, Ordering::Relaxed);
         shared.time_spent_finding_and_printing_matches_in_nanos.fetch_add(self.time_spent_finding_and_printing_matches_in_nanos as _, Ordering::Relaxed);
         shared.node_cache_misses.fetch_add(self.node_cache_misses as _, Ordering::Relaxed);
-        shared.files_skipped_as_binary_due_to_ext.fetch_add(self.files_skipped_as_binary_due_to_ext as _, Ordering::Relaxed);
         shared.files_skipped_as_binary_cached.fetch_add(self.files_skipped_as_binary_cached as _, Ordering::Relaxed);
         shared.files_skipped_as_binary_due_to_probe.fetch_add(self.files_skipped_as_binary_due_to_probe as _, Ordering::Relaxed);
         shared.files_skipped_gitignore.fetch_add(self.files_skipped_gitignore as _, Ordering::Relaxed);
@@ -157,8 +139,6 @@ impl Stats {
         shared.time_spent_fragment_presence_checking_in_nanos.fetch_add(self.time_spent_fragment_presence_checking_in_nanos as _, Ordering::Relaxed);
         shared.dirs_skipped_gitignore.fetch_add(self.dirs_skipped_gitignore as _, Ordering::Relaxed);
         shared.dirs_skipped_reserved.fetch_add(self.dirs_skipped_reserved as _, Ordering::Relaxed);
-        shared.symlinks_followed.fetch_add(self.symlinks_followed as _, Ordering::Relaxed);
-        shared.symlinks_broken.fetch_add(self.symlinks_broken as _, Ordering::Relaxed);
     }
 }
 
@@ -175,14 +155,11 @@ pub struct AtomicStats {
     pub time_spent_fragment_presence_checking_in_nanos: AtomicU64,
     pub dirs_skipped_path_too_long: AtomicU64,
     pub files_skipped_large: AtomicU64,
-    pub files_skipped_as_binary_due_to_ext: AtomicU64,
     pub files_skipped_as_binary_cached: AtomicU64,
     pub time_spent_finding_and_printing_matches_in_nanos: AtomicU64,
     pub files_skipped_as_binary_due_to_probe: AtomicU64,
     pub files_skipped_gitignore: AtomicU64,
     pub files_skipped_by_cache: AtomicU64,
-    pub symlinks_followed: AtomicU64,
-    pub symlinks_broken: AtomicU64,
 }
 
 impl Default for AtomicStats {
@@ -206,14 +183,11 @@ impl AtomicStats {
             dirs_skipped_reserved: AtomicU64::new(0),
             dirs_skipped_path_too_long: AtomicU64::new(0),
             files_skipped_large: AtomicU64::new(0),
-            files_skipped_as_binary_due_to_ext: AtomicU64::new(0),
             node_cache_misses: AtomicU64::new(0),
             node_cache_hits: AtomicU64::new(0),
             files_skipped_as_binary_due_to_probe: AtomicU64::new(0),
             files_skipped_gitignore: AtomicU64::new(0),
             files_skipped_by_cache: AtomicU64::new(0),
-            symlinks_followed: AtomicU64::new(0),
-            symlinks_broken: AtomicU64::new(0),
         }
     }
 
@@ -234,12 +208,9 @@ impl AtomicStats {
             dirs_skipped_reserved: self.dirs_skipped_reserved.load(Ordering::Relaxed) as _,
             files_skipped_large: self.files_skipped_large.load(Ordering::Relaxed) as _,
             files_skipped_as_binary_cached: self.files_skipped_as_binary_cached.load(Ordering::Relaxed) as _,
-            files_skipped_as_binary_due_to_ext: self.files_skipped_as_binary_due_to_ext.load(Ordering::Relaxed) as _,
             files_skipped_as_binary_due_to_probe: self.files_skipped_as_binary_due_to_probe.load(Ordering::Relaxed) as _,
             files_skipped_gitignore: self.files_skipped_gitignore.load(Ordering::Relaxed) as _,
             files_skipped_by_cache: self.files_skipped_by_cache.load(Ordering::Relaxed) as _,
-            symlinks_followed: self.symlinks_followed.load(Ordering::Relaxed) as _,
-            symlinks_broken: self.symlinks_broken.load(Ordering::Relaxed) as _,
         }
     }
 }

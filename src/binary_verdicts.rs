@@ -11,6 +11,8 @@
 // the last one instead of learning them again.
 //
 
+#![allow(unsafe_op_in_unsafe_fn)]
+
 use crate::index_::Index_;
 use crate::parser::FileIdentifier;
 use crate::util::{read_u32_unaligned_le, read_u64_unaligned_le};
@@ -233,7 +235,9 @@ impl BinaryVerdicts {
     /// Any problem (missing, wrong magic or version, truncated, unsorted) gives an empty set.
     #[inline]
     pub fn load(path: &Path) -> Self {
-        fs::read(path).ok().and_then(|buf| Self::parse(&buf)).unwrap_or_else(Self::empty)
+        crate::util::mmap_populate(path)
+            .and_then(|mmap| Self::parse(&mmap))
+            .unwrap_or_else(Self::empty)
     }
 
     fn parse(buf: &[u8]) -> Option<Self> {
@@ -349,7 +353,7 @@ impl BinaryVerdicts {
         if fresh.is_empty() { return Ok(()); }
 
         let merged = self.merge(&fresh, MAX_KEPT);
-        let table = {
+        let table: [u32; SLOT_COUNT] = {
             use std::mem::MaybeUninit;
 
             let mut out: [MaybeUninit<_>; SLOT_COUNT] = unsafe { MaybeUninit::uninit().assume_init() };
@@ -362,19 +366,20 @@ impl BinaryVerdicts {
             unsafe { std::mem::transmute::<[std::mem::MaybeUninit<u32>; SLOT_COUNT], [u32; SLOT_COUNT]>(out) }
         };
 
-        let mut out = Vec::with_capacity(24 + table.len() * 4 + merged.len() * 8);
+        let magic_bytes      = MAGIC.to_le_bytes();
+        let version_bytes    = VERSION.to_le_bytes();
+        let table_len_bytes  = (table.len() as u32).to_le_bytes();
+        let merged_len_bytes = (merged.len() as u64).to_le_bytes();
 
-        out.extend_from_slice(&MAGIC.to_le_bytes());
-        out.extend_from_slice(&VERSION.to_le_bytes());
-        out.extend_from_slice(&(table.len() as u32).to_le_bytes());
-        crate::util::extend_le(&mut out, &table);
-        out.extend_from_slice(&(merged.len() as u64).to_le_bytes());
-        crate::util::extend_le(&mut out, &merged);
-
-        // @Note: fix_ownership()...?
+        let mut out: Vec<u8> = Vec::new();
+        crate::batch_extend_pod!(out, [
+            &magic_bytes[..], &version_bytes[..], &table_len_bytes[..], &table[..],
+            &merged_len_bytes[..], &merged[..],
+        ]);
 
         let tmp = path.with_extension(format!("tmp{}", std::process::id()));
         fs::write (&tmp, &out)?;
+        #[cfg(unix)] { _ = crate::cache::fix_ownership(&tmp); }
         fs::rename(&tmp, path)
     }
 
@@ -483,7 +488,7 @@ mod tests {
         assert_ne!(fs::read(&path).unwrap(), b"marker");
         assert_eq!(BinaryVerdicts::load(&path).len(), 5);
 
-        let _ = fs::remove_file(&path);
+        _ = fs::remove_file(&path);
     }
 
     #[test]
@@ -503,6 +508,6 @@ mod tests {
         assert_eq!(BinaryVerdicts::load(&path).len(), 0);
         assert_eq!(BinaryVerdicts::load(&path.with_extension("missing")).len(), 0);
 
-        let _ = fs::remove_file(&path);
+        _ = fs::remove_file(&path);
     }
 }

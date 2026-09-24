@@ -21,6 +21,7 @@ compile_error!(
 
 pub mod ctx;
 pub mod cli;
+pub mod stale;
 pub mod binary_verdicts;
 pub mod grep;
 pub mod ext4;
@@ -53,6 +54,7 @@ pub mod unwrap_;
 pub mod index_;
 pub mod logger;
 #[cfg(unix)] pub mod run_temperature;
+#[cfg(unix)] pub mod holder;
 
 #[cfg(not(feature = "dont_vendor"))]
 pub mod smallvec_vendor;
@@ -165,7 +167,7 @@ impl RawGrepConfig {
             threads: crate::topology::default_worker_count(),
             no_cache:         false,
             cache_size_mb:    100,
-            cache_dir:        Some(PathBuf::from("~/.cache/rawgrep").into()),  // @Cleanup
+            cache_dir:        Some(resolve_cache_dir().into_boxed_path()),  // @Cleanup
             rebuild_cache:    false,
         }
     }
@@ -384,4 +386,19 @@ pub fn find_git_boundary(start: &Path) -> bool {
 
         current = parent;
     }
+}
+
+#[cfg(target_os = "linux")]
+pub fn resolve_cache_dir() -> PathBuf {
+    if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
+        return PathBuf::from(runtime_dir).join("rawgrep");
+    }
+    let uid = unsafe { libc::getuid() };
+
+    PathBuf::from(format!("/dev/shm/rawgrep-{uid}"))
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn resolve_cache_dir() -> PathBuf {
+    get_default_disk_cache_dir() // whatever get_cache_path falls back to today
 }

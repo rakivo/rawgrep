@@ -23,7 +23,7 @@ use crate::stats::Stats;
 use crate::stdout::{RawStdout, IOV_MAX};
 use crate::thin_path_arc::ThinPathArc;
 use crate::parser::{BufFatPtr, FileIdentifier, BufKind, FileId, FileNode, FileType, ParsedEntry, Parser, RawFs};
-use crate::util::{likely, truncate_utf8, unlikely, prefetch_read};
+use crate::util::{likely, truncate_utf8, unlikely, prefetch_read, RawAppend};
 use crate::tracy;
 
 use std::ops::Not;
@@ -441,12 +441,8 @@ impl PathArena {
     fn push_path(&mut self, parent: &[u8], needs_slash: bool, name: &[u8]) -> (u32, u32) {
         let start = self.buf.len() as u32;
 
-        self.buf.reserve(parent.len() + needs_slash as usize + name.len());
-        self.buf.extend_from_slice(parent);
-        if needs_slash {
-            self.buf.push(MAIN_SEPARATOR as u8);
-        }
-        self.buf.extend_from_slice(name);
+        let sep: &[u8] = if needs_slash { &[MAIN_SEPARATOR as u8][..] } else { &[][..] };
+        crate::batch_extend_pod!(self.buf, [parent, sep, name]);
 
         (start, self.buf.len() as u32)
     }
@@ -544,67 +540,108 @@ pub struct WorkerResult {
     pub fragment_presence:  FragmentPresenceBits,
 }
 
+#[repr(C)]
 pub struct WorkerCtx<'a, F: RawFs, S: MatchSink> {
-    // ----- Setup-once
-    pub fs:               &'a F,
-    pub cache:     Option<&'a FragmentCache>,
-    pub fragment_hashes:  &'a [u32],
-    pub fragment_indexes: &'a [u32],
-    pub matcher:          &'a Matcher,
-    pub cli:              &'a Cli,
-    pub fragment_index:   &'a IntSet<u32>,
-    pub pacer:            &'a FlushPacer,
+    //
+    // Every field here is read unconditionally in BOTH lookahead_file AND
+    // process_file's early-exit checks, on every single file before any return.
+    //
+    pub fs:               &'a F,                      //  8  [  0]  file_identifier every file
+    pub cache:     Option<&'a FragmentCache>,         //  8  [  8]  can_skip_file every file
+    pub cli:              &'a Cli,                    //  8  [ 16]  multiple flag checks per file
+    pub binary_verdicts:  &'a BinaryVerdicts,         //  8  [ 24]  binary_hints every file
+    pub fragment_indexes: &'a [u32],                  // 16  [ 32]  can_skip_file argument; fat ptr
+    pub stats:            Box<Stats>,                 //  8  [ 48]  files_encountered is first write in process_file
+    pub check_mask:       usize,                      //  8  [ 56]  output flush guard, every iteration
 
-    pub selected_fragment_hash_len: FragmentLen,
+    //
+    // Still per-file hot. dir_tally and file_entries_arena are both
+    // accessed in lookahead_file before any early return.
+    //
+    pub batch_size_cached:  u32,                      //  4  [ 64]  output flush threshold every file
+    pub stdout_is_being_redirected_to_dev_null: bool, //  1  [ 68]  guards flush block
+    pub print_line_numbers: bool,                     //  1  [ 69]  find_and_print_matches setup
+    pub ignore_case:        bool,                     //  1  [ 70]  presence checker
+    pub single_literal_fragments: bool,               //  1  [ 71]  cache record logic
+    pub gitignore_enabled:  bool,                     //  1  [ 72]  should_ignore_gitignore()
+    pub dir_tally:          DirTally,                 //  8  [ 76]  binary_hints + record every file
+    pub file_entries_arena: FileEntryArena,           // 24  [ ??]  name lookup in lookahead + main loop
 
-    pub ignore_case:                            bool,
-    pub single_literal_fragments:               bool,
-    pub gitignore_enabled:                      bool,
-    pub stdout_is_being_redirected_to_dev_null: bool,
-    pub print_line_numbers:                     bool,
+    //
+    // output.len() is the final check every file iteration.
+    // write_record only fires on matches (warm), but the len check is every file.
+    // path_buf is built for every file that survives known_binary check.
+    //
+    pub output:             OutputSlotWriter,         //  ?         len check every file
+    pub path_buf:           Box<SmallPathBuf>,        //  8         built per surviving file
 
-    pub parser: Parser,
-    pub output: OutputSlotWriter,
+    //
+    // Accessed once per directory in process_directory; never in the tight
+    // per-file loop (subdirs_arena, entries_arena are fully consumed before
+    // process_files is called).
+    //
+    pub path_arena:         PathArena,             // 24
+    pub subdirs_arena:      SubdirsArena,          // 24
+    pub entries_arena:      EntriesArena,          // 24
+    pub swap_path_buf:      Box<SmallPathBuf>,     //  8         swapped once per directory
 
-    // ----- Hot
-    pub         path_arena: PathArena,          // 24
-    pub file_entries_arena: FileEntryArena,     // 24
-    pub      subdirs_arena: SubdirsArena,       // 24
-    pub      entries_arena: EntriesArena,       // 24
+    //
+    // node_hot_scratch and node_cold_scratch are taken via mem::take at the
+    // START of process_files and put back at the END - their Vec descriptors
+    // in WorkerCtx are NOT accessed during the mid-loop per-file iterations.
+    // node_cache is passed into parse_nodes_batch once per directory.
+    //
+    pub node_hot_scratch:   Vec<F::NodeHot>,       // 24
+    pub node_cache:         F::NodeCache,          //  ?
+    pub node_cold_scratch:  Vec<F::NodeCold>,      // 24
 
-    pub      path_buf:      Box<SmallPathBuf>,  // 8
-    pub      swap_path_buf: Box<SmallPathBuf>,  // 8
+    //
+    //
+    // fragment_hashes + fragment_index: only in check_fragment_presence (warm).
+    // matcher: only in find_and_print_matches (warm, match-found path).
+    // pacer: only at i & check_mask == 0 intervals (rare).
+    // selected_fragment_hash_len: only in presence checking.
+    //
+    pub fragment_hashes:          &'a [u32],       // 16
+    pub fragment_index:           &'a IntSet<u32>, //  8
+    pub matcher:                  &'a Matcher,     //  8
+    pub pacer:                    &'a FlushPacer,  //  8
+    pub selected_fragment_hash_len: FragmentLen,   //  4
 
-    pub node_scratch:       Vec<F::Node>,
-    pub node_cache:         F::NodeCache,
+    //
+    // parser.dir is accessed via buf_ptr(BufKind::Dir) in lookahead_file for
+    // every file's name lookup. parser.file/scratch/etc. are warm (read_file_content).
+    //
+    // Parser stays here rather than earlier because its ~200 byte footprint
+    // would push cache lines further out if moved up. Once the first file in a
+    // directory is processed, all of parser is in cache anyway.
+    //
+    pub parser:             Parser,
 
-    pub dir_tally:          DirTally,           // Default; reset at the start of every directory
-    pub binary_verdicts:    &'a BinaryVerdicts, // shared, like `cache`
-
-    pub batch_size_cached:  u32,
-    pub check_mask:         usize,
-    pub stats:              Box<Stats>,         // 8
-
-    // ----- Warm
-    pub          newlines_scratch: Vec<u32>,
-    pub            ranges_scratch: Vec<(u32, u32)>,
-    pub       line_ranges_scratch: Vec<(u32, u32)>, // @VerySad
+    //
+    // Touched only when a file survives all early-outs and reaches find_and_print_matches
+    // or the streaming path.
+    //
+    pub newlines_scratch:          Vec<u32>,
+    pub ranges_scratch:            Vec<(u32, u32)>,
+    pub line_ranges_scratch:       Vec<(u32, u32)>,  // @VerySad
     pub fragment_presence_scratch: Vec<u64>,
-
     pub chunk_carry:               Option<Box<ChunkCarry>>,
-
     pub matcher_cache:             Option<&'a mut MatcherCache>,
-
     pub worker_id:                 u16,
     pub num_workers:               u16,
 
+    //
+    // Written once per fully-scanned file
+    //
     pub pending_verdict_fingerprints: Vec<u64>,
     pub pending_file_ids:             Vec<FileIdentifier>,
     pub pending_fragment_presence:    FragmentPresenceBits,
 
-    // ----- Cold / output plumbing ----
-    pub sink: S,
-
+    //
+    // Only touched when a match is actually output.
+    //
+    pub sink:  S,
     pub red:   &'static str,
     pub cyan:  &'static str,
     pub green: &'static str,
@@ -747,7 +784,9 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
         };
 
         self.dir_tally.reset();
-        self.process_file(&node, name_fat_ptr, &[], &work.gitignore_chain, LookaheadResult::NONE)?;
+
+        let (hot, cold) = self.fs.split_node(node);
+        self.process_file(hot, || cold, name_fat_ptr, &[], &work.gitignore_chain, LookaheadResult::NONE)?;
 
         Ok(())
     }
@@ -1015,17 +1054,20 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
         // nothing else uses the tally in between, and a child's own process_files resets it again.
         self.dir_tally.reset();
 
-        self.node_scratch.clear();
+        self.node_hot_scratch.clear();
+        self.node_cold_scratch.clear();
         let batch_stats = self.fs.parse_nodes_batch(
             self.file_entries_arena.get_(start_files..end_files),
             &mut self.node_cache,
-            &mut self.node_scratch
+            &mut self.node_hot_scratch,
+            &mut self.node_cold_scratch,
         );
 
         self.stats.node_cache_hits   += batch_stats.hits;
         self.stats.node_cache_misses += batch_stats.misses;
 
-        let mut nodes = std::mem::take(&mut self.node_scratch);
+        let mut nodes      = std::mem::take(&mut self.node_hot_scratch);
+        let mut nodes_cold = std::mem::take(&mut self.node_cold_scratch);
         debug_assert_eq!(nodes.len(), end_files - start_files);
 
         //
@@ -1058,7 +1100,8 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
             let window_end = (node_index + 1 + FILE_PREFETCH_AHEAD).min(nodes.len());
             while ahead_up_to < window_end {
                 lookahead_ring[ahead_up_to % FILE_RING] = self.lookahead_file(
-                    nodes.get_(ahead_up_to),
+                    *nodes.get_(ahead_up_to),
+                    || *nodes_cold.get_(ahead_up_to),
                     start_files + ahead_up_to,
                     &mut batch_cold
                 );
@@ -1066,13 +1109,14 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
                 ahead_up_to += 1;
             }
 
-            let node = nodes.get_(node_index);
+            let node = *nodes.get_(node_index);
             if node.file_id() == 0 { continue; }  // Poisoned...
 
             let (_, name_fat_ptr) = *self.file_entries_arena.get_(i);
 
             self.process_file(
-                node, name_fat_ptr, parent_path,
+                node, || *nodes_cold.get_(node_index),
+                name_fat_ptr, parent_path,
                 gitignore_chain, lookahead_ring[node_index % FILE_RING]
             )?;
 
@@ -1094,7 +1138,9 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
         }
 
         nodes.clear();
-        self.node_scratch = nodes;
+        nodes_cold.clear();
+        self.node_hot_scratch = nodes;
+        self.node_cold_scratch = nodes_cold;
 
         Ok(())
     }
@@ -1124,10 +1170,16 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
     // on the corpora we currenly benchmark on (Chromium and Linux source trees).
     //
     #[inline]
-    fn lookahead_file(&self, node: &F::Node, entry_index: usize, batch_cold: &mut Option<bool>) -> LookaheadResult {
-        if node.file_id() == 0 { return LookaheadResult::NONE; }  // Poisoned...
+    fn lookahead_file(
+        &self,
+        hot: F::NodeHot,
+        cold: impl Fn() -> F::NodeCold,
+        entry_index: usize,
+        batch_cold: &mut Option<bool>
+    ) -> LookaheadResult {
+        if hot.file_id() == 0 { return LookaheadResult::NONE; }  // Poisoned...
 
-        if !self.cli.should_ignore_all_filters() && node.size() > self.max_file_byte_size() as u64 {
+        if !self.cli.should_ignore_all_filters() && hot.size() > self.max_file_byte_size() as u64 {
             return LookaheadResult::NONE;
         }
 
@@ -1161,7 +1213,7 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
         // Cache first
         //
 
-        let file_identifier = self.fs.file_identifier(node);
+        let file_identifier = self.fs.file_identifier(hot);
 
         let mut cache_skip = None;
         if let Some(cache) = self.cache {
@@ -1181,10 +1233,12 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
 
         let likely_binary = binary.is_some_and(|(_, likely)| likely);
 
-        let max_size = (node.size() as usize).min(self.max_file_byte_size());
+        let max_size = (hot.size() as usize).min(self.max_file_byte_size());
 
+        let mut node = None;
         if batch_cold.is_none() {
-            *batch_cold = self.fs.head_is_cold(node, max_size);  // Stays None if it can't tell yet
+            node = Some(self.fs.merge_node(hot, cold()));
+            *batch_cold = self.fs.head_is_cold(&node.unwrap_(), max_size);  // Stays None if it can't tell yet
         }
 
         if *batch_cold != Some(false) {
@@ -1192,7 +1246,8 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
             // For a file we expect the probe to reject, only the probe block is worth fetching
             //
             let hint_size = if likely_binary { max_size.min(binary_verdicts::PROBE_BYTES) } else { max_size };
-            self.fs.prefetch_file_head(node, hint_size);
+            let node = node.unwrap_or_else(|| self.fs.merge_node(hot, cold()));
+            self.fs.prefetch_file_head(&node, hint_size);
         }
 
         LookaheadResult { cache_skip, binary }
@@ -1200,7 +1255,8 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
 
     fn process_file(
         &mut self,
-        node: &F::Node,
+        hot: F::NodeHot,
+        cold: impl FnOnce() -> F::NodeCold,
         file_name_ptr: BufFatPtr,
         parent_path: &[u8],
         gitignore_chain: &GitignoreChain,
@@ -1210,17 +1266,13 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
 
         self.stats.files_encountered += 1;
 
-        if !self.cli.should_ignore_all_filters() && node.size() > self.max_file_byte_size() as u64 {
+        if !self.cli.should_ignore_all_filters() && hot.size() > self.max_file_byte_size() as u64 {
             self.stats.files_skipped_large += 1;
             return Ok(());
         }
 
         let file_name        = self.parser.buf_ptr(file_name_ptr);
-        let file_identifier  = self.fs.file_identifier(node);
-        let file_ext_pos     = memchr::memrchr(b'.', file_name);
-        let file_ext_or_name = file_ext_pos
-            .and_then(|p| if p + 1 < file_name.len() { Some(file_name.get_(p + 1..)) } else { None })
-            .unwrap_or(file_name);
+        let file_identifier  = self.fs.file_identifier(hot);
 
         if let Some(cache) = self.cache {
             let skip = match pre.cache_skip {
@@ -1235,6 +1287,11 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
         }
 
         let check_binary = !self.cli.should_search_binary();
+
+        let file_ext_pos     = memchr::memrchr(b'.', file_name);
+        let file_ext_or_name = file_ext_pos
+            .and_then(|p| if p + 1 < file_name.len() { Some(file_name.get_(p + 1..)) } else { None })
+            .unwrap_or(file_name);
 
         //
         // Use what the lookahead already worked out, or do it now if a file skipped the lookahead
@@ -1261,16 +1318,10 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
 
         // Build full path
         {
-            let _span = tracy::span!("build full path");
-
             self.path_buf.clear();
-            self.path_buf.reserve(parent_path.len() + usize::from(!parent_path.is_empty()) + file_name.len());
 
-            self.path_buf.extend_from_slice(parent_path);
-            if likely(!parent_path.is_empty()) {
-                self.path_buf.push(MAIN_SEPARATOR as _);
-            }
-            self.path_buf.extend_from_slice(file_name);
+            let sep: &[u8] = if likely(!parent_path.is_empty()) { &[MAIN_SEPARATOR as u8] } else { &[] };
+            crate::batch_extend_pod!(self.path_buf, [parent_path, sep, file_name]);
         }
 
         if !self.should_ignore_gitignore() && !gitignore_chain.is_empty() {
@@ -1280,17 +1331,19 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
             }
         }
 
-        let max_size = (node.size() as usize).min(self.max_file_byte_size());
+        let max_size = (hot.size() as usize).min(self.max_file_byte_size());
 
         let rejected_before = self.stats.files_skipped_as_binary_due_to_probe;
 
         let streamed = max_size >= STREAMING_THRESHOLD;
 
+        let node = self.fs.merge_node(hot, cold());
+
         let (found_any, presence_ready) = if likely(!streamed) {
-            let found_any = self.process_file_buffered(node, max_size, check_binary, likely_binary)?;
+            let found_any = self.process_file_buffered(&node, max_size, check_binary, likely_binary)?;
             (found_any, false)
         } else {
-            self.process_file_streaming(node, max_size, check_binary, likely_binary)?
+            self.process_file_streaming(&node, max_size, check_binary, likely_binary)?
         };
 
         if check_binary {
@@ -2593,43 +2646,30 @@ impl<S: MatchSink> WorkerPrintCtx<'_, S> {
 
     #[inline(always)]
     fn write_file_header(
-        scratch:            &mut Vec<u8>,
+        mut scratch:        &mut Vec<u8>,
         cli:                &Cli,
         path:               &[u8],
 
         should_print_color: bool,
         green: &'static str,
     ) {
-        if cli.jump { return }  // Jump mode writes path per-line, not as a header
-
-        if should_print_color { scratch.extend_from_slice(green.as_bytes()); }
+        if cli.jump { return }
 
         let root = cli.search_root_path.as_bytes();
         let ends_with_slash = root.last() == Some(&(MAIN_SEPARATOR as _));
 
-        // Reserve
-        {
-            let mut len = root.len() + usize::from(!ends_with_slash) + path.len() + 2; // ":\n"
-            if should_print_color {
-                len += green.len() + COLOR_RESET.len();
-            }
-            scratch.reserve(len);
-        }
+        let color_start: &[u8] = if should_print_color { green.as_bytes() }       else { &[] };
+        let sep:         &[u8] = if ends_with_slash    { &[] }                    else { &[MAIN_SEPARATOR as u8] };
+        let color_end:   &[u8] = if should_print_color { COLOR_RESET.as_bytes() } else { &[] };
 
-        scratch.extend_from_slice(root);
-        if !ends_with_slash { scratch.push(MAIN_SEPARATOR as _); }
-        scratch.extend_from_slice(path);
-
-        if should_print_color { scratch.extend_from_slice(COLOR_RESET.as_bytes()); }
-
-        scratch.extend_from_slice(b":\n");
+        crate::batch_extend_pod!(scratch, [color_start, root, sep, path, color_end, b":\n"]);
     }
 
     #[inline(always)]
     #[allow(clippy::too_many_arguments, reason = "alwaysinline")]
     fn write_match_line(
         output:            &mut OutputSlotWriter,
-        scratch:           &mut Vec<u8>,
+        mut scratch:       &mut Vec<u8>,
         cli:               &Cli,
         path:              &[u8],
         line:              &[u8],
@@ -2653,46 +2693,22 @@ impl<S: MatchSink> WorkerPrintCtx<'_, S> {
             ""
         };
 
-        // Reserve
-        {
-            let mut prefix_len = line_num_str.len() + 2; // digits + ": "
-            if should_print_color {
-                prefix_len += cyan.len() + COLOR_RESET.len();
-            }
-
-            if cli.jump {
-                let root = cli.search_root_path.as_bytes();
-                let ends_with_slash = root.last() == Some(&(MAIN_SEPARATOR as _));
-                prefix_len += root.len() + usize::from(!ends_with_slash) + path.len() + 1; // ':'
-                if should_print_color {
-                    prefix_len += green.len() + COLOR_RESET.len();
-                }
-            }
-
-            scratch.reserve(prefix_len);
-        }
-
         if cli.jump {
-            if should_print_color { scratch.extend_from_slice(green.as_bytes()); }
-
             let root = cli.search_root_path.as_bytes();
             let ends_with_slash = root.last() == Some(&(MAIN_SEPARATOR as _));
 
-            scratch.extend_from_slice(root);
-            if !ends_with_slash { scratch.push(MAIN_SEPARATOR as _); }
-            scratch.extend_from_slice(path);
+            let color_start: &[u8] = if should_print_color { green.as_bytes() }       else { &[] };
+            let sep:         &[u8] = if ends_with_slash    { &[] }                    else { &[MAIN_SEPARATOR as u8] };
+            let color_end:   &[u8] = if should_print_color { COLOR_RESET.as_bytes() } else { &[] };
 
-            if should_print_color { scratch.extend_from_slice(COLOR_RESET.as_bytes()); }
-
-            scratch.extend_from_slice(b":");
+            crate::batch_extend_pod!(scratch, [color_start, root, sep, path, color_end, b":"]);
         }
 
         if !line_num_str.is_empty() {
-            if should_print_color { scratch.extend_from_slice(cyan.as_bytes()); }
-            scratch.extend_from_slice(line_num_str.as_bytes());
-            if should_print_color { scratch.extend_from_slice(COLOR_RESET.as_bytes()); }
+            let color_start: &[u8] = if should_print_color { cyan.as_bytes() } else { &[] };
+            let color_end:   &[u8] = if should_print_color { COLOR_RESET.as_bytes() } else { &[] };
 
-            scratch.extend_from_slice(b": ");
+            crate::batch_extend_pod!(scratch, [color_start, line_num_str.as_bytes(), color_end, b": "]);
         } else {
             scratch.push(b' ');
         }
@@ -2705,11 +2721,13 @@ impl<S: MatchSink> WorkerPrintCtx<'_, S> {
 
             let mut reserve_len = display.len() + 1;
             if should_print_color {
-                reserve_len += matches.len() * (red.len() + COLOR_RESET.len());
+                reserve_len += matches.len() * (crate::color::BOLD.len() + red.len() + COLOR_RESET.len());
             }
             scratch.reserve(reserve_len);
 
             let mut last = 0;
+            let mut w = RawAppend::new(scratch);
+
             for &(s, e) in matches {
                 let s = s as usize;
                 let e = e as usize;
@@ -2717,22 +2735,31 @@ impl<S: MatchSink> WorkerPrintCtx<'_, S> {
                 if s >= display.len() { break; }
                 let e = e.min(display.len());
 
-                scratch.extend_from_slice(display.get_(last..s));
+                // SAFETY: the non-highlighted spans of 'display' (the 'last..s' pieces across
+                // every iteration) sum to at most 'display.len()' since they partition it as
+                // 'last' only advances, each iteration contributes at most one BOLD+red+reset
+                // wrap, bounded by 'matches.len()'. Together that's exactly 'reserve_len'.
+                unsafe {
+                    w.extend(display.get_(last..s));
 
-                if should_print_color {
-                    scratch.extend_from_slice(crate::color::BOLD.as_bytes()); // @Incomplete: Check if whatever we output to supports bold?...
-                    scratch.extend_from_slice(red.as_bytes());
+                    if should_print_color {
+                        w.extend(crate::color::BOLD.as_bytes());
+                        w.extend(red.as_bytes());
+                    }
+
+                    w.extend(display.get_(s..e));
+
+                    if should_print_color { w.extend(COLOR_RESET.as_bytes()); }
                 }
-
-                scratch.extend_from_slice(display.get_(s..e));
-
-                if should_print_color { scratch.extend_from_slice(COLOR_RESET.as_bytes()); }
 
                 last = e;
             }
 
-            scratch.extend_from_slice(display.get_(last..));
-            scratch.push(b'\n');
+            unsafe {
+                w.extend(display.get_(last..));
+                w.push(b'\n');
+            }
+            w.finish();
 
             output.write_record(scratch);
             return;
@@ -2803,39 +2830,41 @@ impl<S: MatchSink> WorkerPrintCtx<'_, S> {
         }
         scratch.reserve(reserve_len);
 
-        if pre_ell {
-            scratch.extend_from_slice(ELLIPSIS);
-        }
+        let mut w = RawAppend::new(scratch);
+
+        if pre_ell { unsafe { w.extend(ELLIPSIS); } }
 
         let mut last = 0usize;
-        let abs_end = end;   // == start + display_len
+        let abs_end = end;
 
         for &(s, e) in matches {
             let s = s as usize;
             let e = e as usize;
 
             if s >= abs_end  { break; }
-            if e <= start    { continue; }   // match fully to the left of the window
+            if e <= start    { continue; }
 
             let ds = s.saturating_sub(start).min(display_len);
             let de = e.saturating_sub(start).min(display_len);
 
-            scratch.extend_from_slice(display.get_(last..ds));
-
-            if should_print_color { scratch.extend_from_slice(red.as_bytes()); }
-
-            scratch.extend_from_slice(display.get_(ds..de));
-
-            if should_print_color { scratch.extend_from_slice(COLOR_RESET.as_bytes()); }
+            // SAFETY: same reasoning as the fast path above, non-highlight spans partition
+            // 'display', at most 'matches.len()' red+reset wraps, matching 'reserve_len'.
+            unsafe {
+                w.extend(display.get_(last..ds));
+                if should_print_color { w.extend(red.as_bytes()); }
+                w.extend(display.get_(ds..de));
+                if should_print_color { w.extend(COLOR_RESET.as_bytes()); }
+            }
 
             last = de;
         }
 
-        scratch.extend_from_slice(display.get_(last..));
-        if post_ell {
-            scratch.extend_from_slice(ELLIPSIS);
+        unsafe {
+            w.extend(display.get_(last..));
+            if post_ell { w.extend(ELLIPSIS); }
+            w.push(b'\n');
         }
-        scratch.push(b'\n');
+        w.finish();
 
         output.write_record(scratch);
     }

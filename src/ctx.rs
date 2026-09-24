@@ -11,7 +11,7 @@ use crate::{cli, ignore, platform, CursorHide};
 use crate::parser::{Parser, FileIdentifier};
 use crate::cache::CacheStats;
 use crate::stats::{AtomicStats, Stats};
-use crate::grep::{AnyGrepper, FsType, RawGrepper, open_device_and_detect_fs, AnyNodeScratch, AnyNodeCache};
+use crate::grep::{AnyGrepper, FsType, RawGrepper, open_device_and_detect_fs, AnyNodeHotScratch, AnyNodeColdScratch, AnyNodeCache};
 use crate::worker::{DirWork, FileWork, MatchSink, OutputWorker, WorkItem, WorkerCtx, PathArena, FileEntryArena, SubdirsArena, FragmentPresenceBits, OutputMessage, EntriesArena};
 
 use std::fs;
@@ -270,6 +270,7 @@ impl<S: MatchSink + 'static> RawGrepCtx<S> {
             debug!("job.grepper.cache is None... (pattern < 3 bytes)");
         }
 
+
         if !config.binary
             && let Ok(cache_path) = crate::cache::get_cache_path(config.cache_dir.as_deref(), "binary-verdicts.bin")
         {
@@ -365,7 +366,8 @@ fn worker_thread_main<S: MatchSink + 'static>(
     let mut entries_arena             = EntriesArena::new();
     let mut output                    = OutputSlotWriter::new(slot_pool, ctx.output_tx.clone());
 
-    let mut node_scratch              = AnyNodeScratch::default();
+    let mut node_hot_scratch          = AnyNodeHotScratch::default();
+    let mut node_cold_scratch         = AnyNodeColdScratch::default();
     let mut node_cache                = AnyNodeCache::default();
 
     let mut matcher_cache             = None;
@@ -460,8 +462,8 @@ fn worker_thread_main<S: MatchSink + 'static>(
                     matcher_cache: matcher_cache.as_mut(),
                     dir_tally: Default::default(),
                     gitignore_enabled: job.gitignore_enabled,
-                    node_scratch:
-                    $g.fs().take_node_scratch(&mut node_scratch),
+                    node_hot_scratch: $g.fs().take_node_hot_scratch(&mut node_hot_scratch),
+                    node_cold_scratch: $g.fs().take_node_cold_scratch(&mut node_cold_scratch),
                     node_cache:   $g.fs().take_node_cache(&mut node_cache),
                     entries_arena,
                     subdirs_arena,

@@ -4,6 +4,7 @@ use crate::smallvec::SmallVec;
 
 use crate::{tracy, util};
 use crate::unwrap_::Unwrap_;
+use crate::grep::{AnyNodeHotScratch, AnyNodeColdScratch};
 use crate::cli::Cli;
 use crate::binary::{is_dot_entry, is_hidden_entry};
 use crate::util::{read_at_offset, read_u8_unaligned, read_u32_unaligned_le, read_u64_unaligned_le};
@@ -27,24 +28,26 @@ pub struct NtfsFs {
     pub dont_skip_dot_entries: bool,
 }
 
-impl FileNode for NtfsInode {
+impl FileNode for NtfsNodeHot {
     const POISONED: Self = Self::POISONED;
+    #[inline(always)] fn file_id(&self)   -> FileId { self.record_num }
+    #[inline(always)] fn size(&self)      -> u64    { self.size }
+    #[inline(always)] fn mtime_sec(&self) -> i64    { self.mtime_sec }
+    #[inline(always)] fn is_dir(&self)    -> bool   { self.flags & NTFS_MFT_RECORD_FLAG_IS_DIR != 0 }
+}
 
-    #[inline(always)]
-    fn file_id(&self) -> FileId { self.record_num }
-
-    #[inline(always)]
-    fn size(&self) -> u64 { self.size }
-
-    #[inline(always)]
-    fn mtime_sec(&self) -> i64 { self.mtime_sec }
-
-    #[inline(always)]
-    fn is_dir(&self) -> bool { self.flags & NTFS_MFT_RECORD_FLAG_IS_DIR != 0 }
+impl FileNode for NtfsNode {
+    const POISONED: Self = Self::POISONED;
+    #[inline(always)] fn file_id(&self) -> FileId { self.hot.file_id() }
+    #[inline(always)] fn size(&self) -> u64 { self.hot.size() }
+    #[inline(always)] fn mtime_sec(&self) -> i64 { self.hot.mtime_sec() }
+    #[inline(always)] fn is_dir(&self) -> bool { self.hot.is_dir() }
 }
 
 impl RawFs for NtfsFs {
-    type Node = NtfsInode;
+    type Node     = NtfsNode;
+    type NodeHot  = NtfsNodeHot;
+    type NodeCold = NtfsNodeCold;
     type Context<'b> = &'b Self where Self: 'b;
     type NodeCache = ();
 
@@ -52,6 +55,16 @@ impl RawFs for NtfsFs {
     #[inline(always)] fn block_size(&self) -> u32 { self.sb.cluster_size }
     #[inline(always)] fn device_file(&self) -> &File { &self.file }
     #[inline(always)] fn root_id(&self) -> FileId { NTFS_ROOT_DIR_RECORD }
+
+    #[inline(always)]
+    fn split_node(&self, node: Self::Node) -> (Self::NodeHot, Self::NodeCold) {
+        (NtfsNodeHot { record_num: node.record_num, flags: node.flags, size: node.size, mtime_sec: node.mtime_sec }, NtfsNodeCold)
+    }
+
+    #[inline(always)]
+    fn merge_node(&self, hot: Self::NodeHot, _cold: Self::NodeCold) -> Self::Node {
+        NtfsNode { hot }
+    }
 
     #[inline]
     fn parse_node_cached(
@@ -143,7 +156,7 @@ impl RawFs for NtfsFs {
         _scratch2: &mut Vec<u8>,  // unused for NTFS cuz runlists are decoded inline
         _scratch3: &mut Vec<u64>,
         scratch_chunks: &mut Vec<(u64, u32)>,
-        node: &NtfsInode,
+        node: &NtfsNode,
         max_size: usize,
         check_binary: bool,
         _likely_binary: bool,
@@ -280,6 +293,25 @@ impl RawFs for NtfsFs {
     fn directory_entry_count_hint(&self, buf: &[u8]) -> usize {
         read_u32_unaligned_le(buf, 0) as _
     }
+
+    #[inline]
+    fn take_node_hot_scratch(&self, shared: &mut AnyNodeHotScratch) -> Vec<NtfsNodeHot> {
+        match std::mem::replace(shared, AnyNodeHotScratch::Ntfs(Vec::new())) {
+            AnyNodeHotScratch::Ntfs(v) => v,
+            _ => Vec::new(),
+        }
+    }
+    #[inline]
+    fn take_node_cold_scratch(&self, shared: &mut AnyNodeColdScratch) -> Vec<NtfsNodeCold> {
+        match std::mem::replace(shared, AnyNodeColdScratch::Ntfs(Vec::new())) {
+            AnyNodeColdScratch::Ntfs(v) => v,
+            _ => Vec::new(),
+        }
+    }
+    #[inline]
+    fn erase_node_hot_scratch(&self, scratch: Vec<NtfsNodeHot>) -> AnyNodeHotScratch { AnyNodeHotScratch::Ntfs(scratch) }
+    #[inline]
+    fn erase_node_cold_scratch(&self, scratch: Vec<NtfsNodeCold>) -> AnyNodeColdScratch { AnyNodeColdScratch::Ntfs(scratch) }
 }
 
 impl NtfsFs {
@@ -344,7 +376,7 @@ impl NtfsFs {
     }
 
     #[inline]
-    fn read_dir_linearised(&self, node: &NtfsInode, parser: &mut Parser, kind: BufKind) -> io::Result<()> {
+    fn read_dir_linearised(&self, node: &NtfsNode, parser: &mut Parser, kind: BufKind) -> io::Result<()> {
         let _span = tracy::span!("NtfsFs::read_dir_linearised");
 
         let buf = parser.get_buf_mut(kind);
@@ -531,7 +563,7 @@ fn apply_fixups(buf: &mut [u8]) -> io::Result<()> {
 }
 
 #[inline]
-fn parse_mft_record(record: &[u8], record_num: u64) -> io::Result<NtfsInode> {
+fn parse_mft_record(record: &[u8], record_num: u64) -> io::Result<NtfsNode> {
     if record.len() < 48 {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "MFT record too short"));
     }
@@ -555,7 +587,7 @@ fn parse_mft_record(record: &[u8], record_num: u64) -> io::Result<NtfsInode> {
     }
 
     let size = find_data_size(record);
-    Ok(NtfsInode { record_num, flags, size, mtime_sec })
+    Ok(NtfsNode { hot: NtfsNodeHot { record_num, flags, size, mtime_sec } })
 }
 
 #[inline]

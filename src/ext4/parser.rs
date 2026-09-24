@@ -1,14 +1,14 @@
 //! ext4 filesystem implementation of RawFs trait
 
-use crate::{tracy, util};
+#[cfg(unix)]
+use crate::run_temperature;
+use crate::{tracy, util, stale};
 use crate::index_::{Index_, IndexMut_};
 use crate::binary_verdicts;
 use crate::util::{likely, unlikely, read_u16_unaligned_le, read_u32_unaligned_le, read_u64_unaligned_le, read_u64_as_u32_and_u16_unaligned_le};
-use crate::grep::{AnyNodeScratch, AnyNodeCache, NodeCacheStats};
+use crate::grep::{AnyNodeHotScratch, AnyNodeColdScratch, AnyNodeCache, NodeCacheStats};
 use crate::parser::{BufFatPtr, BufKind, FileId, FileNode, FileType, Parser, RawFs, binary_probe, FastDivU32};
 use crate::worker::{STREAMING_CHUNK_SIZE, PendingSubdir};
-#[cfg(unix)]
-use crate::run_temperature;
 
 use super::*;
 
@@ -76,12 +76,20 @@ pub struct Ext4Fs {
     pub inode_table_blocks: Vec<u64>,
 }
 
-impl FileNode for Ext4Inode {
+impl FileNode for Ext4Node {
+    const POISONED: Self = Self::POISONED;
+    #[inline(always)] fn file_id(&self) -> FileId { self.hot.file_id() }
+    #[inline(always)] fn size(&self) -> u64 { self.hot.size() }
+    #[inline(always)] fn mtime_sec(&self) -> i64 { self.hot.mtime_sec() }
+    #[inline(always)] fn is_dir(&self) -> bool { self.hot.is_dir() }
+}
+
+impl FileNode for Ext4NodeHot {
     const POISONED: Self = Self::POISONED;
 
     #[inline(always)]
     fn file_id(&self) -> FileId {
-        self.inode_num
+        self.inode_num as _
     }
 
     #[inline(always)]
@@ -101,9 +109,12 @@ impl FileNode for Ext4Inode {
 }
 
 impl RawFs for Ext4Fs {
-    type Node = Ext4Inode;
-    type Context<'b> = &'b Self where Self: 'b;
+    type Node      = Ext4Node;
+    type NodeCold  = Ext4NodeCold;
+    type NodeHot   = Ext4NodeHot;
     type NodeCache = InodeBlockCache;
+
+    type Context<'b> = &'b Self where Self: 'b;
 
     #[inline(always)]
     fn device_id(&self) -> u64 {
@@ -126,11 +137,20 @@ impl RawFs for Ext4Fs {
     }
 
     #[inline(always)]
+    fn split_node(&self, node: Self::Node) -> (Self::NodeHot, Self::NodeCold) {
+        (node.hot, node.cold)
+    }
+    #[inline(always)]
+    fn merge_node(&self, hot: Self::NodeHot, cold: Self::NodeCold) -> Self::Node {
+        Self::Node { hot, cold }
+    }
+
+    #[inline(always)]
     fn parse_node_cached(
         &self,
         file_id: FileId,
         cache: &mut InodeBlockCache
-    ) -> (io::Result<Ext4Inode>, NodeCacheStats) {
+    ) -> (io::Result<Ext4Node>, NodeCacheStats) {
         let inode_num = file_id as INodeNum;
         if unlikely(inode_num == 0) {
             return (
@@ -162,7 +182,7 @@ impl RawFs for Ext4Fs {
 
         let in_block = (inode_offset - block_start) as usize;
         let end = (in_block + inode_size).min(cache.buf.len());
-        (Ok(Self::decode_inode(inode_num as u64, &cache.buf[in_block..end], self.sb.inode_size)), stats)
+        (Ok(Self::decode_inode(inode_num, &cache.buf[in_block..end], self.sb.inode_size)), stats)
     }
 
     #[inline(always)]
@@ -170,7 +190,8 @@ impl RawFs for Ext4Fs {
         &self,
         entries: &[(FileId, BufFatPtr)],
         cache: &mut InodeBlockCache,
-        out: &mut Vec<Ext4Inode>,
+        hot_out:  &mut Vec<Self::NodeHot>,
+        cold_out: &mut Vec<Self::NodeCold>,
     ) -> NodeCacheStats {
         let mut total = NodeCacheStats::default();
 
@@ -182,10 +203,14 @@ impl RawFs for Ext4Fs {
         for &(file_id, _) in entries {
             let (node_result, stats) = self.parse_node_cached(file_id, cache);
 
-            let node = match node_result { Ok(node) => node, Err(_) => Ext4Inode::POISONED };
-            out.push(node);
+            let node = match node_result { Ok(node) => node, Err(_) => Ext4Node::POISONED };
 
-            total.hits += stats.hits;
+            let (hot, cold) = self.split_node(node);
+
+             hot_out.push(hot);
+            cold_out.push(cold);
+
+            total.hits   += stats.hits;
             total.misses += stats.misses;
         }
 
@@ -193,7 +218,7 @@ impl RawFs for Ext4Fs {
     }
 
     #[inline]
-    fn parse_node(&self, file_id: FileId) -> io::Result<Ext4Inode> {
+    fn parse_node(&self, file_id: FileId) -> io::Result<Ext4Node> {
         let _span = tracy::span!("Ext4Fs::parse_node");
 
         let inode_offset = self.inode_disk_offset(file_id);
@@ -205,7 +230,7 @@ impl RawFs for Ext4Fs {
 
         self.read_at_offset(buf, inode_offset as _)?;
 
-        Ok(Self::decode_inode(file_id, buf, self.sb.inode_size))
+        Ok(Self::decode_inode(file_id as INodeNum, buf, self.sb.inode_size))
     }
 
     #[inline(always)]
@@ -233,11 +258,10 @@ impl RawFs for Ext4Fs {
     // Is the head of this file already in the page cache? None: can't tell yet, so callers assume cold.
     #[cfg(unix)]
     #[inline]
-    fn head_is_cold(&self, node: &Ext4Inode, max_size: usize) -> Option<bool> {
+    fn head_is_cold(&self, node: &Ext4Node, max_size: usize) -> Option<bool> {
         use run_temperature::{DATA, HEAD_SAMPLE_BYTES};
 
         if DATA.want_sample() {
-            // ASSUMED: head_hint_range() gives (device byte offset of the head, _)
             let sampled = match self.head_hint_range(node, max_size) {
                 Some((offset, _)) => {
                     let len = HEAD_SAMPLE_BYTES.min(max_size as u64).max(1);
@@ -261,7 +285,7 @@ impl RawFs for Ext4Fs {
     //
     #[cfg(unix)]
     #[inline]
-    fn prefetch_file_head(&self, node: &Ext4Inode, max_size: usize) {
+    fn prefetch_file_head(&self, node: &Ext4Node, max_size: usize) {
         let Some((offset, len)) = self.head_hint_range(node, max_size) else {
             return;
         };
@@ -294,7 +318,7 @@ impl RawFs for Ext4Fs {
         let buf = Parser::get_buf_mut_impl(&mut parser.file, &mut parser.dir, &mut parser.gitignore, kind);
         buf.clear();
 
-        let file_size = node.size as usize;
+        let file_size = node.size() as usize;
         let size_to_read = file_size.min(max_size);
 
         // Inline data: file content stored directly in inode's block array
@@ -405,7 +429,7 @@ impl RawFs for Ext4Fs {
         scratch2: &mut Vec<u8>,  // Probe buffer, only touched (and only sized) when check_binary
         scratch3: &mut Vec<u64>, // For children blocks
         scratch_chunks: &mut Vec<(u64, u32)>,
-        node: &Ext4Inode,
+        node: &Ext4Node,
         max_size: usize,
         check_binary: bool,
         likely_binary: bool,
@@ -419,7 +443,7 @@ impl RawFs for Ext4Fs {
 
         let _span = tracy::span!("Ext4Fs::collect_file_chunks");
 
-        let file_size = node.size as usize;
+        let file_size = node.size() as usize;
         let block_size = self.sb.block_size as u64;
 
         // Inline data has no disk offsets - caller handles it via read_file_content
@@ -431,7 +455,7 @@ impl RawFs for Ext4Fs {
         scratch_chunks.clear();
 
         if node.flags & EXT4_EXTENTS_FL != 0 {
-            let block_bytes = util::cast_slice(&node.blocks);
+            let block_bytes = util::cast_slice(&node.cold.blocks);
 
             //
             // Probe before walking the whole extent tree. A depth-0 tree lives in the inode, so
@@ -442,9 +466,33 @@ impl RawFs for Ext4Fs {
             //
             let mut parsed = false;
 
-            let mut first_start = if check_binary { self.first_extent_start(block_bytes) } else { None };
+            //
+            // @Volatile
+            //
+            // The device's page cache can hold pre-edit copies of this file's data blocks
+            // (writeback goes around it), so a file that may have changed since boot gets its clean device pages
+            // dropped before anything below reads them. See `crate::stale`.
+            //
+            // This needs the whole extent list, so it's parsed here rather than after the probe.
+            //
+            #[cfg(target_os = "linux")]
+            if unlikely(!node.is_dir() && stale::needs_invalidation(node.file_id(), node.cold.ctime_sec)) {
+                self.parse_extent_node_into(scratch, scratch3, block_bytes, 0)?;
+                parsed = true;
 
-            if check_binary && first_start.is_none() {
+                let ok = self.drop_stale_extents(Self::scratch_as_extents(scratch), max_size);
+                stale::note_invalidated(node.file_id(), node.cold.ctime_sec, ok && max_size >= file_size);
+            }
+
+            let mut first_start = if !check_binary {
+                None
+            } else if parsed {
+                Self::scratch_as_extents(scratch).first().map(|e| e.start)
+            } else {
+                self.first_extent_start(block_bytes)
+            };
+
+            if check_binary && first_start.is_none() && !parsed {
                 self.parse_extent_node_into(scratch, scratch3, block_bytes, 0)?;
                 parsed = true;
 
@@ -554,10 +602,31 @@ impl RawFs for Ext4Fs {
         //
         //
 
-        let blocks = node.blocks.get_(..EXT4_BLOCK_POINTERS_COUNT);
+        let blocks = node.cold.blocks.get_(..EXT4_BLOCK_POINTERS_COUNT);
 
         if blocks.iter().all(|&b| b == 0 || b as u64 >= self.max_block) {
             return Ok(true);
+        }
+
+        //
+        // Same as in the extents branch ...
+        //
+        #[cfg(target_os = "linux")]
+        if unlikely(!node.is_dir() && stale::needs_invalidation(node.file_id(), node.cold.ctime_sec)) {
+            let mut left = max_size as u64;
+            let mut ok   = true;
+
+            for &b in blocks.iter() {
+                if b == 0 || b as u64 >= self.max_block { continue; }
+                if left == 0 { break; }
+
+                let n = left.min(block_size);
+                left -= n;
+
+                ok &= self.drop_stale_range(b as u64 * block_size, n);
+            }
+
+            stale::note_invalidated(node.file_id(), node.cold.ctime_sec, ok && max_size >= file_size);
         }
 
         let mut skip_first = 0usize;
@@ -688,9 +757,17 @@ impl RawFs for Ext4Fs {
     }
 
     #[inline]
-    fn take_node_scratch(&self, shared: &mut AnyNodeScratch) -> Vec<Ext4Inode> {
-        match std::mem::replace(shared, AnyNodeScratch::Ext4(Vec::new())) {
-            AnyNodeScratch::Ext4(v) => v,
+    fn take_node_hot_scratch(&self, shared: &mut AnyNodeHotScratch) -> Vec<Ext4NodeHot> {
+        match std::mem::replace(shared, AnyNodeHotScratch::Ext4(Vec::new())) {
+            AnyNodeHotScratch::Ext4(v) => v,
+            _ => Vec::new(), // Last job on this thread was a different FS...
+        }
+    }
+
+    #[inline]
+    fn take_node_cold_scratch(&self, shared: &mut AnyNodeColdScratch) -> Vec<Ext4NodeCold> {
+        match std::mem::replace(shared, AnyNodeColdScratch::Ext4(Vec::new())) {
+            AnyNodeColdScratch::Ext4(v) => v,
             _ => Vec::new(), // Last job on this thread was a different FS...
         }
     }
@@ -704,8 +781,9 @@ impl RawFs for Ext4Fs {
     }
 
     #[inline]
-    fn erase_node_scratch(&self, scratch: Vec<Ext4Inode>) -> AnyNodeScratch { AnyNodeScratch::Ext4(scratch) }
-
+    fn erase_node_hot_scratch(&self, scratch: Vec<Ext4NodeHot>) -> AnyNodeHotScratch { AnyNodeHotScratch::Ext4(scratch) }
+    #[inline]
+    fn erase_node_cold_scratch(&self, scratch: Vec<Ext4NodeCold>) -> AnyNodeColdScratch { AnyNodeColdScratch::Ext4(scratch) }
     #[inline]
     fn erase_node_cache(&self, cache: InodeBlockCache) -> AnyNodeCache { AnyNodeCache::Ext4(cache) }
 }
@@ -726,7 +804,7 @@ impl Ext4Fs {
     fn read_inline_data(
         &self,
         parser: &mut Parser,
-        node: &Ext4Inode,
+        node: &Ext4Node,
         size_to_read: usize,
         kind: BufKind,
         check_binary: bool,
@@ -734,7 +812,7 @@ impl Ext4Fs {
         let _span = tracy::span!("Ext4Fs::read_inline_data");
 
         // blocks array is [u32; 15] = 60 bytes of inline data
-        let inline_bytes: &[u8] = util::cast_slice(&node.blocks);
+        let inline_bytes: &[u8] = util::cast_slice(&node.cold.blocks);
         let actual_size = size_to_read.min(inline_bytes.len());
 
         let inline_bytes = inline_bytes.get_(..actual_size);
@@ -937,8 +1015,9 @@ impl Ext4Fs {
 
     /// Decode one inode from a byte slice already containing its raw record.
     #[inline]
-    fn decode_inode(inode_num: u64, src: &[u8], inode_size_field: u16) -> Ext4Inode {
+    fn decode_inode(inode_num: u32, src: &[u8], inode_size_field: u16) -> Ext4Node {
         const I_MODE:       usize = 0x00;
+        const I_CTIME:      usize = 0x0C;
         const I_MTIME:      usize = 0x10;
         const I_FLAGS:      usize = 0x20;
         const I_BLOCK:      usize = 0x28;
@@ -951,6 +1030,7 @@ impl Ext4Fs {
         let mode      = word as u16;
         let size_lo   = ((word >> 32) & 0xFFFF_FFFF) as u32;
         let mtime_sec = read_u32_unaligned_le(src, I_MTIME) as i64;
+        let ctime_sec = read_u32_unaligned_le(src, I_CTIME) as i64;
         let flags     = read_u32_unaligned_le(src, I_FLAGS);
 
         let size_high = if inode_size_field > 128 && src.len() >= I_HEADER_MIN {
@@ -981,7 +1061,10 @@ impl Ext4Fs {
             }
         }
 
-        Ext4Inode { inode_num, mode, size, flags, mtime_sec, blocks }
+        Ext4Node {
+            hot: Ext4NodeHot { inode_num, size, mtime_sec, mode, flags },
+            cold: Ext4NodeCold { ctime_sec, blocks }
+        }
     }
 }
 
@@ -995,7 +1078,7 @@ impl Ext4Fs {
     /// (deeper trees / inline data / empty files / etc).
     #[cfg(unix)]
     #[inline]
-    fn head_hint_range(&self, node: &Ext4Inode, max_size: usize) -> Option<(u64, u64)> {
+    fn head_hint_range(&self, node: &Ext4Node, max_size: usize) -> Option<(u64, u64)> {
         if PREFETCH_HEAD_BYTES == 0 || max_size == 0 || node.flags & EXT4_INLINE_DATA_FL != 0 {
             return None;
         }
@@ -1003,7 +1086,7 @@ impl Ext4Fs {
         let block_size = self.sb.block_size as u64;
 
         let (start_block, extent_bytes) = if node.flags & EXT4_EXTENTS_FL != 0 {
-            let (start, len) = Self::first_inline_extent(util::cast_slice(&node.blocks))?;
+            let (start, len) = Self::first_inline_extent(util::cast_slice(&node.cold.blocks))?;
             (start, len as u64 * block_size)
 
         } else {
@@ -1011,7 +1094,7 @@ impl Ext4Fs {
             // Block-mapped file: the probe reads the first mapped direct block
             //
 
-            let first = *node.blocks.iter()
+            let first = *node.cold.blocks.iter()
                 .take(EXT4_BLOCK_POINTERS_COUNT)
                 .find(|&&b| b != 0 && (b as u64) < self.max_block)?;
 
@@ -1206,4 +1289,47 @@ fn extent_index_child_block(data: &[u8], i: usize) -> Option<u64> {
 
     let (ei_leaf_lo, ei_leaf_hi) = read_u64_as_u32_and_u16_unaligned_le(data, offset + 4);
     Some(((ei_leaf_hi as u64) << 32) | (ei_leaf_lo as u64))
+}
+
+
+#[cfg(target_os = "linux")]
+impl Ext4Fs {
+    /// Drops the clean pages of the block-device's page cache backing [offset, offset + len).
+    ///
+    /// Rounded outwards to whole pages: fadvise(DONTNEED) skips partial pages at the edges, which
+    /// would leave stale sub-page blocks behind on filesystems with block_size < page size.
+    fn drop_stale_range(&self, offset: u64, len: u64) -> bool {
+        let page = stale::page_size();
+        let lo   = offset & !(page - 1);
+        let hi   = (offset + len + page - 1) & !(page - 1);
+
+        unsafe {
+            libc::posix_fadvise(
+                self.file.as_raw_fd(),
+                lo as libc::off_t,
+                (hi - lo) as libc::off_t,
+                libc::POSIX_FADV_DONTNEED,
+            ) == 0
+        }
+    }
+
+    /// Same, for the first 'max_size' bytes of a file's extent list, only what is about to be
+    /// read, so a huge file with a small read cap doesn't lose its whole cache.
+    fn drop_stale_extents(&self, extents: &[Ext4Extent], max_size: usize) -> bool {
+        let block_size = self.sb.block_size as u64;
+
+        let mut left = max_size as u64;
+        let mut ok   = true;
+
+        for e in extents {
+            if left == 0 { break; }
+
+            let bytes = (e.len as u64 * block_size).min(left);
+            left -= bytes;
+
+            ok &= self.drop_stale_range(e.start * block_size, bytes);
+        }
+
+        ok
+    }
 }

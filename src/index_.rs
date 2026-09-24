@@ -119,6 +119,6 @@ mod tests {
     fn debug_still_panics_on_oob() {
         // In a debug build this must panic, same as `v[10]` would.
         let v = [1, 2, 3];
-        let _ = v.get_(10);
+        _ = v.get_(10);
     }
 }

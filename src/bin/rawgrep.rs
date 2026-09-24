@@ -14,6 +14,9 @@ use rawgrep::worker::NoSink;
 use rawgrep::{Error, RawGrepConfig, eprint_blue, eprint_green, eprintln_red};
 
 fn main() {
+    #[cfg(unix)]
+    rawgrep::holder::run_if_holder();
+
     _ = rawgrep::platform::set_process_priority(-10);
 
     #[cfg(feature = "dhat")]

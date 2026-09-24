@@ -74,6 +74,21 @@ pub fn read_u64_unaligned_le(data: &[u8], offset: usize) -> u64 {
     unsafe { (data.as_ptr().add(offset) as *const u64).read_unaligned().to_le() }
 }
 
+#[inline(always)]
+pub fn read_u16_unaligned_be(data: &[u8], offset: usize) -> u16 {
+    unsafe { (data.as_ptr().add(offset) as *const u16).read_unaligned().to_be() }
+}
+
+#[inline(always)]
+pub fn read_u32_unaligned_be(data: &[u8], offset: usize) -> u32 {
+    unsafe { (data.as_ptr().add(offset) as *const u32).read_unaligned().to_be() }
+}
+
+#[inline(always)]
+pub fn read_u64_unaligned_be(data: &[u8], offset: usize) -> u64 {
+    unsafe { (data.as_ptr().add(offset) as *const u64).read_unaligned().to_be() }
+}
+
 #[inline]
 pub fn extend_le(out: &mut Vec<u8>, v: &[impl Copy]) {
     #[cfg(target_endian = "little")]
@@ -326,3 +341,86 @@ mod imp {
 }
 
 pub use imp::*;
+
+/// Appends POD data to a Vec as raw bytes without bounds checks
+#[macro_export]
+macro_rules! batch_extend_pod {
+    ($buf:expr, [$($slice:expr),+ $(,)?]) => {{
+        let buf   = &mut $buf;
+        let start = buf.len();
+        let extra = 0 $(+ std::mem::size_of_val($slice))+;
+
+        buf.reserve(extra);
+
+        // SAFETY: 'buf' was just reserved for exactly 'extra' more bytes, each slice's
+        // raw bytes are memcpy'd in turn into that region with 'p' advanced by exactly
+        // that slice's length, so by 'set_len', all of 'start..start+extra' is written
+        // and nothing past it is touched.
+        #[allow(unused_assignments)]
+        unsafe {
+            let mut p = buf.as_mut_ptr().add(start);
+            $(
+                let n = std::mem::size_of_val($slice);
+                std::ptr::copy_nonoverlapping($slice.as_ptr() as *const u8, p, n);
+                p = p.add(n);
+            )+
+            buf.set_len(start + extra);
+        }
+    }};
+}
+
+/// A 'Vec<u8>' append cursor for hand written loops that write a variable, runtime known
+/// number of pieces.
+///
+/// Caller reserves an exact-or-upper-bound number of bytes once up front ('Vec::reserve'),
+/// wraps the vec in 'RawAppend::new', calls 'push'/'extend' any number of times, each one
+/// an unchecked pointer write, no per-call capacity check, then calls 'finish()' exactly
+/// once, which is the only place 'set_len' happens.
+pub(crate) struct RawAppend<'a> {
+    buf:     &'a mut Vec<u8>,
+    ptr:     *mut u8,
+    written: usize,
+}
+
+#[allow(unsafe_op_in_unsafe_fn)]
+impl<'a> RawAppend<'a> {
+    #[inline(always)]
+    pub(crate) fn new(buf: &'a mut Vec<u8>) -> Self {
+        // SAFETY: offsetting to exactly buf.len() from as_mut_ptr() always lands within
+        // the allocation.
+        let ptr = unsafe { buf.as_mut_ptr().add(buf.len()) };
+        RawAppend { buf, ptr, written: 0 }
+    }
+
+    #[inline(always)]
+    pub(crate) unsafe fn push(&mut self, byte: u8) {
+        self.ptr.write(byte);
+        self.ptr = self.ptr.add(1);
+        self.written += 1;
+    }
+
+    #[inline(always)]
+    pub(crate) unsafe fn extend(&mut self, bytes: &[u8]) {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.ptr, bytes.len());
+        self.ptr = self.ptr.add(bytes.len());
+        self.written += bytes.len();
+    }
+
+    #[inline(always)]
+    pub(crate) fn finish(self) {
+        let new_len = self.buf.len() + self.written;
+        // SAFETY: caller's contract (see struct docs) guarantees 'written' bytes were
+        // actually written into the reserved region starting at the old length.
+        unsafe { self.buf.set_len(new_len); }
+    }
+}
+
+#[inline]
+pub fn mmap_populate(path: &std::path::Path) -> Option<memmap2::Mmap> {
+    let file = File::open(path).ok()?;
+
+    let mut opts = memmap2::MmapOptions::new();
+    opts.populate();
+
+    unsafe { opts.map(&file).ok() }
+}

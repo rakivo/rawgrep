@@ -167,8 +167,8 @@ pub struct Cli {
     #[bpaf(long("cache-size"), argument("MB"), fallback(100))]
     pub cache_size_mb: usize,
 
-    /// Cache directory (default: ~/.cache/rawgrep/)
-    #[bpaf(long("cache-dir"), argument("DIR"))]
+    /// Cache directory // nocheckin (default: ~/.cache/rawgrep/)
+    #[bpaf(long("cache-dir"), argument("DIR"), fallback(Some(crate::resolve_cache_dir())))]
     pub cache_dir: Option<std::path::PathBuf>,
 
     /// Ignore existing cache and rebuild from scratch

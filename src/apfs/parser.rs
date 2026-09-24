@@ -17,10 +17,11 @@
 use crate::tracy;
 use crate::unwrap_::Unwrap_;
 use crate::util::{self, read_at_offset};
+use crate::grep::{AnyNodeHotScratch, AnyNodeColdScratch};
 use crate::parser::{BufKind, FileId, FileNode, FileType, Parser, RawFs, binary_probe};
 
 use super::{
-    raw, ApfsInode, ApfsSuperBlock, ApfsVolume,
+    raw, ApfsNode, ApfsSuperBlock, ApfsVolume,
     APFS_NX_MAGIC, APFS_APSB_MAGIC,
     APFS_NX_BLOCK_SIZE_OFFSET, APFS_NX_OMAP_OID_OFFSET, APFS_NX_FS_OID_OFFSET,
     APFS_APSB_OMAP_OID_OFFSET, APFS_APSB_ROOT_TREE_OID_OFFSET,
@@ -29,6 +30,7 @@ use super::{
     APFS_BTNODE_FLAG_LEAF,
     S_IFMT, S_IFDIR,
     DT_REG, DT_DIR,
+    ApfsNodeHot, ApfsNodeCold
 };
 
 use std::fs::File;
@@ -52,7 +54,15 @@ pub struct ApfsFs {
 // FileNode impl
 // -----------------------------------------------------------------------------
 
-impl FileNode for ApfsInode {
+impl FileNode for ApfsNodeHot {
+    const POISONED: Self = Self::POISONED;
+    #[inline(always)] fn file_id(&self)   -> FileId { self.inode_num }
+    #[inline(always)] fn size(&self)      -> u64    { self.size }
+    #[inline(always)] fn mtime_sec(&self) -> i64    { self.mtime_sec }
+    #[inline(always)] fn is_dir(&self)    -> bool   { (self.mode & S_IFMT) == S_IFDIR }
+}
+
+impl FileNode for ApfsNode {
     const POISONED: Self = Self::POISONED;
 
     #[inline(always)] fn file_id(&self) -> FileId { self.inode_num }
@@ -66,14 +76,29 @@ impl FileNode for ApfsInode {
 // -----------------------------------------------------------------------------
 
 impl RawFs for ApfsFs {
-    type Node = ApfsInode;
+    type Node     = ApfsNode;
+    type NodeHot  = ApfsNodeHot;
+    type NodeCold = ApfsNodeCold;
     type Context<'b> = &'b Self where Self: 'b;
     type NodeCache = ();
 
-    #[inline(always)] fn device_id(&self)  -> u64 { self.device_id }
+    #[inline(always)] fn device_id(&self)   -> u64 { self.device_id }
     #[inline(always)] fn device_file(&self) -> &File { &self.file }
-    #[inline(always)] fn block_size(&self) -> u32 { self.sb.block_size }
-    #[inline(always)] fn root_id(&self)    -> FileId { APFS_ROOT_DIR_INO_NUM }
+    #[inline(always)] fn block_size(&self)  -> u32 { self.sb.block_size }
+    #[inline(always)] fn root_id(&self)     -> FileId { APFS_ROOT_DIR_INO_NUM }
+
+    #[inline(always)]
+    fn split_node(&self, node: Self::Node) -> (Self::NodeHot, Self::NodeCold) {
+        (
+            ApfsNodeHot { inode_num: node.inode_num, mode: node.mode, size: node.size, mtime_sec: node.mtime_sec },
+            ApfsNodeCold { flags: node.cold.flags },
+        )
+    }
+
+    #[inline(always)]
+    fn merge_node(&self, hot: Self::NodeHot, cold: Self::NodeCold) -> Self::Node {
+        ApfsNode { hot, cold }
+    }
 
     #[inline]
     fn parse_node_cached(
@@ -85,6 +110,7 @@ impl RawFs for ApfsFs {
         (self.parse_node(file_id), Default::default()) // @Incomplete
     }
 
+    #[inline]
     fn parse_node(&self, file_id: FileId) -> io::Result<Self::Node> {
         let _span = tracy::span!("ApfsFs::parse_node");
         self.lookup_inode(file_id)
@@ -186,7 +212,7 @@ impl RawFs for ApfsFs {
         let mut names: Vec<u8> = Vec::with_capacity(4096);
         let mut result: Option<R> = None;
 
-        let _ = self.scan_dir_entries(dir_ino, |child_id, name_bytes, dt| {
+        _ = self.scan_dir_entries(dir_ino, |child_id, name_bytes, dt| {
             let name_start = names.len();
             names.extend_from_slice(name_bytes);
             let name_len = name_bytes.len();
@@ -208,6 +234,25 @@ impl RawFs for ApfsFs {
 
     #[inline]
     fn directory_entry_count_hint(&self, _buf: &[u8]) -> usize { 0 } // @Incomplete
+
+    #[inline]
+    fn take_node_hot_scratch(&self, shared: &mut AnyNodeHotScratch) -> Vec<ApfsNodeHot> {
+        match std::mem::replace(shared, AnyNodeHotScratch::Apfs(Vec::new())) {
+            AnyNodeHotScratch::Apfs(v) => v,
+            _ => Vec::new(),
+        }
+    }
+    #[inline]
+    fn take_node_cold_scratch(&self, shared: &mut AnyNodeColdScratch) -> Vec<ApfsNodeCold> {
+        match std::mem::replace(shared, AnyNodeColdScratch::Apfs(Vec::new())) {
+            AnyNodeColdScratch::Apfs(v) => v,
+            _ => Vec::new(),
+        }
+    }
+    #[inline]
+    fn erase_node_hot_scratch(&self, scratch: Vec<ApfsNodeHot>) -> AnyNodeHotScratch { AnyNodeHotScratch::Apfs(scratch) }
+    #[inline]
+    fn erase_node_cold_scratch(&self, scratch: Vec<ApfsNodeCold>) -> AnyNodeColdScratch { AnyNodeColdScratch::Apfs(scratch) }
 }
 
 // -----------------------------------------------------------------------------
@@ -492,7 +537,7 @@ impl ApfsFs {
                             ControlFlow::Break(b) => { result = Some(b); break; }
                             ControlFlow::Continue(_) => {}
                         }
-                        let _ = v_len; // suppress warning
+                        _ = v_len; // suppress warning
                     }
                     // Past the target range – stop early
                     if entry_ino > target_ino { break; }
@@ -527,12 +572,12 @@ impl ApfsFs {
 
     // -- Inode lookup ---------------------------------------------------------
 
-    fn lookup_inode(&self, ino: u64) -> io::Result<ApfsInode> {
+    fn lookup_inode(&self, inode_num: u64) -> io::Result<ApfsNode> {
         let _span = tracy::span!("ApfsFs::lookup_inode");
 
-        let mut found: Option<ApfsInode> = None;
+        let mut found: Option<ApfsNode> = None;
 
-        self.walk_fs_tree(ino, APFS_TYPE_INODE, |_key, val| {
+        self.walk_fs_tree(inode_num, APFS_TYPE_INODE, |_key, val| {
             if val.len() < mem::size_of::<raw::JInodeVal>() {
                 return ControlFlow::Continue(());
             }
@@ -551,12 +596,15 @@ impl ApfsFs {
                 | (u64::from_le(raw.uncompressed_size_hi as u64) << 32);
             let flags     = u64::from_le(raw.internal_flags);
 
-            found = Some(ApfsInode { inode_num: ino, mode, size, mtime_sec, flags });
+            found = Some(ApfsNode {
+                hot: ApfsNodeHot { inode_num, mode, size, mtime_sec },
+                cold: ApfsNodeCold { flags }
+            });
             ControlFlow::Break(())
         })?;
 
         found.ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, format!("Inode {ino} not found"))
+            io::Error::new(io::ErrorKind::NotFound, format!("Inode {inode_num} not found"))
         })
     }
 

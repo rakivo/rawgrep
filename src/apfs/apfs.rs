@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+use std::ops::Deref;
 use std::fmt::Display;
 
 pub type ObjId = u64;
@@ -123,18 +124,36 @@ pub struct ApfsVolume {
     pub root_tree_paddr: u64,
 }
 
-/// Parsed APFS inode (j_inode_val_t + key)
-#[derive(Clone, Copy)]
-pub struct ApfsInode {
+#[derive(Copy, Clone)]
+pub struct ApfsNodeHot {
     pub inode_num: u64,
-    pub mode: u16,
-    pub size: u64,
+    pub mode:      u16,
+    pub size:      u64,
     pub mtime_sec: i64,
+}
+
+#[derive(Copy, Clone, Default)]
+pub struct ApfsNodeCold {
     /// BSD flags / inode flags (j_inode_flags)
     pub flags: u64,
 }
 
-impl ApfsInode {
+/// Parsed APFS inode (j_inode_val_t + key)
+#[derive(Clone, Copy)]
+pub struct ApfsNode {
+    pub hot:  ApfsNodeHot,
+    pub cold: ApfsNodeCold,
+}
+
+impl Deref for ApfsNode {
+    type Target = ApfsNodeHot;
+    fn deref(&self) -> &Self::Target { &self.hot }
+}
+
+impl ApfsNodeHot {
+    pub const POISONED: Self = Self { inode_num: 0, mode: 0, size: 0, mtime_sec: 0 };
+}
+impl ApfsNode {
     pub const POISONED: Self = unsafe { core::mem::zeroed() };
 }
 

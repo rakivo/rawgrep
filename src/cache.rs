@@ -1,17 +1,16 @@
 #![allow(clippy::needless_range_loop)]
 
-use crate::debug;
 use crate::writeln_blue;
 use crate::unwrap_::Unwrap_;
 use crate::index_::{Index_, IndexMut_};
 use crate::util::{likely, unlikely, prefetch_read};
 use crate::parser::{FileIdentifier, FileKey, FileMeta};
 
-use std::time::Instant;
-use std::io::{self};
+use std::io;
 use std::fmt::Display;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU32;
+use std::time::{Instant, Duration};
 #[cfg(not(feature = "no-cache-stats"))]
 use std::sync::atomic::Ordering;
 
@@ -243,13 +242,17 @@ impl std::ops::Deref for CacheBytes {
     }
 }
 
+#[inline]
+#[cfg(not(unix))]
+pub fn fix_ownership(_path: &Path) -> io::Result<()> { Ok(()) }
+
 /// Ownership of the cache directory/file may fuck up and error out
 /// when we try to write/read from it.
 ///
 /// So this function is for preventing that.
 #[inline]
 #[cfg(unix)]
-fn fix_ownership(path: &Path) -> io::Result<()> {
+pub fn fix_ownership(path: &Path) -> io::Result<()> {
     use std::{ffi::CString, os::unix::ffi::OsStrExt};
 
     let (sudo_uid, sudo_gid) = match (
@@ -257,7 +260,7 @@ fn fix_ownership(path: &Path) -> io::Result<()> {
         std::env::var("SUDO_GID").ok().and_then(|s| s.parse::<u32>().ok()),
     ) {
         (Some(uid), Some(gid)) => (uid, gid),
-        _ => return Ok(()), // not running with sudo, nothing to fix
+        _ => return Ok(()),  // Not running with sudo, nothing to fix
     };
 
     let path_cstr = CString::new(path.as_os_str().as_bytes())
@@ -268,12 +271,6 @@ fn fix_ownership(path: &Path) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
 
-    Ok(())
-}
-
-#[inline]
-#[cfg(not(unix))]
-fn fix_ownership(_path: &Path) -> io::Result<()> {
     Ok(())
 }
 
@@ -372,68 +369,13 @@ impl CacheStorage for DiskStorage {
 
         #[cfg(not(windows))]
         {
-            fn ensure_memlock_capacity(min_bytes: u64) {
-                let mut rl = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
-                if unsafe { libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut rl) } != 0 {
-                    return;  // Can't even query; leave as-is...
-                }
-
-                // RLIM_INFINITY means no hard cap -- safe to just request what we need
-                let target = if rl.rlim_max == libc::RLIM_INFINITY {
-                    min_bytes
-                } else {
-                    min_bytes.min(rl.rlim_max)
-                };
-
-                if rl.rlim_cur >= target {
-                    return;  // Already sufficient
-                }
-
-                let new_rl = libc::rlimit { rlim_cur: target, rlim_max: rl.rlim_max };
-                let ret = unsafe { libc::setrlimit(libc::RLIMIT_MEMLOCK, &new_rl) };
-                if ret != 0 {
-                    debug!(
-                        "[cache] setrlimit(RLIMIT_MEMLOCK) failed ({}), mlock may still fail",
-                        io::Error::last_os_error()
-                    );
-                }
-            }
-
-            fn try_mlock_cache(bytes: &[u8]) -> bool {
-                let ret = unsafe { libc::mlock(bytes.as_ptr() as *const libc::c_void, bytes.len()) };
-                if ret != 0 {
-                    let err = io::Error::last_os_error();
-                    eprintln!("[cache] mlock failed ({err}), falling back to populated but unlocked mapping");
-                    false
-                } else {
-                    true
-                }
-            }
-
-            ensure_memlock_capacity(256 * 1024 * 1024); // @Constant @Tune
-
-            // SAFETY: the file is only ever replaced via tmp+rename,
-            // never truncated/modified in place, so this mapping stays valid for
-            // as long as we hold it. External processes touching the cache path
-            // directly would violate this, but that's outside our control anyway.
-            let mmap = unsafe { memmap2::Mmap::map(&file)? };
-
-            //
-            // With the pages mlock'd there is nothing left to advise about,
-            // so madvise would be a no-op.
-            //
-            // The exception is mlock failing (RLIMIT_MEMLOCK), in this case
-            // populate-read the mmap
-            //
-            let t0 = Instant::now();
-            if try_mlock_cache(&mmap[..]) {
-                eprintln!("mlock-cached cache pages in {}ms", t0.elapsed().as_millis() as f64);
-            } else {
-                _ = mmap.advise(memmap2::Advice::PopulateRead);
-                _ = mmap.advise(memmap2::Advice::Random);
-
-                eprintln!("mmap-populated cache pages in {}ms", t0.elapsed().as_millis() as f64);
-            }
+            // SAFETY: the file is only ever replaced via tmp+rename, never truncated
+            // or modified in place, so this mapping stays valid while we hold it.
+            let mmap = unsafe {
+                let mut opts = memmap2::MmapOptions::new();
+                opts.populate();
+                opts.map(&file)?
+            };
 
             Ok(Some(CacheBytes::Mapped(mmap)))
         }
@@ -472,8 +414,8 @@ impl CacheStorage for MemoryStorage {
     }
 }
 
-/// Allocate a lookup table with `size` slots, all initialized to
-/// FILE_LOOKUP_EMPTY. `size` must be a power of two. Writing the 0xFF byte
+/// Allocate a lookup table with 'size' slots, all initialized to
+/// FILE_LOOKUP_EMPTY. 'size' must be a power of two. Writing the 0xFF byte
 /// pattern directly is a single memset instead of a per-element store loop.
 #[inline(always)]
 fn new_empty_lookup(size: usize) -> Box<[u32]> {
@@ -484,10 +426,10 @@ fn new_empty_lookup(size: usize) -> Box<[u32]> {
     }
 }
 
-/// Insert `num_files` entries into `lookup` via open addressing, hashing
-/// each file's key through `key_at(file_id)`. Shared by the full-table
-/// rebuild in `ensure_capacity`'s rehash and by `load_from_disk`'s
-/// from-scratch build -- both used to carry their own copy of this loop.
+/// Insert 'num_files' entries into 'lookup' via open addressing, hashing
+/// each file's key through 'key_at(file_id)'. Shared by the full-table
+/// rebuild in 'ensure_capacity''s rehash and by 'load_from_disk's
+/// from-scratch build, both used to carry their own copy of this loop.
 ///
 /// Prefetches the next file's target slot one iteration ahead so its cache
 /// line is already in flight while we're still probing for the current file.
@@ -564,11 +506,84 @@ pub struct FragmentCache<S: CacheStorage = DiskStorage> {
     storage: S,
 
     backing: Option<CacheBytes>,
+
+    // Held for the process's entire lifetime when we're the one
+    // accumulating a fresh cache. Drop (including on process exit by crash)
+    // closes the fd, which releases the flock and is exactly the signal other
+    // waiting instances need.
+    build_lock: Option<std::fs::File>,
+
+    // Set only when this cache holds data actually loaded from a
+    // pre-existing file on disk (never on the create_empty/leader path).
+    //
+    // This is what tells the caller 'there's something here
+    // worth having the holder pin', as opposed to an empty cache
+    // that's about to be built and rewritten this run.
+    pub loaded_from_disk: bool,
+}
+
+enum WaitOutcome { Released, TimedOut }
+
+#[cfg(unix)]
+fn wait_for_leader(fd: std::os::fd::RawFd, max_wait: Duration) -> WaitOutcome {
+    let deadline = Instant::now() + max_wait;
+    loop {
+        // flock has no timed variant, so poll LOCK_NB with backoff.
+        if unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            unsafe { libc::flock(fd, libc::LOCK_UN) }; // we only needed the signal, not ownership
+            return WaitOutcome::Released;
+        }
+        if Instant::now() >= deadline {
+            return WaitOutcome::TimedOut;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 impl FragmentCache<DiskStorage> {
+    #[cfg(unix)]
+    pub fn new(config: &CacheConfig) -> io::Result<Self> {
+        use std::os::fd::AsRawFd;
+
+        let t0 = Instant::now();
+        let path = get_cache_path(config.cache_dir.as_deref(), "fragment-cache.bin")?;
+        let storage = DiskStorage::new(path.clone());
+
+        if !config.ignore_cache {
+            if let Ok(cache) = Self::load_from_disk(storage.clone(), config, t0) {
+                return Ok(cache);
+            }
+        }
+
+        // No usable cache yet. Try to become the sole builder for this run.
+        let lock_path = path.with_extension("lock");
+        let lock_file = std::fs::OpenOptions::new().create(true).write(true).open(&lock_path)?;
+        let fd = lock_file.as_raw_fd();
+
+        if unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            // Leader: builds from scratch this run. Nothing to pin yet, the
+            // next invocation loads the published file and pins that.
+            let mut cache = Self::create_empty(config, storage)?;
+            cache.build_lock = Some(lock_file);
+            return Ok(cache);
+        }
+
+        match wait_for_leader(fd, Duration::from_secs(2)) {
+            WaitOutcome::Released => {
+                if !config.ignore_cache {
+                    if let Ok(cache) = Self::load_from_disk(storage.clone(), config, t0) {
+                        return Ok(cache);
+                    }
+                }
+                Self::create_empty(config, storage)
+            }
+            WaitOutcome::TimedOut => Self::create_empty(config, storage),
+        }
+    }
+
     /// Create new or load existing cache
     #[inline]
+    #[cfg(not(unix))]
     pub fn new(config: &CacheConfig) -> io::Result<Self> {
         let t0 = Instant::now();
 
@@ -699,8 +714,10 @@ impl<S: CacheStorage> FragmentCache<S> {
             ring_pos: 0,
             max_fragments,
             max_files,
+            build_lock: None,
             file_capacity: INITIAL_CAPACITY,
             fragment_hashes,
+            loaded_from_disk: false,
             owned_arena: None,
             file_keys,
             file_metas,
@@ -846,7 +863,9 @@ impl<S: CacheStorage> FragmentCache<S> {
             backing: Some(bytes),
             max_fragments: config.max_fragments as u32,
             max_files: config.max_files as u32,
+            build_lock: None,
             owned_arena: None,
+            loaded_from_disk: true,
             file_capacity,
             fragment_hashes,
             file_keys,

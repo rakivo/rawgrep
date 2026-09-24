@@ -1,8 +1,8 @@
 use crate::unwrap_::Unwrap_;
-use crate::apfs::{ApfsFs, ApfsVolume, APFS_NX_MAGIC, ApfsInode};
+use crate::apfs::{ApfsFs, ApfsVolume, APFS_NX_MAGIC, ApfsNodeHot, ApfsNodeCold};
 use crate::cli::Cli;
 use crate::matcher::Matcher;
-use crate::ntfs::{NtfsFs, NtfsInode};
+use crate::ntfs::{NtfsFs, NtfsNodeHot, NtfsNodeCold};
 use crate::fragments::FragmentLen;
 use crate::util::read_at_offset;
 use crate::{Result, Error, tracy};
@@ -13,7 +13,7 @@ use crate::binary_verdicts::BinaryVerdicts;
 use crate::worker::{MatchSink, NoSink};
 use crate::ext4::parser::InodeBlockCache;
 use crate::ext4::{
-    EXT4_INODE_TABLE_OFFSET, EXT4_MAGIC_OFFSET, EXT4_SUPER_MAGIC, EXT4_SUPERBLOCK_OFFSET, EXT4_SUPERBLOCK_SIZE, Ext4Fs, Ext4Inode
+    EXT4_INODE_TABLE_OFFSET, EXT4_MAGIC_OFFSET, EXT4_SUPER_MAGIC, EXT4_SUPERBLOCK_OFFSET, EXT4_SUPERBLOCK_SIZE, Ext4Fs, Ext4NodeHot,Ext4NodeCold
 };
 
 use std::time::Instant;
@@ -82,15 +82,41 @@ impl<F: RawFs, S: MatchSink> RawGrepper<F, S> {
             None
         };
 
-        let binary_verdicts = if !cli.should_search_binary() &&
-            let Ok(binary_verdicts_path) = crate::cache::get_cache_path(
-                config.cache_dir.as_deref(), "binary-verdicts.bin"
-            )
-        {
-            BinaryVerdicts::load(&binary_verdicts_path)
+        let binary_verdicts_path = if !cli.should_search_binary() {
+            crate::cache::get_cache_path(config.cache_dir.as_deref(), "binary-verdicts.bin").ok()
         } else {
-            BinaryVerdicts::empty()
+            None
         };
+        let binary_verdicts = match &binary_verdicts_path {
+            Some(p) => BinaryVerdicts::load(p),
+            None    => BinaryVerdicts::empty(),
+        };
+
+        #[cfg(unix)]
+        {
+            let mut holder_paths = Vec::with_capacity(3);
+
+            if let Some(cache) = cache.as_ref() {
+                if cache.loaded_from_disk {
+                    if let Ok(p) = crate::cache::get_cache_path(config.cache_dir.as_deref(), "fragment-cache.bin") {
+                        holder_paths.push(p);
+                    }
+                }
+            }
+
+            if !binary_verdicts.is_empty() {
+                if let Some(p) = &binary_verdicts_path {
+                    holder_paths.push(p.clone());
+                }
+            }
+
+            #[cfg(target_os = "linux")]
+            if let Some(p) = crate::stale::holder_path() {
+                holder_paths.push(p);
+            }
+
+            crate::holder::ensure(&holder_paths);
+        }
 
         eprintln!("prepared RawGrepper in {}ms", t0.elapsed().as_millis() as f64);
 
@@ -152,7 +178,7 @@ impl<F: RawFs, S: MatchSink> RawGrepper<F, S> {
 /// impl block for ext4-specific construction
 impl<S: MatchSink> RawGrepper<Ext4Fs, S> {
     #[inline]
-    pub fn new_ext4(cli: &Cli, _device_path: &str, mut file: File, sink: S) -> Result<AnyGrepper<S>> {
+    pub fn new_ext4(cli: &Cli, device_path: &str, mut file: File, sink: S) -> Result<AnyGrepper<S>> {
         let t0 = Instant::now();
 
         let mut sb_bytes = [0u8; EXT4_SUPERBLOCK_SIZE];
@@ -208,6 +234,9 @@ impl<S: MatchSink> RawGrepper<Ext4Fs, S> {
         }
 
         eprintln!("read ext4 block groups in {}ms", t0.elapsed().as_millis() as f64);
+
+        #[cfg(target_os = "linux")]
+        crate::stale::init(device_path);
 
         let fs = Ext4Fs { sb, device_id, max_block, file, inode_table_blocks };
         Self::new_with_fs(cli, fs, sink).map(AnyGrepper::Ext4)
@@ -302,7 +331,46 @@ pub fn open_device_and_detect_fs(device_path: &str) -> Result<(File, FsType)> {
         let t = std::time::Instant::now();
 
         #[cfg(unix)]
-        unsafe { libc::sync(); }
+        {
+            #[cfg(target_os = "linux")]
+            fn sync_mounted_fs(dev: &File) -> bool {
+                use std::os::fd::AsRawFd;
+                use std::os::unix::fs::MetadataExt;
+
+                let Ok(rdev) = dev.metadata().map(|m| m.rdev())                  else { return false };
+                let want = format!("{}:{}", libc::major(rdev), libc::minor(rdev));
+
+                let Ok(mounts) = std::fs::read_to_string("/proc/self/mountinfo") else { return false };
+
+                for line in mounts.lines() {
+                    let mut f = line.split(' ');
+
+                    // Fields: id, parent id, major:minor, root, mount point, ...
+                    let (Some(devno), Some(mnt)) = (f.nth(2), f.nth(1))          else { continue };
+                    if devno != want { continue; }
+
+                    let Ok(dir) = File::open(mnt.replace("\\040", " "))          else { continue };
+
+                    // Something else mounted on top of the path would make syncfs sync the wrong fs
+                    if !dir.metadata().is_ok_and(|m| m.dev() == rdev) { continue; }
+
+                    return unsafe { libc::syncfs(dir.as_raw_fd()) } == 0;
+                }
+
+                false
+            }
+
+            #[cfg(target_os = "linux")] {
+                crate::stale::mark_run_start();
+                if !sync_mounted_fs(&file) {
+                    unsafe { libc::sync(); }
+                }
+            }
+
+            #[cfg(not(target_os = "linux"))] {
+                libc::sync();
+            }
+        }
 
         #[cfg(windows)]
         {
@@ -453,10 +521,16 @@ pub struct NodeCacheStats {
     pub misses: u32,
 }
 
-pub enum AnyNodeScratch {
-    Ext4(Vec<Ext4Inode>),
-    Apfs(Vec<ApfsInode>),
-    Ntfs(Vec<NtfsInode>),
+pub enum AnyNodeHotScratch {
+    Ext4(Vec<Ext4NodeHot>),
+    Apfs(Vec<ApfsNodeHot>),
+    Ntfs(Vec<NtfsNodeHot>),
+}
+
+pub enum AnyNodeColdScratch {
+    Ext4(Vec<Ext4NodeCold>),
+    Apfs(Vec<ApfsNodeCold>),
+    Ntfs(Vec<NtfsNodeCold>),
 }
 
 pub enum AnyNodeCache {
@@ -465,10 +539,11 @@ pub enum AnyNodeCache {
     Ntfs(()),
 }
 
-impl Default for AnyNodeScratch {
-    fn default() -> Self {
-        AnyNodeScratch::Ext4(Vec::new()) // arbitrary starting arm -- see take_* fallback
-    }
+impl Default for AnyNodeHotScratch {
+    fn default() -> Self { AnyNodeHotScratch::Ext4(Vec::new()) }
+}
+impl Default for AnyNodeColdScratch {
+    fn default() -> Self { AnyNodeColdScratch::Ext4(Vec::new()) }
 }
 
 impl Default for AnyNodeCache {

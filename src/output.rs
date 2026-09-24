@@ -18,13 +18,14 @@
 // two adjacent (and independently owned/reused) slots could share a physical page,
 // letting a live producer write into slot N+1 corrupt a page the kernel still holds open for slot N's vmsplice.
 
+use crate::index_::IndexMut_;
 use crate::worker::OutputMessage;
 
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::ops::{Deref, DerefMut};
 use std::cell::UnsafeCell;
 
-use crate::crossbeam_channel::Sender;
+use crossbeam_channel::Sender;
 
 pub const SLOT_CAP:         usize = 64 * 1024;
 pub const SLOTS_PER_WORKER: usize = 20;
@@ -235,7 +236,7 @@ impl OutputSlot {
     fn append_unchecked(&mut self, bytes: &[u8]) {
         match self {
             OutputSlot::Slab { slab, slot, len } => unsafe {
-                slab.slot_mut(*slot as usize)[*len..*len + bytes.len()].copy_from_slice(bytes);
+                slab.slot_mut(*slot as usize).get_mut_(*len..*len + bytes.len()).copy_from_slice(bytes);
                 *len += bytes.len();
             },
             OutputSlot::Owned { buf, .. } => buf.extend_from_slice(bytes),
@@ -330,7 +331,7 @@ impl OutputSlotWriter {
         let fresh = self.pool.acquire();
         let old = std::mem::replace(&mut self.buf, fresh);
         if !old.is_empty() {
-            let _ = self.tx.send(old.finish());
+            _ = self.tx.send(old.finish());
         }
     }
 

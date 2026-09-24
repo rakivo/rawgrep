@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+use std::ops::Deref;
 use std::fmt::Display;
 
 pub type MftRecordNum = u64;
@@ -104,17 +105,34 @@ impl Display for NtfsSuperBlock {
     }
 }
 
-/// Parsed MFT record / inode equivalent
-#[derive(Clone, Copy)]
-pub struct NtfsInode {
+#[derive(Copy, Clone)]
+pub struct NtfsNodeHot {
     pub record_num: MftRecordNum,
-    pub flags: u16,
-    pub size: u64,          // from $FILE_NAME data size
-    pub mtime_sec: i64,     // from $STANDARD_INFORMATION, Unix epoch seconds
+    pub flags:      u16,
+    pub size:       u64,   // from $FILE_NAME data size
+    pub mtime_sec:  i64,   // from $STANDARD_INFORMATION, Unix epoch seconds
 }
 
-impl NtfsInode {
+#[derive(Copy, Clone, Default)]
+pub struct NtfsNodeCold;
+
+/// Parsed MFT record / inode equivalent
+#[derive(Clone, Copy)]
+pub struct NtfsNode {
+    pub hot: NtfsNodeHot
+}
+
+impl Deref for NtfsNode {
+    type Target = NtfsNodeHot;
+    fn deref(&self) -> &Self::Target { &self.hot }
+}
+
+impl NtfsNode {
     pub const POISONED: Self = unsafe { core::mem::zeroed() };
+}
+
+impl NtfsNodeHot {
+    pub const POISONED: Self = Self { record_num: 0, flags: 0, size: 0, mtime_sec: 0 };
 }
 
 /// A single run (extent) in an NTFS runlist

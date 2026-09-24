@@ -1,6 +1,6 @@
 use crate::tracy;
 use crate::index_::Index_;
-use crate::grep::{AnyNodeCache, AnyNodeScratch, NodeCacheStats};
+use crate::grep::{AnyNodeCache, AnyNodeHotScratch, AnyNodeColdScratch, NodeCacheStats};
 use crate::binary::{is_binary_chunk, is_dot_entry, is_hidden_entry};
 use crate::worker::{BINARY_PROBE_BYTE_SIZE, PendingSubdir, STREAMING_CHUNK_SIZE};
 use crate::cli::BufferConfig;
@@ -100,7 +100,12 @@ pub trait FileNode: Copy {
 pub trait RawFs: Sync + Send {
     /// Filesystem-specific file node type (e.g., Ext4Inode)
     type Node: FileNode;
+
+    type NodeHot:  Copy + FileNode;   // file_id, size, mtime_sec, mode/is_dir
+    type NodeCold: Copy + Default;    // flags, blocks, whatever only a surviving file reads
+
     type NodeCache: Default;
+
     /// Filesystem-specific context (e.g., superblock + mmap reference)
     type Context<'a>: Copy where Self: 'a;
 
@@ -110,12 +115,15 @@ pub trait RawFs: Sync + Send {
     fn device_file(&self) -> &File;
 
     #[inline(always)]
-    fn file_identifier(&self, node: &Self::Node) -> FileIdentifier {
+    fn file_identifier<N: FileNode>(&self, node: N) -> FileIdentifier {
         FileIdentifier {
             key: FileKey::new(self.device_id(), node.file_id()),
             meta: FileMeta::new(node.mtime_sec(), node.size())
         }
     }
+
+    fn split_node(&self, node: Self::Node) -> (Self::NodeHot, Self::NodeCold);
+    fn merge_node(&self, hot: Self::NodeHot, cold: Self::NodeCold) -> Self::Node;
 
     #[inline]
     fn read_at_offset(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
@@ -131,14 +139,22 @@ pub trait RawFs: Sync + Send {
     // @Incomplete
     fn parse_nodes_batch(
         &self,
-        entries: &[(FileId, BufFatPtr)],
-        _cache:  &mut Self::NodeCache,
-        out:     &mut Vec<Self::Node>,
+        entries:  &[(FileId, BufFatPtr)],
+        _cache:   &mut Self::NodeCache,
+        hot_out:  &mut Vec<Self::NodeHot>,
+        cold_out: &mut Vec<Self::NodeCold>,
     ) -> NodeCacheStats {
-        out.extend(entries.iter().map(|&(id, _)| match self.parse_node(id) {
-            Ok(node) => node,
-            Err(_) => Self::Node::POISONED
-        }));
+        hot_out.reserve(entries.len());
+        cold_out.reserve(entries.len());
+
+        for &(id, _) in entries {
+            let (hot, cold) = match self.parse_node(id) {
+                Ok(node) => self.split_node(node),
+                Err(_)   => (Self::NodeHot::POISONED, Self::NodeCold::default()),
+            };
+            hot_out.push(hot);
+            cold_out.push(cold);
+        }
 
         NodeCacheStats { hits: 0, misses: entries.len() as u32 }
     }
@@ -192,6 +208,8 @@ pub trait RawFs: Sync + Send {
         Ok(false)
     }
 
+    fn directory_entry_count_hint(&self, buf: &[u8]) -> usize;
+
     /// Iterate directory entries from buffer
     fn with_directory_entries<R>(
         &self,
@@ -199,12 +217,13 @@ pub trait RawFs: Sync + Send {
         callback: impl FnMut(FileId, usize, usize, FileType) -> ControlFlow<R>
     ) -> Option<R>;
 
-    fn directory_entry_count_hint(&self, buf: &[u8]) -> usize;
+    fn take_node_hot_scratch(&self,  _shared: &mut AnyNodeHotScratch)  -> Vec<Self::NodeHot>  { Default::default() } // @Incomplete
+    fn take_node_cold_scratch(&self, _shared: &mut AnyNodeColdScratch) -> Vec<Self::NodeCold> { Default::default() } // @Incomplete
+    fn take_node_cache(&self,        _shared: &mut AnyNodeCache)       -> Self::NodeCache     { Default::default() } // @Incomplete
 
-    fn take_node_scratch(&self,  _shared: &mut AnyNodeScratch) -> Vec<Self::Node> { Default::default() } // @Incomplete
-    fn take_node_cache(&self,    _shared: &mut AnyNodeCache)   -> Self::NodeCache { Default::default() } // @Incomplete
-    fn erase_node_scratch(&self, _scratch: Vec<Self::Node>)    -> AnyNodeScratch { Default::default() } // @Incomplete
-    fn erase_node_cache(&self,   _cache: Self::NodeCache)      -> AnyNodeCache { Default::default() } // @Incomplete
+    fn erase_node_hot_scratch(&self,  _scratch: Vec<Self::NodeHot>)  -> AnyNodeHotScratch  { Default::default() }    // @Incomplete
+    fn erase_node_cold_scratch(&self, _scratch: Vec<Self::NodeCold>) -> AnyNodeColdScratch { Default::default() }    // @Incomplete
+    fn erase_node_cache(&self,        _cache: Self::NodeCache)       -> AnyNodeCache      { Default::default() }     // @Incomplete
 }
 
 /// Result of scanning directory entries
@@ -243,22 +262,16 @@ pub struct DirScanResult {
 ///    buffered read loop and the streaming loop. Live for the whole read -- not throwaway
 ///    scratch like the rest of this list.
 ///
+#[repr(C)]
 pub struct Parser {
-    pub file:           Vec<u8>,                // 0
-
-    pub scratch:        Vec<u8>,                // 24
-    pub scratch2:       Vec<u8>,                // 48
-
-    // ================ Cache line ===================
-
-    pub scratch3:       Vec<u64>,               // 72
-    pub stream_chunk:   Vec<u8>,                // 96
-    pub scratch_chunks: Vec<(u64, u32)>,        // 120
-
-    // ================ Cache line ===================
-
-    pub dir:            Vec<u8>,                // 144
-    pub gitignore:      Vec<u8>,                // 168
+    pub dir:            Vec<u8>,
+    pub file:           Vec<u8>,
+    pub scratch:        Vec<u8>,
+    pub scratch2:       Vec<u8>,
+    pub scratch3:       Vec<u64>,
+    pub stream_chunk:   Vec<u8>,
+    pub scratch_chunks: Vec<(u64, u32)>,
+    pub gitignore:      Vec<u8>,
 
     pub dont_skip_dot_entries: bool,
 }
