@@ -25,7 +25,7 @@ use crate::debug;
 use crate::util::likely;
 use crate::parser::FileId;
 use crate::index_::{Index_, IndexMut_};
-use crate::util::{RawAppend, read_u32_unaligned_le, mmap_populate};
+use crate::util::{RawAppend, read_u64_unaligned_le, mmap_populate};
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -95,7 +95,7 @@ pub fn note_invalidated(inode: u64, ctime_sec: i64, complete: bool) {
 // for the rest of the run. Inode 0 is never allocated on ext4 (this module is only ever
 // used from the ext4 path for now (@Incomplete)), so it doubles as the 'empty slot' sentinel for free.
 //
-// Each slot packs (inode << 32 | ctime) into one u64.
+// Each slot packs (ctime << 32 | inode) into one u64.
 struct InodeTable {
     slots: Vec<u64>,
     mask:  usize,     // slots.len() - 1, for probe wraparound (len is a power of two)
@@ -121,10 +121,10 @@ impl InodeTable {
     const fn is_empty(&self) -> bool { self.len == 0 }
 
     #[inline(always)]
-    const fn pack(ino: u32, ctime: u32) -> u64 { ((ino as u64) << 32) | ctime as u64 }
+    const fn pack(ino: u32, ctime: u32) -> u64 { ((ctime as u64) << 32) | ino as u64 }
 
     #[inline(always)]
-    const fn unpack(v: u64) -> (u32, u32) { ((v >> 32) as u32, v as u32) }
+    const fn unpack(v: u64) -> (u32, u32) { (v as u32, (v >> 32) as u32) }  // (ino, ctime)
 
     #[inline(always)]
     const fn hash(&self, ino: u32) -> usize {
@@ -138,7 +138,7 @@ impl InodeTable {
     fn insert_max(&mut self, inode_num: u32, ctime: u32) {
         debug_assert_ne!(inode_num, 0, "inode 0 is never valid on ext4; reserved as the empty-slot sentinel");
 
-        let mut i = self.hash(inode_num) & self.mask;
+        let mut i = self.hash(inode_num);
         loop {
             let slot = *self.slots.get_(i);
             if slot == 0 {
@@ -163,7 +163,7 @@ impl InodeTable {
     fn get(&self, ino: u32) -> Option<u32> {
         if ino == 0 { return None; }  // Poisoned...
 
-        let mut i = self.hash(ino) & self.mask;
+        let mut i = self.hash(ino);
         loop {
             let slot = *self.slots.get_(i);
             if slot == 0 { return None; }
@@ -236,8 +236,8 @@ pub fn init(device_path: &str) {
 
             let mut table = InodeTable::with_capacity(record_count);
             for r in mmap.get_(HEADER_LEN..).chunks_exact(RECORD_LEN) {
-                let inode_num = read_u32_unaligned_le(r, 0);
-                let ctime     = read_u32_unaligned_le(r, 4);
+                let word               = read_u64_unaligned_le(r, 0);
+                let (inode_num, ctime) = InodeTable::unpack(word);
 
                 if inode_num != 0 {
                     table.insert_max(inode_num, ctime);
@@ -306,9 +306,7 @@ pub fn save() {
 
         for &slot in &merged.slots {
             if slot != 0 {
-                let (ino, ctime) = InodeTable::unpack(slot);
-                let packed = ((ctime as u64) << 32) | ino as u64;
-                cursor.extend(&packed.to_le_bytes());
+                cursor.extend(&slot.to_le_bytes());
             }
         }
     }
