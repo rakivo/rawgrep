@@ -270,6 +270,15 @@ pub fn check_fragment_presence(
     )
 }
 
+#[inline(always)]
+fn fragment_present(hash: u32, fragment_hashes: &[u32], fragment_index: &IntSet<u32>) -> bool {
+    if fragment_hashes.len() <= 8 {  // @Tune
+        fragment_hashes.contains(&hash)
+    } else {
+        fragment_index .contains(&hash)
+    }
+}
+
 /// Scalar fallback for fragment presence checking
 #[inline]
 pub fn check_fragment_presence_scalar(
@@ -314,7 +323,7 @@ pub fn check_fragment_presence_scalar(
 
         let hash = hash_fragment_u32(raw);
 
-        if fragment_index.contains(&hash) {
+        if fragment_present(hash, fragment_hashes, fragment_index) {
             for (index, &frag_hash) in fragment_hashes.iter().enumerate() {
                 if frag_hash != hash { continue; }
 
@@ -323,7 +332,8 @@ pub fn check_fragment_presence_scalar(
                     fragment_presence_scratch[word] |= bit;
                     found_count += 1;
                 }
-                // no break: another fragment at a different index can share this hash
+
+                // No break: another fragment at a different index can share this hash
             }
 
             if found_count == num_frags { return; }
