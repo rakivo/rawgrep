@@ -302,10 +302,15 @@ pub fn open_device_impl(path: &str) -> io::Result<File> {
 #[inline]
 pub fn open_device_impl(path: &str) -> io::Result<File> {
     use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
 
-    let file = OpenOptions::new().read(true).write(false).open(path)?;
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOATIME)
+        .open(path)
+        .or_else(|_| OpenOptions::new().read(true).write(false).open(path))?;
+
     let fd = file.as_raw_fd();
-
     unsafe { libc::posix_fadvise(fd, 0, 0, libc::POSIX_FADV_RANDOM); }
 
     Ok(file)

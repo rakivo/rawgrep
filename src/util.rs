@@ -126,8 +126,24 @@ const DEFAULT_SECTOR_SIZE: u64 = 512;
 #[inline]
 pub fn read_at_offset(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
     #[cfg(unix)] {
-        use std::os::unix::fs::FileExt;
-        file.read_at(buf, offset)
+        use std::os::fd::AsRawFd;
+
+        let fd = file.as_raw_fd();
+        let ret = unsafe {
+            libc::syscall(
+                libc::SYS_pread64,
+                fd,
+                buf.as_mut_ptr(),
+                buf.len(),
+                offset as i64,
+            )
+        };
+
+        if likely(ret >= 0) {
+            Ok(ret as usize)
+        } else {
+            Err(io::Error::last_os_error())
+        }
     }
 
     #[cfg(windows)] {

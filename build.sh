@@ -52,12 +52,12 @@ fi
 
 if [ "$install" = 1 ]; then
     sudo cp ./target/release-fast/rawgrep /usr/bin/rawgrep
-    sudo setcap 'cap_dac_read_search,cap_ipc_lock=eip' /usr/bin/rawgrep
+    sudo setcap 'cap_dac_read_search,cap_ipc_lock=eip cap_fowner=ep' /usr/bin/rawgrep
 fi
 
 # if [ "$fast" = 1 ]; then
 #     RUSTFLAGS="-C debug-assertions=off -C force-frame-pointers=yes -C target-cpu=native" \
-#     cargo b -Z build-std=core,alloc,std,panic_abort \
+#     cargo +nightly b -Z build-std=core,alloc,std,panic_abort \
 #         --profile=release-fast-without-lto-with-debug \
 #         $no_default_features \
 #         --features "use_nightly${features:+,$features}"
@@ -71,5 +71,5 @@ fi
 
 # if [ "$install" = 1 ]; then
 #     sudo cp ./target/release-fast-without-lto-with-debug/rawgrep /usr/bin/rawgrep
-#     sudo setcap 'cap_dac_read_search,cap_ipc_lock=eip' /usr/bin/rawgrep
+#     sudo setcap 'cap_dac_read_search,cap_ipc_lock=eip cap_fowner=ep' /usr/bin/rawgrep
 # fi
