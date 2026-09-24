@@ -728,7 +728,7 @@ impl RawFs for Ext4Fs {
 
             let file_type = match file_type {
                 EXT4_FT_REG_FILE => FileType::File,
-                EXT4_FT_DIR => FileType::Dir,
+                EXT4_FT_DIR      => FileType::Dir,
                 _ => FileType::Other,
             };
 
