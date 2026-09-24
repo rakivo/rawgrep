@@ -97,7 +97,7 @@ pub fn note_invalidated(inode: u64, ctime_sec: i64, complete: bool) {
 //
 // Each slot packs (ctime << 32 | inode) into one u64.
 struct InodeTable {
-    slots: Vec<u64>,
+    slots: Box<[u64]>,
     mask:  usize,     // slots.len() - 1, for probe wraparound (len is a power of two)
     shift: u32,       // 32 - log2(slots.len()), so the hash uses the high (well-mixed) bits
     len:   usize,
@@ -110,7 +110,7 @@ impl InodeTable {
         let cap = min_entries.saturating_mul(2).next_power_of_two().max(16);
 
         InodeTable {
-            slots: vec![0u64; cap],
+            slots: crate::util::vec_into_boxed_slice_noshrink(vec![0u64; cap]),
             mask:  cap - 1,
             shift: 32 - cap.trailing_zeros(),
             len:   0,
