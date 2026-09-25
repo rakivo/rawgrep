@@ -576,8 +576,20 @@ fn build_job_and_initial_work<S: MatchSink + 'static>(
     };
 
     let device = match config.device.clone() {
-        Some(d) => d,
-        None    => platform::detect_partition_for_path(&search_root)
+        Some(d) => {
+            let p = Path::new(&*d);
+            if p.is_dir() {
+                let canonical = fs::canonicalize(p)
+                    .unwrap_or_else(|_| p.to_path_buf());
+
+                platform::detect_partition_for_path(&canonical)
+                    .map(Into::into)
+                    .map_err(Error::DeviceDetectionFailed)?
+            } else {
+                d
+            }
+        }
+        None => platform::detect_partition_for_path(&search_root)
             .map(Into::into)
             .map_err(Error::DeviceDetectionFailed)?,
     };
@@ -604,12 +616,27 @@ fn build_job_and_initial_work<S: MatchSink + 'static>(
     //
     inspect_before_search(&search_root, &device, fs_type, &cli.pattern);
 
-    let search_root_for_fs = if config.device.is_some() {
-        platform::strip_mountpoint_prefix(&device, &search_root)
-            .unwrap_or_else(|| search_root.to_string_lossy().into_owned())
-    } else {
-        search_root.to_string_lossy().into_owned()
-    }.into_boxed_str();
+    let search_root_for_fs = platform::strip_mountpoint_prefix(&device, &search_root)
+        .unwrap_or_else(|| {
+            if !config.device.is_some() {
+                return search_root.to_string_lossy().into_owned();
+            }
+
+            //
+            // Canonicalize may have succeeded against some unrelated real path on
+            // the host (cwd, or a relative name that happens to exist there).
+            //
+            // That has nothing to do with the device, so fall back to what the
+            // user actually typed and treat it as device-relative.
+            //
+
+            let raw = &*config.search_root_path;
+            if raw.is_empty() || raw == "." {
+                std::path::MAIN_SEPARATOR_STR.to_string()
+            } else {
+                raw.to_string()
+            }
+        }).into_boxed_str();
 
     let root_file_id = grepper
         .try_resolve_path_to_file_id(&search_root_for_fs)
