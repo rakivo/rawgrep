@@ -429,7 +429,17 @@ impl RawFs for Ext4Fs {
     ) -> io::Result<bool> {
         #[inline]
         fn first_read_len(block_size: usize, max_size: usize, likely_binary: bool) -> usize {
-            let cap = if likely_binary { binary_verdicts::PROBE_BYTES } else { block_size };
+            let cap = if likely(!likely_binary) {
+                const SMALL_FILE_ONE_SHOT_CAP: usize = 64 * 1024;
+
+                //
+                // The file isn't likely to be binary, so read more on the first read
+                //
+                block_size.max(SMALL_FILE_ONE_SHOT_CAP)
+            } else {
+                binary_verdicts::PROBE_BYTES
+            };
+
             max_size.min(cap)
         }
 
