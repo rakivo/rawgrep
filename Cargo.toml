@@ -68,8 +68,6 @@ tracy-client      = { version = "0.17.3",  default-features = false, features = 
 bytecount         = { version = "0.6.9",   default-features = false,                                optional = true }
 smallvec          = { version = "1.15.1",                            features = ["const_generics"], optional = true }
 
-paste             = "1"
-
 # =======================================================================================================
 # Dependencies only used by src/bin/gitignore_oracle_check.rs
 # =======================================================================================================
@@ -123,7 +121,18 @@ strip = true
 overflow-checks = false
 debug-assertions = false
 
-[profile.release-fast-without-lto-with-debug] # Use this profile if you're inspecting the LLVM IR with "cargo asm"
+[profile.release-fast-with-lto-with-debug] # Use this profile if you're inspecting the LLVM IR with "cargo asm"
+inherits = "release"
+opt-level = 3
+panic = "abort"
+codegen-units = 1
+lto = false
+debug = 1
+strip = false
+overflow-checks = false
+debug-assertions = false
+
+[profile.release-fast-without-lto-with-debug]
 inherits = "release"
 opt-level = 3
 panic = "abort"
