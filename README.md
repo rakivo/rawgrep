@@ -7,7 +7,7 @@
 
 benchmark script: [`bench.sh`](https://github.com/rakivo/rawgrep/blob/master/bench.sh)
 
-The following benchmarks compare `rawgrep` `0.2.0` (rev `050840e`, with `Hyperscan`)  against:
+The following benchmarks compare `rawgrep` `0.2.0` (rev `a489025`, with `Hyperscan`)  against:
 
 - [ripgrep](https://github.com/BurntSushi/ripgrep) `15.2.0` (rev `3fce3b5bb0`)
 - [hypergrep](https://github.com/p-ranav/hypergrep) `0.1.1` (rev `ee85b71`)
