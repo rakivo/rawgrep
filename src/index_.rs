@@ -23,8 +23,8 @@ where
 {
     type Output = I::Output;
 
-    #[track_caller]
-    #[inline]
+    #[inline(always)]
+    #[cfg_attr(debug_assertions, track_caller)]
     fn get_(&self, index: I) -> &I::Output {
         #[cfg(debug_assertions)]             { &self[index] }
         #[cfg(not(debug_assertions))] unsafe { self.get_unchecked(index) }
@@ -35,8 +35,8 @@ impl<T, I> IndexMut_<I> for [T]
 where
     I: SliceIndex<[T]>,
 {
-    #[track_caller]
-    #[inline]
+    #[inline(always)]
+    #[cfg_attr(debug_assertions, track_caller)]
     fn get_mut_(&mut self, index: I) -> &mut I::Output {
         #[cfg(debug_assertions)]             { &mut self[index] }
         #[cfg(not(debug_assertions))] unsafe { self.get_unchecked_mut(index) }
@@ -49,8 +49,8 @@ where
 {
     type Output = I::Output;
 
-    #[track_caller]
-    #[inline]
+    #[inline(always)]
+    #[cfg_attr(debug_assertions, track_caller)]
     fn get_(&self, index: I) -> &I::Output {
         #[cfg(debug_assertions)]             { &self[index] }
         #[cfg(not(debug_assertions))] unsafe { self.get_unchecked(index) }
@@ -61,8 +61,8 @@ impl<I> IndexMut_<I> for str
 where
     I: SliceIndex<str>,
 {
-    #[track_caller]
-    #[inline]
+    #[inline(always)]
+    #[cfg_attr(debug_assertions, track_caller)]
     fn get_mut_(&mut self, index: I) -> &mut I::Output {
         #[cfg(debug_assertions)]             { &mut self[index] }
         #[cfg(not(debug_assertions))] unsafe { self.get_unchecked_mut(index) }
