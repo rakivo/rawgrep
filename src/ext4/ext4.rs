@@ -5,8 +5,8 @@ use std::fmt::Display;
 
 use crate::parser::FastDivU32;
 
-pub type INodeNum = u32;
-pub type FileId   = INodeNum;
+pub type InodeNum = u32;
+pub type FileId   = InodeNum;
 
 // pub const MAX_SYMLINK_TARGET_SIZE: usize = 4096;
 // pub const FAST_SYMLINK_SIZE: usize = 60; // Symlinks < 60 bytes stored in inode
@@ -20,7 +20,7 @@ pub const EXT4_INODES_PER_GROUP_OFFSET: usize = 40;
 pub const EXT4_BLOCKS_PER_GROUP_OFFSET: usize = 32;
 pub const EXT4_BLOCK_SIZE_OFFSET: usize = 24;
 pub const EXT4_INODE_TABLE_OFFSET: usize = 8;
-pub const EXT4_ROOT_INODE: INodeNum = 2;
+pub const EXT4_ROOT_INODE: InodeNum = 2;
 pub const EXT4_DESC_SIZE_OFFSET: usize = 254;
 pub const EXT4_INODE_MODE_OFFSET: usize = 0;
 pub const EXT4_INODE_SIZE_OFFSET_LOW: usize = 4;

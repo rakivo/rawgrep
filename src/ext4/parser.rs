@@ -143,7 +143,7 @@ impl RawFs for Ext4Fs {
         file_id: Self::FileId,
         cache: &mut InodeBlockCache
     ) -> (io::Result<Ext4Node>, NodeCacheStats) {
-        let inode_num = file_id as INodeNum;
+        let inode_num = file_id as InodeNum;
         if unlikely(inode_num == 0) {
             return (
                 Err(io::Error::new(io::ErrorKind::InvalidInput, "Invalid inode number 0")),
@@ -222,7 +222,7 @@ impl RawFs for Ext4Fs {
 
         self.read_at_offset(buf, inode_offset as _)?;
 
-        Ok(Self::decode_inode(file_id as INodeNum, buf, self.sb.inode_size))
+        Ok(Self::decode_inode(file_id as InodeNum, buf, self.sb.inode_size))
     }
 
     #[inline(always)]
