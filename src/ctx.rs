@@ -172,7 +172,7 @@ impl<S: MatchSink + 'static> RawGrepCtx<S> {
         ctx.injector.push(work);
         ctx.running.store(true, Ordering::SeqCst);
 
-        eprintln!("kicked-off work in {}ms", t0.elapsed().as_millis() as f64);
+        debug!("kicked-off work in {}ms", t0.elapsed().as_millis() as f64);
 
         ctx.spawn_workers(
             worker_count,

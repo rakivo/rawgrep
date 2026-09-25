@@ -1,3 +1,4 @@
+use crate::debug;
 use crate::unwrap_::Unwrap_;
 use crate::apfs::{ApfsFs, ApfsVolume, APFS_NX_MAGIC, ApfsNodeHot, ApfsNodeCold};
 use crate::cli::Cli;
@@ -75,7 +76,7 @@ impl<F: RawFs, S: MatchSink> RawGrepper<F, S> {
                 }
 
                 Err(e) => {
-                    eprintln!("Warning: Failed to initialize cache: {e}");
+                    debug!("Warning: Failed to initialize cache: {e}");
                     None
                 }
             }
@@ -119,7 +120,7 @@ impl<F: RawFs, S: MatchSink> RawGrepper<F, S> {
             crate::holder::ensure(&holder_paths);
         }
 
-        eprintln!("prepared RawGrepper in {}ms", t0.elapsed().as_millis() as f64);
+        debug!("prepared RawGrepper in {}ms", t0.elapsed().as_millis() as f64);
 
         Ok(RawGrepper {
             cli: cli.clone(),
@@ -234,7 +235,7 @@ impl<S: MatchSink> RawGrepper<Ext4Fs, S> {
             inode_table_blocks.push(inode_table_block as u64);
         }
 
-        eprintln!("read ext4 block groups in {}ms", t0.elapsed().as_millis() as f64);
+        debug!("read ext4 block groups in {}ms", t0.elapsed().as_millis() as f64);
 
         #[cfg(target_os = "linux")]
         crate::stale::init(device_path);
@@ -403,7 +404,7 @@ pub fn open_device_and_detect_fs(device_path: &str) -> Result<(File, FileSystem)
                 if err.raw_os_error() != Some(ERROR_ACCESS_DENIED as i32) {
                     return Err(err);
                 } else {
-                    eprintln!("FlushFileBuffers skipped: handle not opened for write");
+                    debug!("FlushFileBuffers skipped: handle not opened for write");
                 }
             }
 
@@ -412,7 +413,7 @@ pub fn open_device_and_detect_fs(device_path: &str) -> Result<(File, FileSystem)
             }
         }
 
-        eprintln!("sync: {:.2}ms", t.elapsed().as_millis() as f64);
+        debug!("sync: {:.2}ms", t.elapsed().as_millis() as f64);
     }
 
     // Read enough to cover both magic locations:

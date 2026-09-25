@@ -1,5 +1,6 @@
 #![allow(clippy::needless_range_loop)]
 
+use crate::debug;
 use crate::writeln_blue;
 use crate::unwrap_::Unwrap_;
 use crate::index_::{Index_, IndexMut_};
@@ -841,7 +842,7 @@ impl<S: CacheStorage> FragmentCache<S> {
 
         let file_capacity = num_files;
 
-        eprintln!(
+        debug!(
             "Cache allocations:\n  fragment_hashes: {}KB\n  file_keys: {}KB\n  file_metas: {}KB\n  file_bitsets: {}KB\n  file_lookup: {}KB\n  raw_bytes: {}KB\n  file_capacity: {}\n  bits_per_file_u64: {}",
             (config.max_fragments * 4) / 1024,
             (file_capacity * size_of::<FileKey>()) / 1024,
@@ -853,7 +854,7 @@ impl<S: CacheStorage> FragmentCache<S> {
             bits_per_file_u64,
         );
 
-        eprintln!(
+        debug!(
             "Cache loaded: {} files, {} fragments, {:.2}MB in {}ms",
             num_files, num_fragments,
             bytes.len() as f64 / (1024.0 * 1024.0),
@@ -938,10 +939,7 @@ impl<S: CacheStorage> FragmentCache<S> {
             unsafe { std::slice::from_raw_parts(self.file_bitsets.ptr as *const u8, file_bitsets_size) },
         ];
 
-        eprintln!(
-            "Cache prepared to write in {:.2}ms",
-            start.elapsed().as_millis() as f64
-        );
+        debug!("Cache prepared to write in {:.2}ms", start.elapsed().as_millis() as f64);
 
         debug_assert_eq!(total_size, segments.iter().map(|s| s.len()).sum::<usize>());
 
@@ -949,7 +947,7 @@ impl<S: CacheStorage> FragmentCache<S> {
 
         self.storage.save_segments(&segments, total_size)?;
 
-        eprintln!(
+        debug!(
             "Cache saved: {} files, {} fragments, {:.2}MB in {:.2}ms",
             num_files, num_fragments,
             total_size as f64 / (1024.0 * 1024.0),
@@ -1839,7 +1837,7 @@ impl<S: CacheStorage> FragmentCache<S> {
             #[cfg(not(feature = "no-cache-stats"))]
             self.stats.dropped_at_capacity.fetch_add(dropped_files, Ordering::Relaxed);
 
-            eprintln!(
+            debug!(
                 "FragmentCache dropped {} file(s), max_files ({}) reached; \
                  these files will never be cached until max_files is increased",
                 dropped_files, self.max_files
@@ -1847,7 +1845,7 @@ impl<S: CacheStorage> FragmentCache<S> {
         }
 
         if fragment_layout.dropped > 0 {
-            eprintln!(
+            debug!(
                 "FragmentCache dropped {} fragment(s): every ring slot is used by this batch \
                  (batch has more distinct fragments than max_fragments = {})",
                 fragment_layout.dropped, self.max_fragments
@@ -2025,7 +2023,7 @@ impl Laps {
         for &(name, ms, flt) in &self.rows[..self.n] {
             s += &format!(" {name} {ms:.2}ms/{flt}pf");
         }
-        eprintln!(
+        debug!(
             "Cache updated: {files} files, {frags} frags in {:.2}ms |{s}",
             (self.last - self.start).as_secs_f64() * 1e3,
         );
