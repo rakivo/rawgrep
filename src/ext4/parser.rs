@@ -486,19 +486,19 @@ impl RawFs for Ext4Fs {
                 stale::note_invalidated(node.file_id() as _, node.cold.ctime_sec, ok && max_size >= file_size);
             }
 
-            let mut first_start = if !check_binary {
+            let mut first_extent = if !check_binary {
                 None
             } else if parsed {
-                Self::scratch_as_extents(scratch).first().map(|e| e.start)
+                Self::scratch_as_extents(scratch).first().map(|e| (e.start, e.len))
             } else {
                 self.first_extent_start(block_bytes)
             };
 
-            if check_binary && first_start.is_none() && !parsed {
+            if check_binary && first_extent.is_none() && !parsed {
                 self.parse_extent_node_into(scratch, scratch3, block_bytes, 0)?;
                 parsed = true;
 
-                first_start = Self::scratch_as_extents(scratch).first().map(|e| e.start);
+                first_extent = Self::scratch_as_extents(scratch).first().map(|e| (e.start, e.len));
             }
 
             //
@@ -507,12 +507,13 @@ impl RawFs for Ext4Fs {
             //
             let mut skip_first = 0usize;
 
-            if let Some(first_start) = first_start {
+            if let Some((first_start, first_len)) = first_extent {
                 //
                 // Binary probe
                 //
 
-                let probe_len = first_read_len(block_size as usize, max_size, likely_binary);
+                let first_extent_bytes = first_len as usize * block_size as usize;
+                let probe_len = first_read_len(block_size as usize, max_size, likely_binary).min(first_extent_bytes);
                 buf.reserve(probe_len);
                 unsafe { buf.set_len(probe_len); }  // @ProbablySafe...
 
@@ -637,8 +638,12 @@ impl RawFs for Ext4Fs {
             //
             // Binary probe
             //
+            // Each direct pointer only guarantees this one block -- the next pointer's block
+            // need not be adjacent on disk -- so, same as the extents branch above, the read
+            // (and the 'skip_first' it feeds) must never reach past this single block.
+            //
 
-            let probe_len = first_read_len(block_size as usize, max_size, likely_binary);
+            let probe_len = first_read_len(block_size as usize, max_size, likely_binary).min(block_size as usize);
             scratch2.clear();
             scratch2.reserve(probe_len);
             unsafe { scratch2.set_len(probe_len); }  // @ProbablySafe...
@@ -936,12 +941,13 @@ impl Ext4Fs {
         result
     }
 
-    /// Start block of the leftmost valid extent, found by walking only the leftmost path of the
-    /// extent tree: no I/O for a depth-0 tree (it lives in the inode), one block read per level otherwise.
+    /// (start block, length in blocks) of the leftmost valid extent, found by walking only the
+    /// leftmost path of the extent tree: no I/O for a depth-0 tree (it lives in the inode), one
+    /// block read per level otherwise.
     ///
     /// Returns None whenever it can't decide cheaply, because of a corrupt header, unreadable block, or a
     /// leftmost leaf with no valid extent -- and the caller falls back to parsing the whole tree.
-    fn first_extent_start(&self, block_bytes: &[u8]) -> Option<u64> {
+    fn first_extent_start(&self, block_bytes: &[u8]) -> Option<(u64, u16)> {
         let _span = tracy::span!("Ext4Fs::first_extent_start");
 
         let block_size = self.sb.block_size as usize;
@@ -963,8 +969,8 @@ impl Ext4Fs {
 
             if eh_depth == 0 {
                 let mut result = None;
-                for_each_valid_leaf_extent(data, eh_entries, |start, _len| {
-                    result = Some(start);
+                for_each_valid_leaf_extent(data, eh_entries, |start, len| {
+                    result = Some((start, len));
                     true
                 });
                 return result;

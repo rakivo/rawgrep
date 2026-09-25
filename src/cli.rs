@@ -174,6 +174,9 @@ pub struct Cli {
     #[bpaf(long("rebuild-cache"))]
     pub rebuild_cache: bool,
 
+    #[bpaf(long("force-stdout-null"), fallback(false))]
+    pub force_stdout_redirect_to_dev_null: bool,
+
     /// Pattern to search for (supports regex syntax)
     #[bpaf(positional("PATTERN"))]
     pub pattern: String,
@@ -181,9 +184,6 @@ pub struct Cli {
     /// Directory path to search in
     #[bpaf(positional("PATH"), fallback(".".into()))]
     pub search_root_path: String,
-
-    #[bpaf(long("force-stdout-null"), fallback(false))]
-    pub force_stdout_redirect_to_dev_null: bool,
 }
 
 impl Cli {
