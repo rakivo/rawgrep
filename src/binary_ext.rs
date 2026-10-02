@@ -405,8 +405,7 @@ sorted_lookup_table! {
         ".cabal-sandbox", "dist-newstyle",
 
         // Build / output dirs
-        "build", "dist", "out", "bin", "obj",
-        ".next", ".nuxt", ".output", ".svelte-kit", ".angular",
+        "obj", ".next", ".nuxt", ".output", ".svelte-kit", ".angular",
         ".parcel-cache", ".turbo", ".cache", ".webpack",
 
         // IDE / editor
