@@ -2062,23 +2062,6 @@ impl<S: MatchSink> WorkerPrintCtx<'_, S> {
                 self.ranges_scratch,
             );
 
-            if self.ranges_scratch.is_empty() {
-                //
-                // carry.line_num has to stay correct for whatever chunk comes next, but only
-                // if it's ever actually read -- same guard as the non-chunk path.
-                //
-                if should_print_line_numbers || S::STDOUT_NOP {
-                    carry.line_num += crate::bytecount::count(region, b'\n') as u32;
-                }
-
-                carry.tail.clear();
-                if !is_last && process_until < data.len() {
-                    carry.tail.extend_from_slice(data.get_(process_until..));
-                }
-
-                return Ok(());
-            }
-
             let mut scan_pos = 0usize;
             let mut i        = 0usize;
 
@@ -2117,6 +2100,15 @@ impl<S: MatchSink> WorkerPrintCtx<'_, S> {
 
                 scan_pos = (line_end + 1).min(process_until);
                 carry.line_num += 1;
+            }
+
+            //
+            // Newlines after the last match (or in the whole region, if nothing matched) still
+            // have to be counted, otherwise carry.line_num is short by that many when the next
+            // chunk starts.
+            //
+            if should_print_line_numbers || S::STDOUT_NOP {
+                carry.line_num += crate::bytecount::count(region.get_(scan_pos..), b'\n') as u32;
             }
 
             carry.tail.clear();
