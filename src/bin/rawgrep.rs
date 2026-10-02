@@ -11,6 +11,7 @@ static ALLOC: dhat::Alloc = dhat::Alloc;
 
 use rawgrep::cli::Cli;
 use rawgrep::sink::NoSink;
+use rawgrep::stdout::OutputKind;
 use rawgrep::{Error, RawGrepConfig, eprint_blue, eprint_green, eprintln_red};
 
 fn main() {
@@ -33,14 +34,16 @@ fn main() {
         rawgrep::setup_signal_handler(),
         NoSink,
         |search_root, device, fs, pattern| {
-            eprint_blue!("Searching ");
-            eprint_green!("'{search_root}' ", search_root = search_root.display());
-            eprint_blue!("on device ");
-            eprint_green!("'{device}' ");
-            eprint_blue!("with fs ");
-            eprint_green!("{fs:?} ");
-            eprint_blue!("for pattern ");
-            eprintln_red!("{b}{pattern}", b = rawgrep::color::BOLD);
+            if rawgrep::ctx::OUTPUT_KIND.get().is_none_or(|o| *o == OutputKind::Tty) {
+                eprint_blue!("Searching ");
+                eprint_green!("'{search_root}' ", search_root = search_root.display());
+                eprint_blue!("on device ");
+                eprint_green!("'{device}' ");
+                eprint_blue!("with fs ");
+                eprint_green!("{fs:?} ");
+                eprint_blue!("for pattern ");
+                eprintln_red!("{b}{pattern}", b = rawgrep::color::BOLD);
+            }
         }
     ) {
         Ok((stats, cache_stats)) => {

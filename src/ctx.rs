@@ -694,12 +694,16 @@ struct OutputPlumbing {
     cursor_hide:  Option<CursorHide>,
 }
 
+pub static OUTPUT_KIND: std::sync::OnceLock<OutputKind> = std::sync::OnceLock::new();
+
 fn setup_output_plumbing(worker_count: usize) -> OutputPlumbing {
     let (output_tx, output_rx)       = unbounded();
     let (flush_ack_tx, flush_ack_rx) = unbounded();
 
     let (raw_stdout, output_kind) = RawStdout::new();
     let stdout_is_being_redirected_to_dev_null = raw_stdout.is_none();
+
+    _ = OUTPUT_KIND.set(output_kind);
 
     let cursor_hide = if output_kind == OutputKind::Tty {
         CursorHide::new().ok()
